@@ -26,14 +26,14 @@ class Config:
 
     # Hierarchical Model Architecture
     EMBEDDING_DIM = 768  # From modern-bert-base
-    NUM_LAYERS = 2
-    NUM_ATTENTION_HEADS = 32
-    FFN_DIM_MULTIPLIER = 4
+    NUM_LAYERS = 3
+    NUM_ATTENTION_HEADS = 16
+    FFN_DIM_MULTIPLIER = 2
 
     # Training Parameters
     EPOCHS = 20
     LEARNING_RATE = 3e-4
-    BATCH_SIZE = 4  # Batch size for the hierarchical model
+    BATCH_SIZE = 256  # Batch size for the hierarchical model
     TRAIN_SPLIT_RATIO = 0.9
 
     # Data Processing
@@ -411,7 +411,7 @@ def main():
 
     logging.info("Pre-processing and caching embeddings...")
 
-    with open('/Users/eloireynal/Downloads/websites_train_embeddings.pkl', 'rb') as f:
+    with open('/content/drive/MyDrive/website predictor/wikipedia_train_embeddings.pkl', 'rb') as f:
       all_train_examples = pickle.load(f)
 
     # Split the training data into 90% train, 10% validation
