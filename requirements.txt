@@ -1,0 +1,16 @@
+
+openai
+pymupdf
+ultralytics
+Pillow
+huggingface_hub
+ultralyticsplus
+torch
+transformers
+datasets
+numpy
+tqdm
+boto3
+aiohttp
+tldextract
+warcio

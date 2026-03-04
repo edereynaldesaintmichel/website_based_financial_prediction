@@ -1,0 +1,8 @@
+# common_crawl_pipeline dependencies
+aiohttp>=3.9.0
+tldextract>=5.1.0
+warcio>=1.7.4
+beautifulsoup4>=4.12.3
+lxml>=5.1.0
+tqdm>=4.66.0
+html2text>=2024.2.26

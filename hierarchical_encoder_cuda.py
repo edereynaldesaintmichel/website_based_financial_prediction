@@ -409,10 +409,20 @@ def main():
     # train_files, val_files = train_test_split(all_files, train_size=Config.TRAIN_SPLIT_RATIO, random_state=42)
     # logging.info(f"Found {len(all_files)} files. Training on {len(train_files)}, validating on {len(val_files)}.")
 
-    logging.info("Pre-processing and caching embeddings...")
 
-    with open('/content/drive/MyDrive/website predictor/wikipedia_train_embeddings.pkl', 'rb') as f:
-      all_train_examples = pickle.load(f)
+    checkpoint_pattern = "/content/drive/MyDrive/website predictor/website_checkpoint_0000.pkl"
+    checkpoint_files = sorted(glob.glob(checkpoint_pattern))
+
+    print('Checkpoint_files: ', checkpoint_files)
+
+    all_train_examples = []
+    for checkpoint_file in checkpoint_files:
+        print(f'processing {checkpoint_file}')
+        with open(checkpoint_file, 'rb') as f:
+            all_train_examples += pickle.load(f)
+
+
+    print(f"All checkpoint files processed. Total nb training examples: {len(all_train_examples)}")
 
     # Split the training data into 90% train, 10% validation
     train_examples, val_examples = train_test_split(

@@ -1,2 +1,10 @@
 env
 .env
+output
+financial_statements*
+__pycache__
+cc_data
+arithmetic_model_bucket.pth
+yolov8n.pt
+*.log
+*.pt
