@@ -1,0 +1,13 @@
+{
+  //... 
+  // fields we don't care about.
+  //...
+
+  "identifier": {
+    "entity_name": "MAHUT LIMITED",
+    "address_line_1": "Thornet Wood Road",
+    "city": "Bickley",
+    "postal_code": "BR1 2LW",
+    "websites": []
+  }
+}
