@@ -257,17 +257,45 @@ def train(args):
 
     # Concatenate datasets
     combined = torch.utils.data.ConcatDataset(datasets)
+
+    # Split each bucket 90/10 into train/val
+    val_ratio = 0.1
+    train_bucket_info = {}
+    val_bucket_info = {}
+    for name, (boffset, count, pad_to) in bucket_info.items():
+        indices = list(range(count))
+        random.shuffle(indices)
+        val_count = max(1, int(count * val_ratio))
+        train_count = count - val_count
+        # Store absolute indices for each split
+        train_bucket_info[name] = (boffset, train_count, pad_to)
+        val_bucket_info[name] = (boffset + train_count, val_count, pad_to)
+
     batch_sampler = MultiBucketBatchSampler(
-        bucket_info, args.tokens_per_batch, min_batch=args.min_batch_size,
+        train_bucket_info, args.tokens_per_batch, min_batch=args.min_batch_size,
+    )
+    val_batch_sampler = MultiBucketBatchSampler(
+        val_bucket_info, args.tokens_per_batch, min_batch=args.min_batch_size,
     )
 
-    print(f"\nBatch plan (tokens_per_batch={args.tokens_per_batch}):")
+    print(f"\nTrain batch plan (tokens_per_batch={args.tokens_per_batch}):")
     print(batch_sampler.summary())
-    print(f"Total batches per epoch: {len(batch_sampler)}\n")
+    print(f"Total train batches per epoch: {len(batch_sampler)}")
+    print(f"\nVal batch plan:")
+    print(val_batch_sampler.summary())
+    print(f"Total val batches per epoch: {len(val_batch_sampler)}\n")
 
     dataloader = DataLoader(
         combined,
         batch_sampler=batch_sampler,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+        collate_fn=variable_length_collate,
+    )
+    val_dataloader = DataLoader(
+        combined,
+        batch_sampler=val_batch_sampler,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
@@ -362,10 +390,41 @@ def train(args):
 
         n = max(num_batches, 1)
         print(f"Epoch {epoch+1}/{args.epochs} — "
-              f"loss: {totals['loss']/n:.4f}  "
+              f"train loss: {totals['loss']/n:.4f}  "
               f"text: {totals['text']/n:.4f}  "
               f"sign: {totals['sign']/n:.4f}  "
               f"mag: {totals['mag']/n:.4f}")
+
+        # Validation
+        model.eval()
+        val_totals = {"loss": 0.0, "text": 0.0, "sign": 0.0, "mag": 0.0}
+        val_batches = 0
+        with torch.no_grad():
+            for batch in tqdm(val_dataloader, desc="  Validation", unit="batch"):
+                batch = {k: v.to(device) for k, v in batch.items()}
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                    outputs = model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        is_number_mask=batch["is_number_mask"],
+                        number_values=batch["number_values"],
+                        labels_text=batch["labels_text"],
+                        labels_sign=batch["labels_sign"],
+                        labels_magnitude=batch["labels_magnitude"],
+                    )
+                val_batches += 1
+                val_totals["loss"] += outputs["loss"].item()
+                val_totals["text"] += outputs["loss_text"].item()
+                val_totals["sign"] += outputs["loss_sign"].item()
+                val_totals["mag"] += outputs["loss_mag"].item()
+
+        vn = max(val_batches, 1)
+        print(f"Epoch {epoch+1}/{args.epochs} — "
+              f"val loss: {val_totals['loss']/vn:.4f}  "
+              f"text: {val_totals['text']/vn:.4f}  "
+              f"sign: {val_totals['sign']/vn:.4f}  "
+              f"mag: {val_totals['mag']/vn:.4f}")
+        model.train()
 
         # Save checkpoint
         if args.save_dir:
