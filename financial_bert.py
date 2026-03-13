@@ -386,12 +386,12 @@ class GatedNumberHead(nn.Module):
         )
 
     def forward(self, sequence_output):
-        # gate = torch.sigmoid(self.gate_proj(sequence_output))
-        # val = self.val_proj(sequence_output)
-        # gated_out = gate * val
-        
-        logits = self.decoder_mlp(sequence_output)
-        
+        gate = torch.sigmoid(self.gate_proj(sequence_output))
+        val = self.val_proj(sequence_output)
+        gated_out = gate * val
+
+        logits = self.decoder_mlp(gated_out)
+
         return logits[...,:2], logits[...,2:]
 
 class FinancialModernBert(ModernBertPreTrainedModel):
