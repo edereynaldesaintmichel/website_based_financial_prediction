@@ -40,9 +40,9 @@ except ImportError:
 # ============================================================================
 
 ZIP_URLS = [
-    # "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-January2025.zip",
-    # "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-February2025.zip",
-    # "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-March2025.zip",
+    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-January2025.zip",
+    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-February2025.zip",
+    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-March2025.zip",
     "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-April2025.zip",
     "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-May2025.zip",
     "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-June2025.zip",

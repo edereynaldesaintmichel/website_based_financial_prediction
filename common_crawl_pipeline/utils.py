@@ -1,5 +1,6 @@
 """Shared utilities for the Common Crawl pipeline."""
 
+import hashlib
 import re
 from urllib.parse import urlparse
 
@@ -57,4 +58,12 @@ def url_to_slug(url: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9_-]", "_", slug)
     # Collapse multiple underscores
     slug = re.sub(r"_+", "_", slug).strip("_")
-    return slug or "index"
+    if not slug:
+        return "index"
+    # macOS HFS+/APFS limit is 255 bytes; cap slug and append a short hash
+    # to avoid collisions when truncating
+    max_len = 200
+    if len(slug) > max_len:
+        h = hashlib.md5(slug.encode()).hexdigest()[:12]
+        slug = f"{slug[:max_len]}_{h}"
+    return slug

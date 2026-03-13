@@ -8,3 +8,5 @@ arithmetic_model_bucket.pth
 yolov8n.pt
 *.log
 *.pt
+cc_data_sec
+training_data

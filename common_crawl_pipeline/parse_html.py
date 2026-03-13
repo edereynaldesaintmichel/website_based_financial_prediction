@@ -38,11 +38,14 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import html2text
-from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag, XMLParsedAsHTMLWarning
 from tqdm import tqdm
+
+import warnings
 
 from utils import url_depth, url_to_slug
 
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
