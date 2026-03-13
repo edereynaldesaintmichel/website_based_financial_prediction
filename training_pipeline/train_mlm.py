@@ -198,8 +198,19 @@ def train(args):
         device = torch.device("cuda" if torch.cuda.is_available()
                               else "mps" if torch.backends.mps.is_available()
                               else "cpu")
-    use_amp = device.type == "cuda" and args.amp
-    print(f"Device: {device}" + (" (AMP enabled)" if use_amp else ""))
+    # Enable TF32 for any residual FP32 matmuls (Ampere+)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision('medium')
+
+    if device.type == "cuda" and args.dtype in ("fp16", "bf16"):
+        use_amp = True
+        amp_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+        use_scaler = args.dtype == "fp16"  # bf16 has full exponent range, no scaler needed
+    else:
+        use_amp = False
+        amp_dtype = torch.float32
+        use_scaler = False
+    print(f"Device: {device}, dtype: {args.dtype}" + (" (AMP)" if use_amp else ""))
 
     # Build model
     print("Building model...")
@@ -209,6 +220,10 @@ def train(args):
     print(f"Applying LoRA (rank={args.lora_rank})...")
     model = setup_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
     model = model.to(device)
+
+    if args.compile:
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
 
     # Load tokenizer just for token IDs
     tokenizer = FinancialBertTokenizer(args.model_name)
@@ -253,37 +268,44 @@ def train(args):
     dataloader = DataLoader(
         combined,
         batch_sampler=batch_sampler,
-        num_workers=0,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
         collate_fn=variable_length_collate,
     )
 
-    # Optimizer: separate LR for LoRA params vs head params
+    # Optimizer: separate param groups
     lora_params = []
-    head_params = []
+    number_params = []  # number_embedder + number_head
+    lm_head_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if "lora_" in name:
             lora_params.append(param)
+        elif "number_embedder" in name or "number_head" in name:
+            number_params.append(param)
         else:
-            head_params.append(param)
+            lm_head_params.append(param)
 
     print(f"LoRA params: {sum(p.numel() for p in lora_params):,}")
-    print(f"Head params: {sum(p.numel() for p in head_params):,}")
+    print(f"Number params: {sum(p.numel() for p in number_params):,}")
+    print(f"LM head params: {sum(p.numel() for p in lm_head_params):,}")
 
     optimizer = torch.optim.AdamW([
         {"params": lora_params, "lr": args.lr_lora},
-        {"params": head_params, "lr": args.lr_heads},
+        {"params": number_params, "lr": args.lr_heads},
+        {"params": lm_head_params, "lr": args.lr_heads},
     ], weight_decay=args.weight_decay)
 
-    # AMP scaler for CUDA mixed precision
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    # AMP scaler — only needed for fp16 (bf16 has full exponent range)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
-    # Warmup: freeze LoRA params for the first N steps
+    # Warmup: freeze everything except number_embedder + number_head
     if args.warmup_steps > 0:
-        print(f"\nWarmup: freezing LoRA params for {args.warmup_steps} steps "
-              f"(training heads only)")
-        for p in lora_params:
+        print(f"\nWarmup: freezing LoRA + lm_head for {args.warmup_steps} steps "
+              f"(training number embedder/head only)")
+        for p in lora_params + lm_head_params:
             p.requires_grad = False
 
     # Training loop
@@ -299,14 +321,14 @@ def train(args):
         for batch in pbar:
             # Unfreeze LoRA after warmup
             if not lora_unfrozen and global_step >= args.warmup_steps:
-                for p in lora_params:
+                for p in lora_params + lm_head_params:
                     p.requires_grad = True
                 lora_unfrozen = True
-                print(f"\n  Step {global_step}: unfreezing LoRA params")
+                print(f"\n  Step {global_step}: unfreezing LoRA + lm_head")
 
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 outputs = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
@@ -389,8 +411,13 @@ def main():
     parser.add_argument("--device", type=str, default=None,
                         help="Device override (e.g. 'cuda', 'cuda:1', 'mps', 'cpu'). "
                              "Auto-detected if not set.")
-    parser.add_argument("--amp", action="store_true",
-                        help="Enable mixed-precision training (CUDA only)")
+    parser.add_argument("--dtype", type=str, default="bf16", choices=["fp32", "fp16", "bf16"],
+                        help="Training precision: bf16 (recommended for Ampere+/Blackwell), "
+                             "fp16 (with loss scaling), or fp32 (no mixed precision)")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader workers for parallel data loading")
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile for kernel fusion (adds warmup time)")
     args = parser.parse_args()
 
     train(args)
