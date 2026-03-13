@@ -180,10 +180,11 @@ def setup_lora(model, rank=8, alpha=16):
     lora_config = LoraConfig(
         r=rank,
         lora_alpha=alpha,
-        target_modules=["Wqkv", "Wo", "Wi"],  # ModernBERT attention + MLP projections
+        target_modules=["Wqkv", "Wo", "Wi",  # ModernBERT attention + MLP projections
+                        "lm_head.dense", "lm_head.decoder"],  # prediction head
         lora_dropout=0.05,
         bias="none",
-        modules_to_save=["number_embedder", "number_head", "lm_head"],
+        modules_to_save=["number_embedder", "number_head"],
     )
 
     model = get_peft_model(model, lora_config)
