@@ -397,8 +397,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
     parser.add_argument("--lr_lora", type=float, default=2e-4, help="Learning rate for LoRA params")
     parser.add_argument("--lr_heads", type=float, default=1e-4, help="Learning rate for head params")
-    parser.add_argument("--lora_rank", type=int, default=8, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
+    parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
     parser.add_argument("--mask_prob", type=float, default=0.15, help="MLM mask probability")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--warmup_steps", type=int, default=0,
