@@ -180,8 +180,7 @@ def setup_lora(model, rank=8, alpha=16):
     lora_config = LoraConfig(
         r=rank,
         lora_alpha=alpha,
-        target_modules=["Wqkv", "Wo", "Wi",  # ModernBERT attention + MLP projections
-                        "lm_head.dense", "lm_head.decoder"],  # prediction head
+        target_modules=["Wqkv", "Wo", "Wi"],  # ModernBERT attention + MLP projections
         lora_dropout=0.05,
         bias="none",
         modules_to_save=["number_embedder", "number_head"],
@@ -277,14 +276,14 @@ def train(args):
 
     # Optimizer: separate param groups
     lora_params = []
-    number_params = []  # number_embedder + number_head
+    number_params = []  # number_embedder + number_head (always trainable)
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "number_embedder" in name or "number_head" in name:
-            number_params.append(param)
-        else:
+        if "lora_" in name:
             lora_params.append(param)
+        elif "number_embedder" in name or "number_head" in name:
+            number_params.append(param)
 
     print(f"LoRA params: {sum(p.numel() for p in lora_params):,}")
     print(f"Number params: {sum(p.numel() for p in number_params):,}")
