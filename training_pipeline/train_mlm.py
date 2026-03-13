@@ -67,7 +67,7 @@ class BucketedMLMDataset(Dataset):
         number_values = number_values + [[0.0, 0.0]] * pad_len
 
         # Create MLM labels and masked input
-        labels_text = list(input_ids)  # copy
+        labels_text = [-100] * self.pad_to
         labels_sign = [-100] * self.pad_to
         labels_magnitude = [-100.0] * self.pad_to
         masked_input_ids = list(input_ids)
@@ -78,25 +78,19 @@ class BucketedMLMDataset(Dataset):
                 # mask the number embedding by zeroing number_values with prob mask_prob
                 labels_sign[i] = int(number_values[i][0])
                 labels_magnitude[i] = number_values[i][1]
-                labels_text[i] = -100  # don't compute text loss on number positions
                 if random.random() < self.mask_prob:
                     # Zero out the number values so the model must predict
                     number_values[i] = [0.0, 0.0]
             elif attention_mask[i] == 1:
                 # Text positions: standard MLM masking
                 if random.random() < self.mask_prob:
+                    labels_text[i] = input_ids[i]  # predict original token
                     # 80% mask, 10% random, 10% keep
                     r = random.random()
                     if r < 0.8:
                         masked_input_ids[i] = self.mask_token_id
                     elif r < 0.9:
                         masked_input_ids[i] = random.randint(0, 50263)  # random token
-                    # else: keep original
-                    # labels_text[i] already has the original token id
-                else:
-                    labels_text[i] = -100  # don't compute loss on unmasked
-            else:
-                labels_text[i] = -100  # padding
 
         return {
             "input_ids": torch.tensor(masked_input_ids, dtype=torch.long),
@@ -400,7 +394,6 @@ def main():
     args = parser.parse_args()
 
     train(args)
-
 
 if __name__ == "__main__":
     main()
