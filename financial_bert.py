@@ -485,6 +485,9 @@ class FinancialModernBert(ModernBertPreTrainedModel):
 
         return {
             "loss": loss,
+            "loss_text": loss_text if loss is not None else None,
+            "loss_sign": loss_sign if loss is not None else None,
+            "loss_mag": loss_mag if loss is not None else None,
             "text_logits": text_logits,
             "sign_logits": sign_logits,
             "magnitude_logits": magnitude_logits

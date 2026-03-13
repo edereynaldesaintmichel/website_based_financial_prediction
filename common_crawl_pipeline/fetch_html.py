@@ -507,6 +507,12 @@ async def main() -> None:
         help="Directory of company JSON files (for Wayback fallback domains)",
     )
     parser.add_argument(
+        "--sec",
+        action="store_true",
+        help="Treat --input-dir as a single SEC company_meta.json file "
+             "(schema: {cik: {website: url}}) instead of a directory of CH JSONs",
+    )
+    parser.add_argument(
         "--output-dir",
         default=str(Path(__file__).resolve().parents[1] / "cc_data" / "raw_html"),
     )
@@ -529,21 +535,34 @@ async def main() -> None:
     manifest_domains = set(manifest.keys())
 
     # ── 2. Load company JSONs → extract all domains ──────────────────────────
-    input_dir  = Path(args.input_dir)
-    json_files = sorted(input_dir.glob("*.json"))
-    logger.info("Found %d company JSON files in %s", len(json_files), input_dir)
-
     all_company_domains: set[str] = set()
-    for p in json_files:
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            websites = data.get("identifier", {}).get("websites", [])
-            if websites:
-                domain = normalize_domain(websites[0])
+
+    if args.sec:
+        # SEC schema: single JSON file {cik: {website: "https://..."}, ...}
+        meta_path = Path(args.input_dir)
+        logger.info("Loading SEC company_meta.json from %s", meta_path)
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        for cik, info in meta.items():
+            url = info.get("website", "")
+            if url:
+                domain = normalize_domain(url)
                 if domain:
                     all_company_domains.add(domain)
-        except Exception:
-            continue
+    else:
+        # Companies House schema: directory of JSONs with identifier.websites[]
+        input_dir = Path(args.input_dir)
+        json_files = sorted(input_dir.glob("*.json"))
+        logger.info("Found %d company JSON files in %s", len(json_files), input_dir)
+        for p in json_files:
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                websites = data.get("identifier", {}).get("websites", [])
+                if websites:
+                    domain = normalize_domain(websites[0])
+                    if domain:
+                        all_company_domains.add(domain)
+            except Exception:
+                continue
 
     logger.info("Extracted %d unique company domains", len(all_company_domains))
 

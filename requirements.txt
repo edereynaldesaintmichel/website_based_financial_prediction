@@ -14,3 +14,5 @@ boto3
 aiohttp
 tldextract
 warcio
+yfinance
+markdownify
