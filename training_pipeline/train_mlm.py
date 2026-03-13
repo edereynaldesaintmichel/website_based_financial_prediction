@@ -278,25 +278,20 @@ def train(args):
     # Optimizer: separate param groups
     lora_params = []
     number_params = []  # number_embedder + number_head
-    lm_head_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "lora_" in name:
-            lora_params.append(param)
-        elif "number_embedder" in name or "number_head" in name:
+        if "number_embedder" in name or "number_head" in name:
             number_params.append(param)
         else:
-            lm_head_params.append(param)
+            lora_params.append(param)
 
     print(f"LoRA params: {sum(p.numel() for p in lora_params):,}")
     print(f"Number params: {sum(p.numel() for p in number_params):,}")
-    print(f"LM head params: {sum(p.numel() for p in lm_head_params):,}")
 
     optimizer = torch.optim.AdamW([
         {"params": lora_params, "lr": args.lr_lora},
         {"params": number_params, "lr": args.lr_heads},
-        {"params": lm_head_params, "lr": args.lr_heads},
     ], weight_decay=args.weight_decay)
 
     # AMP scaler — only needed for fp16 (bf16 has full exponent range)
@@ -304,9 +299,9 @@ def train(args):
 
     # Warmup: freeze everything except number_embedder + number_head
     if args.warmup_steps > 0:
-        print(f"\nWarmup: freezing LoRA + lm_head for {args.warmup_steps} steps "
+        print(f"\nWarmup: freezing LoRA for {args.warmup_steps} steps "
               f"(training number embedder/head only)")
-        for p in lora_params + lm_head_params:
+        for p in lora_params:
             p.requires_grad = False
 
     # Training loop
@@ -322,10 +317,10 @@ def train(args):
         for batch in pbar:
             # Unfreeze LoRA after warmup
             if not lora_unfrozen and global_step >= args.warmup_steps:
-                for p in lora_params + lm_head_params:
+                for p in lora_params:
                     p.requires_grad = True
                 lora_unfrozen = True
-                print(f"\n  Step {global_step}: unfreezing LoRA + lm_head")
+                print(f"\n  Step {global_step}: unfreezing LoRA")
 
             batch = {k: v.to(device) for k, v in batch.items()}
 
