@@ -375,8 +375,8 @@ class GatedNumberHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.val_proj = nn.Linear(config.hidden_size, config.hidden_size)
-        self.gate_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        # self.val_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        # self.gate_proj = nn.Linear(config.hidden_size, config.hidden_size)
         
         self.decoder_mlp = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
@@ -386,11 +386,11 @@ class GatedNumberHead(nn.Module):
         )
 
     def forward(self, sequence_output):
-        gate = torch.sigmoid(self.gate_proj(sequence_output))
-        val = self.val_proj(sequence_output)
-        gated_out = gate * val
+        # gate = torch.sigmoid(self.gate_proj(sequence_output))
+        # val = self.val_proj(sequence_output)
+        # gated_out = gate * val
 
-        logits = self.decoder_mlp(gated_out)
+        logits = self.decoder_mlp(sequence_output)
 
         return logits[...,:2], logits[...,2:]
 

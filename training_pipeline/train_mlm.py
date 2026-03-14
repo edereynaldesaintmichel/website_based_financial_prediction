@@ -478,3 +478,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""python -m training_pipeline.train_mlm     --data_dir '/content/drive/MyDrive/website predictor/bucketed'     --tokens_per_batch 32768     --dtype bf16     --compile     --num_workers 4     --epochs 3 --lr_heads 3e-4 --lr_lora 3e-4"""
+
+
