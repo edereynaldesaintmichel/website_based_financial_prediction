@@ -1,30 +1,31 @@
 """
-MLM training script for FinancialModernBert with LoRA.
+Full-parameter MLM training for FinancialModernBert (no LoRA).
 
-Loads pre-tokenized, bucketed data and trains with:
-- LoRA adapters on the ModernBERT backbone (rank 8)
-- Full-parameter training on GatedNumberEmbedder + GatedNumberHead
-- Dual loss: text MLM + number prediction (sign CE + soft-label magnitude CE)
-- Dynamic batch size: inversely proportional to sequence length, keeping
-  total tokens per batch roughly constant
+Same data pipeline as train_mlm.py but trains ALL parameters of the
+ModernBERT backbone, number embedder, and number head.
+
+To mitigate catastrophic forgetting, regularization data (.txt source files)
+is interleaved with financial data (.md source files) at a configurable ratio.
+Both go through the same chunk → tokenize → bucket pipeline.
 
 Usage:
-    python -m training_pipeline.train_mlm \
-        --data_dir training_data/bucketed_demo \
+    python -m training_pipeline.train_mlm_full \
+        --data_dir training_data/bucketed \
         --tokens_per_batch 4096 \
         --epochs 3 \
-        --lr_lora 2e-4 \
-        --lr_heads 1e-4
+        --lr 5e-5 \
+        --regularization_ratio 0.3
 """
 import argparse
 import json
+import math
 import os
 import random
 import sys
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset, DataLoader, Sampler, ConcatDataset
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,7 +33,7 @@ from financial_bert import build_model, FinancialBertTokenizer
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset — bucketed MLM (same as train_mlm.py)
 # ---------------------------------------------------------------------------
 
 class BucketedMLMDataset(Dataset):
@@ -77,23 +78,18 @@ class BucketedMLMDataset(Dataset):
 
         for i in range(seq_len):
             if is_number_mask[i] == 1:
-                # Number positions: always predict (like masking), but we
-                # mask the number embedding by zeroing number_values with prob mask_prob
                 labels_sign[i] = int(number_values[i][0])
                 labels_magnitude[i] = number_values[i][1]
                 if random.random() < self.mask_prob:
-                    # Zero out the number values so the model must predict
                     number_values[i] = [0.0, 0.0]
             elif attention_mask[i] == 1:
-                # Text positions: standard MLM masking
                 if random.random() < self.mask_prob:
-                    labels_text[i] = input_ids[i]  # predict original token
-                    # 80% mask, 10% random, 10% keep
+                    labels_text[i] = input_ids[i]
                     r = random.random()
                     if r < 0.8:
                         masked_input_ids[i] = self.mask_token_id
                     elif r < 0.9:
-                        masked_input_ids[i] = random.randint(0, 50263)  # random token
+                        masked_input_ids[i] = random.randint(0, 50263)
 
         return {
             "input_ids": torch.tensor(masked_input_ids, dtype=torch.long),
@@ -107,40 +103,20 @@ class BucketedMLMDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Multi-bucket sampler with dynamic batch size
+# Multi-bucket sampler (same as train_mlm.py)
 # ---------------------------------------------------------------------------
 
 def compute_batch_size(bucket_len: int, tokens_per_batch: int, min_batch: int = 1) -> int:
-    """
-    Compute batch size for a bucket so that total tokens ≈ tokens_per_batch.
-
-    Memory for a transformer forward pass scales as:
-        activations ∝ batch_size × seq_len × hidden_size
-        attention    ∝ batch_size × num_heads × seq_len² (without flash attn)
-
-    ModernBERT uses flash attention, so the dominant term is the linear one.
-    We keep batch_size × seq_len ≈ constant (= tokens_per_batch).
-    """
     return max(min_batch, tokens_per_batch // bucket_len)
 
 
 class MultiBucketBatchSampler(Sampler):
-    """
-    Yields batches where all items come from the same bucket.
-    Batch size varies per bucket to keep total tokens roughly constant.
-    Shuffles within and across buckets each epoch.
-    """
+    """Yields batches from the same bucket with dynamic batch sizes."""
 
     def __init__(self, bucket_info: dict, tokens_per_batch: int, min_batch: int = 1):
-        """
-        bucket_info: {bucket_name: (indices_list, pad_to)}
-            indices_list: explicit list of dataset indices for this split
-        """
         self.bucket_info = bucket_info
         self.tokens_per_batch = tokens_per_batch
         self.min_batch = min_batch
-
-        # Pre-compute batch sizes and total batch count
         self._total_batches = 0
         self._batch_sizes = {}
         for name, (indices, pad_to) in bucket_info.items():
@@ -155,8 +131,7 @@ class MultiBucketBatchSampler(Sampler):
             shuffled = list(indices)
             random.shuffle(shuffled)
             for i in range(0, len(shuffled), bs):
-                batch = shuffled[i:i + bs]
-                all_batches.append(batch)
+                all_batches.append(shuffled[i:i + bs])
         random.shuffle(all_batches)
         yield from all_batches
 
@@ -174,27 +149,13 @@ class MultiBucketBatchSampler(Sampler):
         return "\n".join(lines)
 
 
+def variable_length_collate(batch):
+    return {key: torch.stack([item[key] for item in batch]) for key in batch[0]}
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-
-def setup_lora(model, rank=8, alpha=16):
-    """Apply LoRA adapters to the ModernBERT backbone."""
-    from peft import LoraConfig, get_peft_model
-
-    lora_config = LoraConfig(
-        r=rank,
-        lora_alpha=alpha,
-        target_modules=["Wqkv", "Wo", "Wi"],  # ModernBERT attention + MLP projections
-        lora_dropout=0.05,
-        bias="none",
-        modules_to_save=["number_embedder", "number_head"],
-    )
-
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
-    return model
-
 
 def train(args):
     if args.device:
@@ -203,37 +164,38 @@ def train(args):
         device = torch.device("cuda" if torch.cuda.is_available()
                               else "mps" if torch.backends.mps.is_available()
                               else "cpu")
-    # Enable TF32 for any residual FP32 matmuls (Ampere+)
     if device.type == "cuda":
         torch.set_float32_matmul_precision('medium')
 
     if device.type == "cuda" and args.dtype in ("fp16", "bf16"):
         use_amp = True
         amp_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
-        use_scaler = args.dtype == "fp16"  # bf16 has full exponent range, no scaler needed
+        use_scaler = args.dtype == "fp16"
     else:
         use_amp = False
         amp_dtype = torch.float32
         use_scaler = False
     print(f"Device: {device}, dtype: {args.dtype}" + (" (AMP)" if use_amp else ""))
 
-    # Build model
-    print("Building model...")
+    # Build model — full parameter training, no LoRA
+    print("Building model (full fine-tuning, no LoRA)...")
     model = build_model(args.model_name)
-
-    # Apply LoRA
-    print(f"Applying LoRA (rank={args.lora_rank})...")
-    model = setup_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
     model = model.to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total params: {total_params:,}, trainable: {trainable_params:,}")
 
     if args.compile:
         print("Compiling model with torch.compile...")
         model = torch.compile(model)
 
-    # Load tokenizer just for token IDs
+    # Load tokenizer
     tokenizer = FinancialBertTokenizer(args.model_name)
 
-    # Load all bucket files and create datasets
+    # ------------------------------------------------------------------
+    # Load bucketed data
+    # ------------------------------------------------------------------
     bucket_dir = Path(args.data_dir)
     bucket_files = sorted(bucket_dir.glob("bucket_*.jsonl"))
 
@@ -260,8 +222,7 @@ def train(args):
         bucket_info[bf.stem] = (offset, len(ds), bucket_bound)
         offset += len(ds)
 
-    # Concatenate datasets
-    combined = torch.utils.data.ConcatDataset(datasets)
+    combined = ConcatDataset(datasets)
 
     # Three-way split based on source_file extension:
     #   .txt → regularization (Wikipedia etc.)
@@ -323,9 +284,9 @@ def train(args):
             reg_bucket_info_nonempty, args.tokens_per_batch, min_batch=args.min_batch_size,
         )
 
-    print(f"\nTrain batch plan (tokens_per_batch={args.tokens_per_batch}):")
+    print(f"\nFinancial train batch plan (tokens_per_batch={args.tokens_per_batch}):")
     print(batch_sampler.summary())
-    print(f"Total train batches per epoch: {len(batch_sampler)}")
+    print(f"Total financial train batches per epoch: {len(batch_sampler)}")
     print(f"\nVal batch plan:")
     print(val_batch_sampler.summary())
     print(f"Total val batches per epoch: {len(val_batch_sampler)}")
@@ -362,39 +323,34 @@ def train(args):
             collate_fn=variable_length_collate,
         )
 
-    # Optimizer: separate param groups
-    lora_params = []
-    number_params = []  # number_embedder + number_head (always trainable)
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "lora_" in name:
-            lora_params.append(param)
-        elif "number_embedder" in name or "number_head" in name:
-            number_params.append(param)
+    # ------------------------------------------------------------------
+    # Optimizer — single param group for full fine-tuning
+    # ------------------------------------------------------------------
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
 
-    print(f"LoRA params: {sum(p.numel() for p in lora_params):,}")
-    print(f"Number params: {sum(p.numel() for p in number_params):,}")
+    # Linear warmup + cosine decay schedule
+    total_steps = len(batch_sampler) * args.epochs
+    warmup_steps = min(args.warmup_steps, total_steps // 5)
 
-    optimizer = torch.optim.AdamW([
-        {"params": lora_params, "lr": args.lr_lora},
-        {"params": number_params, "lr": args.lr_heads},
-    ], weight_decay=args.weight_decay)
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    # AMP scaler — only needed for fp16 (bf16 has full exponent range)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
-    # Warmup: freeze everything except number_embedder + number_head
-    if args.warmup_steps > 0:
-        print(f"\nWarmup: freezing LoRA for {args.warmup_steps} steps "
-              f"(training number embedder/head only)")
-        for p in lora_params:
-            p.requires_grad = False
-
+    # ------------------------------------------------------------------
     # Training loop
+    # ------------------------------------------------------------------
     model.train()
     global_step = 0
-    lora_unfrozen = args.warmup_steps == 0
 
     for epoch in range(args.epochs):
         totals = {"loss": 0.0, "text": 0.0, "sign": 0.0, "mag": 0.0}
@@ -406,15 +362,9 @@ def train(args):
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}", unit="batch")
         for batch in pbar:
-            # Unfreeze LoRA after warmup
-            if not lora_unfrozen and global_step >= args.warmup_steps:
-                for p in lora_params:
-                    p.requires_grad = True
-                lora_unfrozen = True
-                print(f"\n  Step {global_step}: unfreezing LoRA")
-
             batch = {k: v.to(device) for k, v in batch.items()}
 
+            # --- Financial batch ---
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 outputs = model(
                     input_ids=batch["input_ids"],
@@ -429,7 +379,7 @@ def train(args):
             loss = outputs["loss"]
             scaler.scale(loss).backward()
 
-            # Regularization batch (interleaved)
+            # --- Regularization batch (interleaved) ---
             if reg_iter and random.random() < args.regularization_ratio:
                 try:
                     reg_batch = next(reg_iter)
@@ -458,8 +408,8 @@ def train(args):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+            scheduler.step()
 
-            # Track individual losses
             num_batches += 1
             global_step += 1
             totals["loss"] += loss.item()
@@ -467,13 +417,12 @@ def train(args):
             totals["sign"] += outputs["loss_sign"].item()
             totals["mag"] += outputs["loss_mag"].item()
 
-            phase = "warmup" if not lora_unfrozen else "full"
             pbar.set_postfix(
                 loss=f"{totals['loss']/num_batches:.4f}",
                 txt=f"{totals['text']/num_batches:.4f}",
                 sgn=f"{totals['sign']/num_batches:.4f}",
                 mag=f"{totals['mag']/num_batches:.4f}",
-                phase=phase,
+                lr=f"{scheduler.get_last_lr()[0]:.2e}",
                 reg=f"{reg_totals['loss']/max(1,reg_totals['count']):.4f}" if reg_totals['count'] > 0 else "n/a",
             )
 
@@ -518,75 +467,54 @@ def train(args):
               f"mag: {val_totals['mag']/vn:.4f}")
         model.train()
 
-        # Save checkpoint
+        # Save checkpoint (full model, not PEFT)
         if args.save_dir:
             save_path = os.path.join(args.save_dir, f"checkpoint_epoch{epoch+1}")
             os.makedirs(save_path, exist_ok=True)
-            model.save_pretrained(save_path)
-
-            # Append train/val losses to the PEFT-generated README.md
-            readme_path = os.path.join(save_path, "README.md")
-            if os.path.exists(readme_path):
-                with open(readme_path, "a") as f:
-                    f.write(f"\n## Training Losses (Epoch {epoch+1})\n\n")
-                    f.write(f"| Split | Total | Text | Sign | Magnitude |\n")
-                    f.write(f"|-------|-------|------|------|-----------|\n")
-                    f.write(f"| Train | {totals['loss']/n:.4f} | {totals['text']/n:.4f} "
-                            f"| {totals['sign']/n:.4f} | {totals['mag']/n:.4f} |\n")
-                    f.write(f"| Val   | {val_totals['loss']/vn:.4f} | {val_totals['text']/vn:.4f} "
-                            f"| {val_totals['sign']/vn:.4f} | {val_totals['mag']/vn:.4f} |\n")
-
+            torch.save({
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "train_loss": totals["loss"] / n,
+                "val_loss": val_totals["loss"] / vn,
+            }, os.path.join(save_path, "full_model.pt"))
             print(f"  Saved to {save_path}")
 
     print("Training complete.")
 
 
-def variable_length_collate(batch):
-    """
-    Collate function that handles variable-length sequences across buckets.
-    Within a batch all sequences have the same pad_to length (same bucket),
-    so we can just stack normally.
-    """
-    return {key: torch.stack([item[key] for item in batch]) for key in batch[0]}
-
-
 def main():
-    parser = argparse.ArgumentParser(description="MLM training with LoRA for FinancialModernBert")
+    parser = argparse.ArgumentParser(
+        description="Full-parameter MLM training for FinancialModernBert")
     parser.add_argument("--data_dir", required=True, help="Directory with bucketed JSONL files")
-    parser.add_argument("--save_dir", default="checkpoints/mlm_lora", help="Checkpoint save directory")
+    parser.add_argument("--save_dir", default="checkpoints/mlm_full",
+                        help="Checkpoint save directory")
     parser.add_argument("--model_name", default="answerdotai/ModernBERT-base", help="Base model")
     parser.add_argument("--tokens_per_batch", type=int, default=4096,
-                        help="Target total tokens per batch (batch_size = tokens_per_batch // seq_len)")
-    parser.add_argument("--min_batch_size", type=int, default=1, help="Minimum batch size for any bucket")
-    parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
-    parser.add_argument("--lr_lora", type=float, default=2e-4, help="Learning rate for LoRA params")
-    parser.add_argument("--lr_heads", type=float, default=1e-4, help="Learning rate for head params")
-    parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
-    parser.add_argument("--mask_prob", type=float, default=0.15, help="MLM mask probability")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
-    parser.add_argument("--warmup_steps", type=int, default=0,
-                        help="Number of steps to freeze LoRA and train only heads (0 = no warmup)")
-    parser.add_argument("--device", type=str, default=None,
-                        help="Device override (e.g. 'cuda', 'cuda:1', 'mps', 'cpu'). "
-                             "Auto-detected if not set.")
-    parser.add_argument("--dtype", type=str, default="bf16", choices=["fp32", "fp16", "bf16"],
-                        help="Training precision: bf16 (recommended for Ampere+/Blackwell), "
-                             "fp16 (with loss scaling), or fp32 (no mixed precision)")
-    parser.add_argument("--num_workers", type=int, default=4,
-                        help="DataLoader workers for parallel data loading")
+                        help="Target total tokens per batch")
+    parser.add_argument("--min_batch_size", type=int, default=1,
+                        help="Minimum batch size for any bucket")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--lr", type=float, default=5e-5,
+                        help="Learning rate (lower than LoRA — full fine-tuning)")
+    parser.add_argument("--mask_prob", type=float, default=0.15)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--warmup_steps", type=int, default=500,
+                        help="Linear warmup steps before cosine decay")
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--dtype", type=str, default="bf16",
+                        choices=["fp32", "fp16", "bf16"])
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--compile", action="store_true",
-                        help="Use torch.compile for kernel fusion (adds warmup time)")
-    parser.add_argument("--regularization_ratio", type=float, default=0,
+                        help="Use torch.compile for kernel fusion")
+    parser.add_argument("--regularization_ratio", type=float, default=0.3,
                         help="Probability of inserting a regularization batch (.txt data) "
-                             "after each financial batch (0 = disabled)")
-    args = parser.parse_args()
+                             "after each financial batch (0.3 = ~30%% of steps)")
 
+    args = parser.parse_args()
     train(args)
+
 
 if __name__ == "__main__":
     main()
-
-"""python -m training_pipeline.train_mlm     --data_dir '/content/drive/MyDrive/website predictor/bucketed'     --tokens_per_batch 32768     --dtype bf16     --compile     --num_workers 4     --epochs 3 --lr_heads 3e-4 --lr_lora 3e-4"""
-
-

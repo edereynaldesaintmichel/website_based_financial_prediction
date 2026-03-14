@@ -127,12 +127,12 @@ def chunk_file(filepath: str, max_tokens: int) -> List[dict]:
 
 
 def process_directory(input_dir: str, max_tokens: int) -> List[dict]:
-    """Process all .md files in a directory."""
+    """Process all .md and .txt files in a directory."""
     input_path = Path(input_dir)
-    md_files = sorted(input_path.glob("*.md"))
+    files = sorted(list(input_path.glob("*.md")) + list(input_path.glob("*.txt")))
     all_chunks = []
 
-    for fp in tqdm(md_files, desc=f"Chunking {input_path.name}", unit="file"):
+    for fp in tqdm(files, desc=f"Chunking {input_path.name}", unit="file"):
         chunks = chunk_file(str(fp), max_tokens)
         all_chunks.extend(chunks)
 
