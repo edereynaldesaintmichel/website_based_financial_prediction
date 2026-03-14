@@ -17,7 +17,6 @@ Usage:
         --lr_heads 1e-4
 """
 import argparse
-import json
 import os
 import random
 import sys
@@ -36,73 +35,67 @@ from financial_bert import build_model, FinancialBertTokenizer
 # ---------------------------------------------------------------------------
 
 class BucketedMLMDataset(Dataset):
-    """Loads pre-tokenized sequences from a single bucket file."""
+    """Loads pre-padded tensors from a single bucket .pt file.
 
-    def __init__(self, jsonl_path: str, pad_to: int, mask_prob: float = 0.15,
+    Expects the format produced by bucket_by_length.py:
+        input_ids:      (N, pad_to)    int32
+        is_number_mask: (N, pad_to)    int8
+        number_values:  (N, pad_to, 2) float32
+        source_files:   [str, ...]
+        pad_to:         int
+    """
+
+    def __init__(self, pt_path: str, mask_prob: float = 0.15,
                  pad_token_id: int = 0, mask_token_id: int = 50264):
-        self.items = []
-        self.source_files = []
-        with open(jsonl_path, "r") as f:
-            for line in f:
-                item = json.loads(line)
-                self.source_files.append(item.get("source_file", ""))
-                self.items.append(item)
-        self.pad_to = pad_to
+        data = torch.load(pt_path, map_location="cpu", mmap=True, weights_only=False)
+        self.input_ids = data["input_ids"]            # (N, pad_to) int32
+        self.is_number_mask = data["is_number_mask"]   # (N, pad_to) int8
+        self.number_values = data["number_values"]     # (N, pad_to, 2) float32
+        self.source_files = data["source_files"]       # list[str]
+        self.pad_to = data["pad_to"]
         self.mask_prob = mask_prob
         self.pad_token_id = pad_token_id
         self.mask_token_id = mask_token_id
 
     def __len__(self):
-        return len(self.items)
+        return self.input_ids.shape[0]
 
     def __getitem__(self, idx):
-        item = self.items[idx]
-        input_ids = list(item["input_ids"])
-        is_number_mask = list(item["is_number_mask"])
-        number_values = [list(v) for v in item["number_values"]]
-        seq_len = len(input_ids)
-
-        # Pad to bucket length
-        pad_len = self.pad_to - seq_len
-        attention_mask = [1] * seq_len + [0] * pad_len
-        input_ids = input_ids + [self.pad_token_id] * pad_len
-        is_number_mask = is_number_mask + [0] * pad_len
-        number_values = number_values + [[0.0, 0.0]] * pad_len
+        input_ids = self.input_ids[idx].to(torch.long).clone()
+        is_number_mask = self.is_number_mask[idx].float()
+        number_values = self.number_values[idx].clone()
+        attention_mask = (input_ids != self.pad_token_id).long()
+        seq_len = attention_mask.sum().item()
 
         # Create MLM labels and masked input
-        labels_text = [-100] * self.pad_to
-        labels_sign = [-100] * self.pad_to
-        labels_magnitude = [-100.0] * self.pad_to
-        masked_input_ids = list(input_ids)
+        labels_text = torch.full((self.pad_to,), -100, dtype=torch.long)
+        labels_sign = torch.full((self.pad_to,), -100, dtype=torch.long)
+        labels_magnitude = torch.full((self.pad_to,), -100.0, dtype=torch.float)
+        masked_input_ids = input_ids.clone()
 
         for i in range(seq_len):
             if is_number_mask[i] == 1:
-                # Number positions: always predict (like masking), but we
-                # mask the number embedding by zeroing number_values with prob mask_prob
-                labels_sign[i] = int(number_values[i][0])
-                labels_magnitude[i] = number_values[i][1]
+                labels_sign[i] = int(number_values[i, 0].item())
+                labels_magnitude[i] = number_values[i, 1].item()
                 if random.random() < self.mask_prob:
-                    # Zero out the number values so the model must predict
-                    number_values[i] = [0.0, 0.0]
+                    number_values[i] = 0.0
             elif attention_mask[i] == 1:
-                # Text positions: standard MLM masking
                 if random.random() < self.mask_prob:
-                    labels_text[i] = input_ids[i]  # predict original token
-                    # 80% mask, 10% random, 10% keep
+                    labels_text[i] = input_ids[i]
                     r = random.random()
                     if r < 0.8:
                         masked_input_ids[i] = self.mask_token_id
                     elif r < 0.9:
-                        masked_input_ids[i] = random.randint(0, 50263)  # random token
+                        masked_input_ids[i] = random.randint(0, 50263)
 
         return {
-            "input_ids": torch.tensor(masked_input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "is_number_mask": torch.tensor(is_number_mask, dtype=torch.float),
-            "number_values": torch.tensor(number_values, dtype=torch.float),
-            "labels_text": torch.tensor(labels_text, dtype=torch.long),
-            "labels_sign": torch.tensor(labels_sign, dtype=torch.long),
-            "labels_magnitude": torch.tensor(labels_magnitude, dtype=torch.float),
+            "input_ids": masked_input_ids,
+            "attention_mask": attention_mask,
+            "is_number_mask": is_number_mask,
+            "number_values": number_values,
+            "labels_text": labels_text,
+            "labels_sign": labels_sign,
+            "labels_magnitude": labels_magnitude,
         }
 
 
@@ -235,10 +228,10 @@ def train(args):
 
     # Load all bucket files and create datasets
     bucket_dir = Path(args.data_dir)
-    bucket_files = sorted(bucket_dir.glob("bucket_*.jsonl"))
+    bucket_files = sorted(bucket_dir.glob("bucket_*.pt"))
 
     if not bucket_files:
-        print(f"No bucket files found in {args.data_dir}")
+        print(f"No bucket .pt files found in {args.data_dir}")
         return
 
     datasets = []
@@ -246,10 +239,8 @@ def train(args):
     offset = 0
 
     for bf in bucket_files:
-        bucket_bound = int(bf.stem.split("_")[1])
         ds = BucketedMLMDataset(
             str(bf),
-            pad_to=bucket_bound,
             mask_prob=args.mask_prob,
             pad_token_id=tokenizer.pad_token_id or 0,
             mask_token_id=tokenizer.mask_token_id,
@@ -257,7 +248,7 @@ def train(args):
         if len(ds) == 0:
             continue
         datasets.append(ds)
-        bucket_info[bf.stem] = (offset, len(ds), bucket_bound)
+        bucket_info[bf.stem] = (offset, len(ds), ds.pad_to)
         offset += len(ds)
 
     # Concatenate datasets
