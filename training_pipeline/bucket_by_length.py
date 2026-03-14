@@ -3,7 +3,17 @@ Step 3: Bucket tokenized chunks by sequence length.
 
 Computes optimal bucket boundaries from the data to minimize
 intra-bucket length variance (1D k-means / Fisher-Jenks style),
-then saves each bucket as a separate file.
+then pads and stacks each bucket into a single .pt file with
+pre-packed tensors ready for training.
+
+Output per bucket:
+    bucket_{bound}.pt = {
+        "input_ids":      (N, pad_to)    uint16
+        "is_number_mask": (N, pad_to)    int8
+        "number_values":  (N, pad_to, 2) float32
+        "source_files":   [str, ...]
+        "pad_to":         int
+    }
 
 Usage:
     python -m training_pipeline.bucket_by_length \
@@ -16,6 +26,7 @@ import json
 import os
 from collections import defaultdict
 
+import torch
 from tqdm import tqdm
 
 
@@ -100,10 +111,35 @@ def get_bucket(seq_length: int, bucket_bounds: list) -> int:
     return bucket_bounds[-1]
 
 
+def pad_and_stack(items: list, pad_to: int) -> dict:
+    """Pad variable-length items and stack into contiguous tensors."""
+    n = len(items)
+    input_ids = torch.zeros(n, pad_to, dtype=torch.uint16)
+    is_number_mask = torch.zeros(n, pad_to, dtype=torch.int8)
+    number_values = torch.zeros(n, pad_to, 2, dtype=torch.float32)
+    source_files = []
+
+    for i, item in enumerate(items):
+        ids = item["input_ids"]
+        seq_len = len(ids)
+        input_ids[i, :seq_len] = torch.tensor(ids, dtype=torch.uint16)
+        is_number_mask[i, :seq_len] = torch.tensor(item["is_number_mask"], dtype=torch.int8)
+        number_values[i, :seq_len] = torch.tensor(item["number_values"][:seq_len], dtype=torch.float32)
+        source_files.append(item.get("source_file", ""))
+
+    return {
+        "input_ids": input_ids,
+        "is_number_mask": is_number_mask,
+        "number_values": number_values,
+        "source_files": source_files,
+        "pad_to": pad_to,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Bucket tokenized chunks by length")
     parser.add_argument("--input", required=True, help="Input tokenized JSONL file")
-    parser.add_argument("--output_dir", required=True, help="Output directory for bucketed files")
+    parser.add_argument("--output_dir", required=True, help="Output directory for bucketed .pt files")
     parser.add_argument("--num_buckets", type=int, default=10,
                         help="Number of buckets (boundaries computed to minimize variance)")
     parser.add_argument("--buckets", nargs="+", type=int, default=None,
@@ -112,7 +148,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Pass 1: stream file to collect only seq_length values (low RAM)
+    # Pass 1: collect lengths
     lengths = []
     with open(args.input, "r", encoding="utf-8") as f:
         for line in tqdm(f, desc="Pass 1: reading lengths", unit="seq"):
@@ -128,47 +164,76 @@ def main():
         bucket_bounds = compute_optimal_boundaries(lengths, args.num_buckets)
         print(f"Optimal buckets ({len(bucket_bounds)}): {bucket_bounds}")
 
-    # Pass 2: stream file again, write each item directly to its bucket file
-    bucket_files = {}
-    bucket_lengths = defaultdict(list)
-    bucket_num_counts = defaultdict(int)
+    # Pass 2: spool items to temporary per-bucket JSONL files on disk
+    # (avoids holding all items in memory at once)
+    import shutil
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="bucket_tmp_")
 
-    for bound in bucket_bounds:
-        output_file = os.path.join(args.output_dir, f"bucket_{bound}.jsonl")
-        bucket_files[bound] = open(output_file, "w", encoding="utf-8")
+    try:
+        bucket_tmp_files = {}
+        bucket_counts = defaultdict(int)
+        bucket_num_counts = defaultdict(int)
+        bucket_lengths = defaultdict(list)
 
-    with open(args.input, "r", encoding="utf-8") as f:
-        for line in tqdm(f, total=len(lengths), desc="Pass 2: bucketing", unit="seq"):
-            item = json.loads(line)
-            seq_len = item["seq_length"]
-            bound = get_bucket(seq_len, bucket_bounds)
-            bucket_files[bound].write(line)
-            bucket_lengths[bound].append(seq_len)
-            bucket_num_counts[bound] += sum(item["is_number_mask"])
+        for bound in bucket_bounds:
+            tmp_path = os.path.join(tmp_dir, f"tmp_{bound}.jsonl")
+            bucket_tmp_files[bound] = open(tmp_path, "w", encoding="utf-8")
 
-    for fh in bucket_files.values():
-        fh.close()
+        with open(args.input, "r", encoding="utf-8") as f:
+            for line in tqdm(f, total=len(lengths), desc="Pass 2: bucketing to disk", unit="seq"):
+                item = json.loads(line)
+                seq_len = item["seq_length"]
+                bound = get_bucket(seq_len, bucket_bounds)
+                bucket_tmp_files[bound].write(line)
+                bucket_counts[bound] += 1
+                bucket_num_counts[bound] += sum(item["is_number_mask"])
+                bucket_lengths[bound].append(seq_len)
 
-    # Report stats
-    total_variance = 0
-    total_seqs = 0
-    non_empty = 0
-    for bound in bucket_bounds:
-        bl = bucket_lengths[bound]
-        if not bl:
-            continue
-        non_empty += 1
-        total_seqs += len(bl)
-        mean_len = sum(bl) / len(bl)
-        variance = sum((l - mean_len) ** 2 for l in bl) / len(bl)
-        padding_waste = sum(bound - l for l in bl) / (bound * len(bl)) * 100
-        total_variance += variance * len(bl)
+        for fh in bucket_tmp_files.values():
+            fh.close()
 
-        print(f"  Bucket ≤{bound:>4}: {len(bl):>6} seqs | "
-              f"len {min(bl):>3}-{max(bl):>3} | "
-              f"mean {mean_len:>5.0f} | var {variance:>8.1f} | "
-              f"pad waste {padding_waste:>4.1f}% | "
-              f"numbers {bucket_num_counts[bound]:>6}")
+        # Pass 3: load each bucket independently, pad+stack, save .pt, free memory
+        total_variance = 0
+        total_seqs = 0
+        non_empty = 0
+        for bound in bucket_bounds:
+            count = bucket_counts[bound]
+            if count == 0:
+                continue
+
+            non_empty += 1
+            total_seqs += count
+            bl = bucket_lengths[bound]
+            mean_len = sum(bl) / count
+            variance = sum((l - mean_len) ** 2 for l in bl) / count
+            padding_waste = sum(bound - l for l in bl) / (bound * count) * 100
+            total_variance += variance * count
+
+            print(f"  Bucket ≤{bound:>4}: {count:>6} seqs | "
+                  f"len {min(bl):>3}-{max(bl):>3} | "
+                  f"mean {mean_len:>5.0f} | var {variance:>8.1f} | "
+                  f"pad waste {padding_waste:>4.1f}% | "
+                  f"numbers {bucket_num_counts[bound]:>6}")
+
+            # Load this bucket's items from temp file
+            tmp_path = os.path.join(tmp_dir, f"tmp_{bound}.jsonl")
+            items = []
+            with open(tmp_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    items.append(json.loads(line))
+
+            # Stack into tensors and save
+            bucket_data = pad_and_stack(items, bound)
+            del items  # free raw dicts before saving
+            output_path = os.path.join(args.output_dir, f"bucket_{bound}.pt")
+            torch.save(bucket_data, output_path)
+            del bucket_data  # free tensors before next bucket
+            mb = os.path.getsize(output_path) / 1e6
+            print(f"           -> {output_path} ({mb:.1f} MB)")
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     avg_variance = total_variance / total_seqs
     print(f"\nTotal: {total_seqs} sequences, {non_empty} non-empty buckets")
