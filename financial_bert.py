@@ -329,8 +329,8 @@ class GatedNumberEmbedder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.sign_emb = nn.Embedding(2, config.sign_embed_dim)
-        self.magnitude_emb = nn.Embedding(config.num_magnitude_bins, config.magnitude_embed_dim)
+        self.sign_emb = nn.Embedding(3, config.sign_embed_dim)  # 0=pos, 1=neg, 2=mask
+        self.magnitude_emb = nn.Embedding(config.num_magnitude_bins + 1, config.magnitude_embed_dim)  # last bin = mask
         
         input_dim = config.sign_embed_dim + config.magnitude_embed_dim
         self.gate_proj = nn.Linear(input_dim, config.hidden_size)
@@ -341,20 +341,26 @@ class GatedNumberEmbedder(nn.Module):
         min_v = self.config.magnitude_min
         max_v = self.config.magnitude_max
         n_bins = self.config.num_magnitude_bins
-        
+        mask_bin = n_bins  # dedicated mask bin (last entry)
+
+        is_mask = log_vals > max_v  # sentinel: magnitude_max + 1
+
         clamped = log_vals.clamp(min_v, max_v)
         norm_pos = (clamped - min_v) / (max_v - min_v) * (n_bins - 1)
-        
+
         lower_idx = norm_pos.floor().long()
         upper_idx = norm_pos.ceil().long()
-        
+
         weight_upper = norm_pos - lower_idx.float()
         weight_lower = 1.0 - weight_upper
-        
+
         emb_lower = self.magnitude_emb(lower_idx)
         emb_upper = self.magnitude_emb(upper_idx)
-        
-        return emb_lower * weight_lower.unsqueeze(-1) + emb_upper * weight_upper.unsqueeze(-1)
+
+        interpolated = emb_lower * weight_lower.unsqueeze(-1) + emb_upper * weight_upper.unsqueeze(-1)
+
+        mask_emb = self.magnitude_emb(torch.full_like(lower_idx, mask_bin))
+        return torch.where(is_mask.unsqueeze(-1), mask_emb, interpolated)
 
     def forward(self, number_values):
         sign_ids = number_values[..., 0].long()
