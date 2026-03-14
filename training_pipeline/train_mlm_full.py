@@ -354,15 +354,11 @@ def train(args):
         warmup_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"  Warmup trainable params: {warmup_trainable:,}")
 
+        warmup_lr = args.number_warmup_lr_mult * args.lr
         warmup_optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
-            lr=args.lr*5,
+            lr=warmup_lr,
             weight_decay=args.weight_decay,
-        )
-        # Linear ramp for the warmup phase
-        warmup_sched = torch.optim.lr_scheduler.LambdaLR(
-            warmup_optimizer,
-            lambda step: min(1.0, step / max(1, args.number_warmup_steps // 5)),
         )
 
         model.train()
@@ -397,7 +393,6 @@ def train(args):
             scaler.step(warmup_optimizer)
             scaler.update()
             warmup_optimizer.zero_grad()
-            warmup_sched.step()
 
             warmup_step += 1
             warmup_totals["loss"] += loss.item()
@@ -409,7 +404,6 @@ def train(args):
                 loss=f"{warmup_totals['loss']/warmup_step:.4f}",
                 sgn=f"{warmup_totals['sign']/warmup_step:.4f}",
                 mag=f"{warmup_totals['mag']/warmup_step:.4f}",
-                lr=f"{warmup_sched.get_last_lr()[0]:.2e}",
             )
         pbar.close()
 
@@ -610,6 +604,8 @@ def main():
     parser.add_argument("--number_warmup_steps", type=int, default=500,
                         help="Steps to train only number_embedder + number_head "
                              "before unfreezing all weights (0 to disable)")
+    parser.add_argument("--number_warmup_lr_mult", type=float, default=5.0,
+                        help="LR multiplier for number warmup phase (warmup_lr = mult * lr)")
     parser.add_argument("--sign_embed_dim", type=int, default=16,
                         help="Sign embedding dimension")
     parser.add_argument("--magnitude_embed_dim", type=int, default=224,
