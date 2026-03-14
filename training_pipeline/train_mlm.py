@@ -3,7 +3,7 @@ MLM training script for FinancialModernBert with LoRA.
 
 Loads pre-tokenized, bucketed data and trains with:
 - LoRA adapters on the ModernBERT backbone (rank 8)
-- Full-parameter training on GatedNumberEmbedder + GatedNumberHead
+- Full-parameter training on NumberEmbedder + NumberHead
 - Dual loss: text MLM + number prediction (sign CE + soft-label magnitude CE)
 - Dynamic batch size: inversely proportional to sequence length, keeping
   total tokens per batch roughly constant
