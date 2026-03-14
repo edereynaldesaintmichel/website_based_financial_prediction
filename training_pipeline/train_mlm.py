@@ -46,7 +46,8 @@ class BucketedMLMDataset(Dataset):
     """
 
     def __init__(self, pt_path: str, mask_prob: float = 0.15,
-                 pad_token_id: int = 0, mask_token_id: int = 50264):
+                 pad_token_id: int = 0, mask_token_id: int = 50264,
+                 magnitude_min: float = -12.0, magnitude_max: float = 12.0):
         data = torch.load(pt_path, map_location="cpu", mmap=True, weights_only=False)
         self.input_ids = data["input_ids"]            # (N, pad_to) int32
         self.is_number_mask = data["is_number_mask"]   # (N, pad_to) int8
@@ -56,6 +57,8 @@ class BucketedMLMDataset(Dataset):
         self.mask_prob = mask_prob
         self.pad_token_id = pad_token_id
         self.mask_token_id = mask_token_id
+        self.magnitude_min = magnitude_min
+        self.magnitude_max = magnitude_max
 
     def __len__(self):
         return self.input_ids.shape[0]
@@ -78,7 +81,15 @@ class BucketedMLMDataset(Dataset):
                 labels_sign[i] = int(number_values[i, 0].item())
                 labels_magnitude[i] = number_values[i, 1].item()
                 if random.random() < self.mask_prob:
-                    number_values[i] = 0.0
+                    r = random.random()
+                    if r < 0.8:
+                        # Sentinel: off-distribution value
+                        number_values[i, 0] = 0.0
+                        number_values[i, 1] = self.magnitude_max
+                    elif r < 0.9:
+                        # Random number
+                        number_values[i, 0] = float(random.randint(0, 1))
+                        number_values[i, 1] = random.uniform(self.magnitude_min, self.magnitude_max)
             elif attention_mask[i] == 1:
                 if random.random() < self.mask_prob:
                     labels_text[i] = input_ids[i]
