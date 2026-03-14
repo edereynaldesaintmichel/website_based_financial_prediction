@@ -325,17 +325,16 @@ class PredictionHead(nn.Module):
         hidden_states = self.decoder(hidden_states)
         return hidden_states
 
-class GatedNumberEmbedder(nn.Module):
+class NumberEmbedder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.sign_emb = nn.Embedding(3, config.sign_embed_dim)  # 0=pos, 1=neg, 2=mask
         self.magnitude_emb = nn.Embedding(config.num_magnitude_bins + 1, config.magnitude_embed_dim)  # last bin = mask
-        
+
         input_dim = config.sign_embed_dim + config.magnitude_embed_dim
-        self.gate_proj = nn.Linear(input_dim, config.hidden_size)
-        self.val_proj = nn.Linear(input_dim, config.hidden_size)
-        self.out_norm = nn.LayerNorm(config.hidden_size)
+        self.proj = nn.Linear(input_dim, config.hidden_size, bias=False)
+        self.norm = nn.LayerNorm(config.hidden_size)
 
     def _get_magnitude_embeddings(self, log_vals):
         min_v = self.config.magnitude_min
@@ -370,35 +369,36 @@ class GatedNumberEmbedder(nn.Module):
         m_emb = self._get_magnitude_embeddings(log_vals)
 
         concat_feats = torch.cat([s_emb, m_emb], dim=-1)
+        return self.norm(self.proj(concat_feats))
 
-        gate = torch.sigmoid(self.gate_proj(concat_feats))
-        val = self.val_proj(concat_feats)
+class NumberHead(nn.Module):
+    """Decodes numbers by projecting back through tied embedder weights."""
 
-        out = gate * val
-        return self.out_norm(out)
-
-class GatedNumberHead(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, number_embedder: NumberEmbedder):
         super().__init__()
         self.config = config
-        # self.val_proj = nn.Linear(config.hidden_size, config.hidden_size)
-        # self.gate_proj = nn.Linear(config.hidden_size, config.hidden_size)
-        
-        self.decoder_mlp = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.GELU(),
-            nn.LayerNorm(config.hidden_size),
-            nn.Linear(config.hidden_size, config.num_magnitude_bins + 2),
-        )
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.act = nn.GELU()
+        self.norm = nn.LayerNorm(config.hidden_size)
+
+        # Inverse of embedder's proj: hidden_size → (sign_embed_dim + magnitude_embed_dim)
+        input_dim = config.sign_embed_dim + config.magnitude_embed_dim
+        self.inv_proj = nn.Linear(config.hidden_size, input_dim, bias=False)
+        self.inv_proj.weight = number_embedder.proj.weight  # tied (shape: hidden_size × input_dim)
+
+        # Embedding tables for dot-product decoding (tied references, sliced in forward)
+        self.sign_emb = number_embedder.sign_emb
+        self.magnitude_emb = number_embedder.magnitude_emb
 
     def forward(self, sequence_output):
-        # gate = torch.sigmoid(self.gate_proj(sequence_output))
-        # val = self.val_proj(sequence_output)
-        # gated_out = gate * val
-
-        logits = self.decoder_mlp(sequence_output)
-
-        return logits[...,:2], logits[...,2:]
+        h = self.norm(self.act(self.dense(sequence_output)))
+        concat_space = self.inv_proj(h)
+        sign_dim = self.config.sign_embed_dim
+        # Dot product with embedding rows (exclude mask entries)
+        sign_logits = F.linear(concat_space[..., :sign_dim], self.sign_emb.weight[:2])
+        magnitude_logits = F.linear(concat_space[..., sign_dim:],
+                                    self.magnitude_emb.weight[:self.config.num_magnitude_bins])
+        return sign_logits, magnitude_logits
 
 class FinancialModernBert(ModernBertPreTrainedModel):
     config_class = FinancialModernBertConfig
@@ -407,9 +407,9 @@ class FinancialModernBert(ModernBertPreTrainedModel):
         super().__init__(config)
         self.config = config
         self.modernbert = ModernBertModel(config)
-        self.number_embedder = GatedNumberEmbedder(config)
+        self.number_embedder = NumberEmbedder(config)
         self.lm_head = PredictionHead(config)
-        self.number_head = GatedNumberHead(config)
+        self.number_head = NumberHead(config, self.number_embedder)
         self.post_init()
 
     def _get_embedding_layer(self):
