@@ -499,10 +499,13 @@ class FinancialModernBert(ModernBertPreTrainedModel):
             "magnitude_logits": magnitude_logits
         }
 
-def build_model(model_id="answerdotai/ModernBERT-base", num_magnitude_bins=128):
+def build_model(model_id="answerdotai/ModernBERT-base", num_magnitude_bins=128,
+                sign_embed_dim=8, magnitude_embed_dim=64):
     donor_model = ModernBertForMaskedLM.from_pretrained(model_id)
     config = FinancialModernBertConfig.from_pretrained(model_id)
     config.num_magnitude_bins = num_magnitude_bins
+    config.sign_embed_dim = sign_embed_dim
+    config.magnitude_embed_dim = magnitude_embed_dim
     
     financial_model = FinancialModernBert(config)
     financial_model.modernbert.load_state_dict(donor_model.model.state_dict())
