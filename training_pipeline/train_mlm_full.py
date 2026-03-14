@@ -332,6 +332,95 @@ def train(args):
             collate_fn=variable_length_collate,
         )
 
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+
+    # ------------------------------------------------------------------
+    # Number warmup phase — train only number_embedder + number_head
+    # ------------------------------------------------------------------
+    if args.number_warmup_steps > 0:
+        print(f"\n--- Number warmup: {args.number_warmup_steps} steps "
+              f"(only number_embedder + number_head trainable) ---")
+
+        # Freeze everything
+        for p in model.parameters():
+            p.requires_grad = False
+        # Unfreeze number_embedder and number_head (head.dense, head.norm;
+        # tied weights proj_weight/sign_emb/magnitude_emb are owned by embedder)
+        for p in model.number_embedder.parameters():
+            p.requires_grad = True
+        for p in model.number_head.parameters():
+            p.requires_grad = True
+
+        warmup_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"  Warmup trainable params: {warmup_trainable:,}")
+
+        warmup_optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=args.lr*5,
+            weight_decay=args.weight_decay,
+        )
+        # Linear ramp for the warmup phase
+        warmup_sched = torch.optim.lr_scheduler.LambdaLR(
+            warmup_optimizer,
+            lambda step: min(1.0, step / max(1, args.number_warmup_steps // 5)),
+        )
+
+        model.train()
+        warmup_step = 0
+        warmup_totals = {"loss": 0.0, "sign": 0.0, "mag": 0.0}
+        warmup_iter = iter(dataloader)
+
+        pbar = tqdm(total=args.number_warmup_steps, desc="Number warmup", unit="batch")
+        while warmup_step < args.number_warmup_steps:
+            try:
+                batch = next(warmup_iter)
+            except StopIteration:
+                warmup_iter = iter(dataloader)
+                batch = next(warmup_iter)
+
+            batch = {k: v.to(device) for k, v in batch.items()}
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    is_number_mask=batch["is_number_mask"],
+                    number_values=batch["number_values"],
+                    labels_text=batch["labels_text"],
+                    labels_sign=batch["labels_sign"],
+                    labels_magnitude=batch["labels_magnitude"],
+                )
+
+            loss = outputs["loss"]
+            scaler.scale(loss).backward()
+            scaler.unscale_(warmup_optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(warmup_optimizer)
+            scaler.update()
+            warmup_optimizer.zero_grad()
+            warmup_sched.step()
+
+            warmup_step += 1
+            warmup_totals["loss"] += loss.item()
+            warmup_totals["sign"] += outputs["loss_sign"].item()
+            warmup_totals["mag"] += outputs["loss_mag"].item()
+
+            pbar.update(1)
+            pbar.set_postfix(
+                loss=f"{warmup_totals['loss']/warmup_step:.4f}",
+                sgn=f"{warmup_totals['sign']/warmup_step:.4f}",
+                mag=f"{warmup_totals['mag']/warmup_step:.4f}",
+                lr=f"{warmup_sched.get_last_lr()[0]:.2e}",
+            )
+        pbar.close()
+
+        n = max(warmup_step, 1)
+        print(f"  Number warmup done — loss: {warmup_totals['loss']/n:.4f}  "
+              f"sign: {warmup_totals['sign']/n:.4f}  mag: {warmup_totals['mag']/n:.4f}")
+
+        # Unfreeze all parameters for full fine-tuning
+        for p in model.parameters():
+            p.requires_grad = True
+
     # ------------------------------------------------------------------
     # Optimizer — single param group for full fine-tuning
     # ------------------------------------------------------------------
@@ -343,17 +432,15 @@ def train(args):
 
     # Linear warmup + cosine decay schedule
     total_steps = len(batch_sampler) * args.epochs
-    warmup_steps = min(args.warmup_steps, total_steps // 5)
+    lr_warmup_steps = min(args.warmup_steps, total_steps // 5)
 
     def lr_lambda(step):
-        if step < warmup_steps:
-            return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        if step < lr_warmup_steps:
+            return step / max(1, lr_warmup_steps)
+        progress = (step - lr_warmup_steps) / max(1, total_steps - lr_warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
     # ------------------------------------------------------------------
     # Training loop
@@ -520,6 +607,9 @@ def main():
     parser.add_argument("--regularization_ratio", type=float, default=0.3,
                         help="Probability of inserting a regularization batch (.txt data) "
                              "after each financial batch (0.3 = ~30%% of steps)")
+    parser.add_argument("--number_warmup_steps", type=int, default=500,
+                        help="Steps to train only number_embedder + number_head "
+                             "before unfreezing all weights (0 to disable)")
     parser.add_argument("--sign_embed_dim", type=int, default=16,
                         help="Sign embedding dimension")
     parser.add_argument("--magnitude_embed_dim", type=int, default=224,
