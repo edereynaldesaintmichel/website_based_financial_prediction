@@ -381,18 +381,18 @@ class NumberHead(nn.Module):
         self.act = nn.GELU()
         self.norm = nn.LayerNorm(config.hidden_size)
 
-        # Inverse of embedder's proj: hidden_size → (sign_embed_dim + magnitude_embed_dim)
-        input_dim = config.sign_embed_dim + config.magnitude_embed_dim
-        self.inv_proj = nn.Linear(config.hidden_size, input_dim, bias=False)
-        self.inv_proj.weight = number_embedder.proj.weight  # tied (shape: hidden_size × input_dim)
-
-        # Embedding tables for dot-product decoding (tied references, sliced in forward)
+        # Tied weights — proj.weight is (hidden_size, input_dim), so we transpose
+        # in forward to get the inverse projection (hidden_size → input_dim).
+        # Can't use nn.Linear tying here: shapes are genuinely transposed.
+        self.proj_weight = number_embedder.proj.weight  # (hidden_size, input_dim)
         self.sign_emb = number_embedder.sign_emb
         self.magnitude_emb = number_embedder.magnitude_emb
 
     def forward(self, sequence_output):
         h = self.norm(self.act(self.dense(sequence_output)))
-        concat_space = self.inv_proj(h)
+        # Inverse projection: F.linear(h, W) computes h @ W.T, so we pass W.T
+        # to get h @ W (the inverse of the embedder's h = concat @ W.T)
+        concat_space = F.linear(h, self.proj_weight.t())
         sign_dim = self.config.sign_embed_dim
         # Dot product with embedding rows (exclude mask entries)
         sign_logits = F.linear(concat_space[..., :sign_dim], self.sign_emb.weight[:2])
