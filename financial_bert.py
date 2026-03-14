@@ -325,7 +325,7 @@ class PredictionHead(nn.Module):
         hidden_states = self.decoder(hidden_states)
         return hidden_states
 
-class NumberEmbedder(nn.Module):
+class GatedNumberEmbedder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -333,8 +333,9 @@ class NumberEmbedder(nn.Module):
         self.magnitude_emb = nn.Embedding(config.num_magnitude_bins + 1, config.magnitude_embed_dim)  # last bin = mask
 
         input_dim = config.sign_embed_dim + config.magnitude_embed_dim
-        self.proj = nn.Linear(input_dim, config.hidden_size, bias=False)
-        self.norm = nn.LayerNorm(config.hidden_size)
+        self.gate_proj = nn.Linear(input_dim, config.hidden_size)
+        self.val_proj = nn.Linear(input_dim, config.hidden_size)
+        self.out_norm = nn.LayerNorm(config.hidden_size)
 
     def _get_magnitude_embeddings(self, log_vals):
         min_v = self.config.magnitude_min
@@ -369,36 +370,30 @@ class NumberEmbedder(nn.Module):
         m_emb = self._get_magnitude_embeddings(log_vals)
 
         concat_feats = torch.cat([s_emb, m_emb], dim=-1)
-        return self.norm(self.proj(concat_feats))
 
-class NumberHead(nn.Module):
-    """Decodes numbers by projecting back through tied embedder weights."""
+        gate = F.silu(self.gate_proj(concat_feats))
+        val = self.val_proj(concat_feats)
 
-    def __init__(self, config, number_embedder: NumberEmbedder):
+        return self.out_norm(gate * val)
+
+class GatedNumberHead(nn.Module):
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.act = nn.GELU()
-        self.norm = nn.LayerNorm(config.hidden_size)
 
-        # Tied weights — proj.weight is (hidden_size, input_dim), so we transpose
-        # in forward to get the inverse projection (hidden_size → input_dim).
-        # Can't use nn.Linear tying here: shapes are genuinely transposed.
-        self.proj_weight = number_embedder.proj.weight  # (hidden_size, input_dim)
-        self.sign_emb = number_embedder.sign_emb
-        self.magnitude_emb = number_embedder.magnitude_emb
+        self.gate_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.val_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.out_norm = nn.LayerNorm(config.hidden_size)
+
+        self.decoder = nn.Linear(config.hidden_size, config.num_magnitude_bins + 2)
 
     def forward(self, sequence_output):
-        h = self.norm(self.act(self.dense(sequence_output)))
-        # Inverse projection: F.linear(h, W) computes h @ W.T, so we pass W.T
-        # to get h @ W (the inverse of the embedder's h = concat @ W.T)
-        concat_space = F.linear(h, self.proj_weight.t())
-        sign_dim = self.config.sign_embed_dim
-        # Dot product with embedding rows (exclude mask entries)
-        sign_logits = F.linear(concat_space[..., :sign_dim], self.sign_emb.weight[:2])
-        magnitude_logits = F.linear(concat_space[..., sign_dim:],
-                                    self.magnitude_emb.weight[:self.config.num_magnitude_bins])
-        return sign_logits, magnitude_logits
+        gate = F.silu(self.gate_proj(sequence_output))
+        val = self.val_proj(sequence_output)
+        h = self.out_norm(gate * val)
+
+        logits = self.decoder(h)
+        return logits[..., :2], logits[..., 2:]
 
 class FinancialModernBert(ModernBertPreTrainedModel):
     config_class = FinancialModernBertConfig
@@ -407,9 +402,9 @@ class FinancialModernBert(ModernBertPreTrainedModel):
         super().__init__(config)
         self.config = config
         self.modernbert = ModernBertModel(config)
-        self.number_embedder = NumberEmbedder(config)
+        self.number_embedder = GatedNumberEmbedder(config)
         self.lm_head = PredictionHead(config)
-        self.number_head = NumberHead(config, self.number_embedder)
+        self.number_head = GatedNumberHead(config)
         self.post_init()
 
     def _get_embedding_layer(self):
