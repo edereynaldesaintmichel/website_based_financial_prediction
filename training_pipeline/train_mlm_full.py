@@ -48,7 +48,7 @@ class BucketedMLMDataset(Dataset):
 
     def __init__(self, pt_path: str, mask_prob: float = 0.15,
                  pad_token_id: int = 0, mask_token_id: int = 50264):
-        data = torch.load(pt_path, map_location="cpu", mmap=True, weights_only=False)
+        data = torch.load(pt_path, map_location="cpu", weights_only=False)
         self.input_ids = data["input_ids"]            # (N, pad_to) int32
         self.is_number_mask = data["is_number_mask"]   # (N, pad_to) int8
         self.number_values = data["number_values"]     # (N, pad_to, 2) float32
