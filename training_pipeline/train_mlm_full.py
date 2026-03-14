@@ -21,6 +21,7 @@ import math
 import os
 import random
 import sys
+from collections import deque
 from pathlib import Path
 
 import torch
@@ -442,10 +443,10 @@ def train(args):
     model.train()
     global_step = 0
 
+    MA_WINDOW = 100
+
     for epoch in range(args.epochs):
-        totals = {"loss": 0.0, "text": 0.0, "sign": 0.0, "mag": 0.0}
-        reg_totals = {"loss": 0.0, "count": 0}
-        num_batches = 0
+        ma = {k: deque(maxlen=MA_WINDOW) for k in ("loss", "text", "sign", "mag", "reg")}
 
         # Fresh regularization iterator each epoch
         reg_iter = iter(reg_dataloader) if reg_dataloader else None
@@ -490,8 +491,7 @@ def train(args):
                     )
                 reg_loss = reg_outputs["loss"]
                 scaler.scale(reg_loss).backward()
-                reg_totals["loss"] += reg_loss.item()
-                reg_totals["count"] += 1
+                ma["reg"].append(reg_loss.item())
 
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -500,31 +500,28 @@ def train(args):
             optimizer.zero_grad()
             scheduler.step()
 
-            num_batches += 1
             global_step += 1
-            totals["loss"] += loss.item()
-            totals["text"] += outputs["loss_text"].item()
-            totals["sign"] += outputs["loss_sign"].item()
-            totals["mag"] += outputs["loss_mag"].item()
+            ma["loss"].append(loss.item())
+            ma["text"].append(outputs["loss_text"].item())
+            ma["sign"].append(outputs["loss_sign"].item())
+            ma["mag"].append(outputs["loss_mag"].item())
 
             pbar.set_postfix(
-                loss=f"{totals['loss']/num_batches:.4f}",
-                txt=f"{totals['text']/num_batches:.4f}",
-                sgn=f"{totals['sign']/num_batches:.4f}",
-                mag=f"{totals['mag']/num_batches:.4f}",
+                loss=f"{sum(ma['loss'])/len(ma['loss']):.4f}",
+                txt=f"{sum(ma['text'])/len(ma['text']):.4f}",
+                sgn=f"{sum(ma['sign'])/len(ma['sign']):.4f}",
+                mag=f"{sum(ma['mag'])/len(ma['mag']):.4f}",
                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
-                reg=f"{reg_totals['loss']/max(1,reg_totals['count']):.4f}" if reg_totals['count'] > 0 else "n/a",
+                reg=f"{sum(ma['reg'])/len(ma['reg']):.4f}" if ma["reg"] else "n/a",
             )
 
-        n = max(num_batches, 1)
-        print(f"Epoch {epoch+1}/{args.epochs} — "
-              f"train loss: {totals['loss']/n:.4f}  "
-              f"text: {totals['text']/n:.4f}  "
-              f"sign: {totals['sign']/n:.4f}  "
-              f"mag: {totals['mag']/n:.4f}")
-        if reg_totals["count"] > 0:
-            print(f"  regularization loss: {reg_totals['loss']/reg_totals['count']:.4f} "
-                  f"({reg_totals['count']} batches)")
+        def _ma_avg(d): return sum(d) / len(d) if d else float('nan')
+        print(f"Epoch {epoch+1}/{args.epochs} (last {MA_WINDOW} batches) — "
+              f"loss: {_ma_avg(ma['loss']):.4f}  "
+              f"text: {_ma_avg(ma['text']):.4f}  "
+              f"sign: {_ma_avg(ma['sign']):.4f}  "
+              f"mag: {_ma_avg(ma['mag']):.4f}"
+              + (f"  reg: {_ma_avg(ma['reg']):.4f}" if ma["reg"] else ""))
 
         # Validation
         model.eval()
@@ -566,7 +563,7 @@ def train(args):
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
-                "train_loss": totals["loss"] / n,
+                "train_loss": _ma_avg(ma["loss"]),
                 "val_loss": val_totals["loss"] / vn,
             }, os.path.join(save_path, "full_model.pt"))
             print(f"  Saved to {save_path}")
@@ -601,7 +598,7 @@ def main():
     parser.add_argument("--regularization_ratio", type=float, default=0.3,
                         help="Probability of inserting a regularization batch (.txt data) "
                              "after each financial batch (0.3 = ~30%% of steps)")
-    parser.add_argument("--number_warmup_steps", type=int, default=500,
+    parser.add_argument("--number_warmup_steps", type=int, default=50,
                         help="Steps to train only number_embedder + number_head "
                              "before unfreezing all weights (0 to disable)")
     parser.add_argument("--number_warmup_lr_mult", type=float, default=5.0,
