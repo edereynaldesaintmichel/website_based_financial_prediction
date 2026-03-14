@@ -188,7 +188,9 @@ def train(args):
 
     # Build model — full parameter training, no LoRA
     print("Building model (full fine-tuning, no LoRA)...")
-    model = build_model(args.model_name)
+    model = build_model(args.model_name,
+                        sign_embed_dim=args.sign_embed_dim,
+                        magnitude_embed_dim=args.magnitude_embed_dim)
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -518,6 +520,10 @@ def main():
     parser.add_argument("--regularization_ratio", type=float, default=0.3,
                         help="Probability of inserting a regularization batch (.txt data) "
                              "after each financial batch (0.3 = ~30%% of steps)")
+    parser.add_argument("--sign_embed_dim", type=int, default=16,
+                        help="Sign embedding dimension")
+    parser.add_argument("--magnitude_embed_dim", type=int, default=224,
+                        help="Magnitude embedding dimension")
 
     args = parser.parse_args()
     train(args)
