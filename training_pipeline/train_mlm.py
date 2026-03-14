@@ -41,9 +41,12 @@ class BucketedMLMDataset(Dataset):
     def __init__(self, jsonl_path: str, pad_to: int, mask_prob: float = 0.15,
                  pad_token_id: int = 0, mask_token_id: int = 50264):
         self.items = []
+        self.source_files = []
         with open(jsonl_path, "r") as f:
             for line in f:
-                self.items.append(json.loads(line))
+                item = json.loads(line)
+                self.source_files.append(item.get("source_file", ""))
+                self.items.append(item)
         self.pad_to = pad_to
         self.mask_prob = mask_prob
         self.pad_token_id = pad_token_id
@@ -130,7 +133,8 @@ class MultiBucketBatchSampler(Sampler):
 
     def __init__(self, bucket_info: dict, tokens_per_batch: int, min_batch: int = 1):
         """
-        bucket_info: {bucket_name: (offset, count, pad_to)}
+        bucket_info: {bucket_name: (indices_list, pad_to)}
+            indices_list: explicit list of dataset indices for this split
         """
         self.bucket_info = bucket_info
         self.tokens_per_batch = tokens_per_batch
@@ -139,19 +143,19 @@ class MultiBucketBatchSampler(Sampler):
         # Pre-compute batch sizes and total batch count
         self._total_batches = 0
         self._batch_sizes = {}
-        for name, (_offset, count, pad_to) in bucket_info.items():
+        for name, (indices, pad_to) in bucket_info.items():
             bs = compute_batch_size(pad_to, tokens_per_batch, min_batch)
             self._batch_sizes[name] = bs
-            self._total_batches += (count + bs - 1) // bs
+            self._total_batches += (len(indices) + bs - 1) // bs
 
     def __iter__(self):
         all_batches = []
-        for name, (offset, count, _pad_to) in self.bucket_info.items():
+        for name, (indices, _pad_to) in self.bucket_info.items():
             bs = self._batch_sizes[name]
-            indices = list(range(offset, offset + count))
-            random.shuffle(indices)
-            for i in range(0, len(indices), bs):
-                batch = indices[i:i + bs]
+            shuffled = list(indices)
+            random.shuffle(shuffled)
+            for i in range(0, len(shuffled), bs):
+                batch = shuffled[i:i + bs]
                 all_batches.append(batch)
         random.shuffle(all_batches)
         yield from all_batches
@@ -161,8 +165,9 @@ class MultiBucketBatchSampler(Sampler):
 
     def summary(self) -> str:
         lines = []
-        for name, (offset, count, pad_to) in self.bucket_info.items():
+        for name, (indices, pad_to) in self.bucket_info.items():
             bs = self._batch_sizes[name]
+            count = len(indices)
             n_batches = (count + bs - 1) // bs
             lines.append(f"  {name}: pad_to={pad_to}, batch_size={bs}, "
                          f"~{bs * pad_to} tokens/batch, {n_batches} batches")
@@ -258,18 +263,33 @@ def train(args):
     # Concatenate datasets
     combined = torch.utils.data.ConcatDataset(datasets)
 
-    # Split each bucket 90/10 into train/val
+    # Document-level split: collect all unique source files, then split 90/10
     val_ratio = 0.1
+    all_source_files = set()
+    for ds in datasets:
+        all_source_files.update(ds.source_files)
+    all_source_files = sorted(all_source_files)
+    random.shuffle(all_source_files)
+    val_count = max(1, int(len(all_source_files) * val_ratio))
+    val_docs = set(all_source_files[:val_count])
+    print(f"\nDocument-level split: {len(all_source_files)} docs total, "
+          f"{len(all_source_files) - val_count} train, {val_count} val")
+
+    # Assign chunks to train/val based on their source document
     train_bucket_info = {}
     val_bucket_info = {}
-    for name, (boffset, count, pad_to) in bucket_info.items():
-        indices = list(range(count))
-        random.shuffle(indices)
-        val_count = max(1, int(count * val_ratio))
-        train_count = count - val_count
-        # Store absolute indices for each split
-        train_bucket_info[name] = (boffset, train_count, pad_to)
-        val_bucket_info[name] = (boffset + train_count, val_count, pad_to)
+    for ds_idx, (name, (boffset, count, pad_to)) in enumerate(bucket_info.items()):
+        ds = datasets[ds_idx]
+        train_indices = []
+        val_indices = []
+        for local_idx in range(count):
+            abs_idx = boffset + local_idx
+            if ds.source_files[local_idx] in val_docs:
+                val_indices.append(abs_idx)
+            else:
+                train_indices.append(abs_idx)
+        train_bucket_info[name] = (train_indices, pad_to)
+        val_bucket_info[name] = (val_indices, pad_to)
 
     batch_sampler = MultiBucketBatchSampler(
         train_bucket_info, args.tokens_per_batch, min_batch=args.min_batch_size,
@@ -431,6 +451,19 @@ def train(args):
             save_path = os.path.join(args.save_dir, f"checkpoint_epoch{epoch+1}")
             os.makedirs(save_path, exist_ok=True)
             model.save_pretrained(save_path)
+
+            # Append train/val losses to the PEFT-generated README.md
+            readme_path = os.path.join(save_path, "README.md")
+            if os.path.exists(readme_path):
+                with open(readme_path, "a") as f:
+                    f.write(f"\n## Training Losses (Epoch {epoch+1})\n\n")
+                    f.write(f"| Split | Total | Text | Sign | Magnitude |\n")
+                    f.write(f"|-------|-------|------|------|-----------|\n")
+                    f.write(f"| Train | {totals['loss']/n:.4f} | {totals['text']/n:.4f} "
+                            f"| {totals['sign']/n:.4f} | {totals['mag']/n:.4f} |\n")
+                    f.write(f"| Val   | {val_totals['loss']/vn:.4f} | {val_totals['text']/vn:.4f} "
+                            f"| {val_totals['sign']/vn:.4f} | {val_totals['mag']/vn:.4f} |\n")
+
             print(f"  Saved to {save_path}")
 
     print("Training complete.")
