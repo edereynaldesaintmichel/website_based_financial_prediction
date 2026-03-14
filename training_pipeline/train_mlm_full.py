@@ -84,9 +84,9 @@ class BucketedMLMDataset(Dataset):
                 if random.random() < self.mask_prob:
                     r = random.random()
                     if r < 0.8:
-                        # Sentinel: off-distribution value
-                        number_values[i, 0] = 0.0
-                        number_values[i, 1] = self.magnitude_max
+                        # Dedicated mask embeddings (sign=2, magnitude=mask bin)
+                        number_values[i, 0] = 2.0
+                        number_values[i, 1] = self.magnitude_max + 1
                     elif r < 0.9:
                         # Random number
                         number_values[i, 0] = float(random.randint(0, 1))
