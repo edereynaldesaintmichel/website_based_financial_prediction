@@ -10,3 +10,4 @@ yolov8n.pt
 *.pt
 cc_data_sec
 training_data
+.DS_Store

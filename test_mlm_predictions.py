@@ -143,7 +143,7 @@ def reconstruct_chunk(tokenizer, input_ids, is_number_mask, number_values,
 def main():
     parser = argparse.ArgumentParser(description="Test MLM predictions on a single file")
     parser.add_argument("--file", required=True, help="Markdown file to test")
-    parser.add_argument("--checkpoint", default="checkpoints/mlm_lora/best_model_base",
+    parser.add_argument("--checkpoint", default="checkpoints/mlm_lora/best_model_gated_head",
                         help="Path to LoRA checkpoint directory")
     parser.add_argument("--model_name", default="answerdotai/ModernBERT-base")
     parser.add_argument("--max_tokens", type=int, default=512, help="Max tokens per chunk")
@@ -186,7 +186,7 @@ def main():
             chunk["text"],
             padding=False,
             truncation=True,
-            max_length=args.max_tokens,
+            max_length=4192, #args.max_tokens,
             return_tensors=None,
             add_special_tokens=True,
         )
