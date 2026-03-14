@@ -336,15 +336,25 @@ def train(args):
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
     # ------------------------------------------------------------------
-    # Optimizer — single param group for full fine-tuning
+    # Optimizer — separate param groups for backbone vs number modules
     # ------------------------------------------------------------------
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    number_params = set()
+    for m in (model.number_embedder, model.number_head):
+        for p in m.parameters():
+            number_params.add(id(p))
 
-    # Linear warmup + cosine decay schedule
+    backbone_group = [p for p in model.parameters() if p.requires_grad and id(p) not in number_params]
+    number_group = [p for p in model.parameters() if p.requires_grad and id(p) in number_params]
+
+    print(f"Param groups — backbone: {sum(p.numel() for p in backbone_group):,} params @ lr={args.lr}, "
+          f"number: {sum(p.numel() for p in number_group):,} params @ lr={args.number_lr}")
+
+    optimizer = torch.optim.AdamW([
+        {"params": backbone_group, "lr": args.lr},
+        {"params": number_group, "lr": args.number_lr},
+    ], weight_decay=args.weight_decay)
+
+    # Linear warmup + cosine decay schedule (applied uniformly to both groups)
     total_steps = len(batch_sampler) * args.epochs
     lr_warmup_steps = min(args.warmup_steps, total_steps // 5)
 
@@ -354,7 +364,7 @@ def train(args):
         progress = (step - lr_warmup_steps) / max(1, total_steps - lr_warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda, lr_lambda])
 
     # ------------------------------------------------------------------
     # Training loop
@@ -503,7 +513,9 @@ def main():
                         help="Minimum batch size for any bucket")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=5e-5,
-                        help="Learning rate (lower than LoRA — full fine-tuning)")
+                        help="Backbone learning rate")
+    parser.add_argument("--number_lr", type=float, default=2e-4,
+                        help="Learning rate for number_embedder + number_head")
     parser.add_argument("--mask_prob", type=float, default=0.15)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_steps", type=int, default=500,
@@ -528,3 +540,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+"""python -m training_pipeline.train_mlm_full   --data_dir "/content/drive/MyDrive/website predictor/bucketed"   --lr 1e-4   --num_workers 4   --tokens_per_batch 32768   --dtype bf16   --device cuda   --compile   --sign_embed_dim 8   --magnitude_embed_dim 64"""
