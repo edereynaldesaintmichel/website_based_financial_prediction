@@ -14,6 +14,9 @@ pip install git+https://github.com/huggingface/transformers.git
 pip install playwright
 playwright install --with-deps chromium
 
+# GLM-OCR SDK (layout detection + OCR pipeline)
+pip install glmocr
+
 # PDF → images + async HTTP + progress bars
 pip install pymupdf aiohttp tqdm
 

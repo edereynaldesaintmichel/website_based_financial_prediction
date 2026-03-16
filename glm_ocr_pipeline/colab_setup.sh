@@ -11,8 +11,11 @@ pip install vllm --extra-index-url https://wheels.vllm.ai/nightly 2>&1 | tail -5
 pip install git+https://github.com/huggingface/transformers.git 2>&1 | tail -5
 
 # Playwright (not on Colab by default)
-pip install --no-deps playwright 2>&1 | tail -3
+pip install playwright 2>&1 | tail -3
 playwright install --with-deps chromium
+
+# GLM-OCR SDK (layout detection + OCR pipeline)
+pip install glmocr 2>&1 | tail -3
 
 # aiohttp, pymupdf, tqdm — already on Colab, just ensure present
 pip install -q aiohttp pymupdf tqdm
