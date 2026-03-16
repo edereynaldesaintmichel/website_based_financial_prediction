@@ -287,7 +287,7 @@ async def main():
             batch = pdf_files[batch_start:batch_start + BATCH_SIZE]
             batch_strs = [str(p) for p in batch]
 
-            for result in parser_ocr.parse(batch_strs, stream=True):
+            for result in parser_ocr.parse(batch_strs, stream=True, save_layout_visualization=False):
                 source = result.original_images[0] if result.original_images else None
                 stem = path_to_stem.get(source)
 
