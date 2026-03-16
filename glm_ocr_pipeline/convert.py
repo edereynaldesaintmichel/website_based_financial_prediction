@@ -279,7 +279,8 @@ async def main():
     # (many pages/regions in the pipeline at once), small enough to
     # bound RAM (the SDK holds all page images in memory per parse call).
     BATCH_SIZE = 20
-    path_to_stem = {str(p): p.stem for p in pdf_files}
+    # The SDK resolves paths to absolute, so key by resolved absolute path
+    path_to_stem = {str(p.resolve()): p.stem for p in pdf_files}
 
     try:
         pbar = tqdm(total=len(pdf_files), desc="OCR", unit="file")
