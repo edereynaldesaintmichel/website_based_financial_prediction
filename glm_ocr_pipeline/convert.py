@@ -41,6 +41,7 @@ from pathlib import Path
 
 import aiohttp
 import fitz  # PyMuPDF
+from tqdm import tqdm
 
 # Allow running as `python convert.py` from any directory
 sys.path.insert(0, str(Path(__file__).parent))
@@ -64,10 +65,12 @@ async def html_to_pdf_batch(html_paths: list[Path], pdf_dir: Path,
 
     async with async_playwright() as p:
         browser = await p.chromium.launch()
+        pbar = tqdm(total=len(html_paths), desc="HTML → PDF", unit="file")
 
         async def convert_one(html_path: Path):
             pdf_path = pdf_dir / f"{html_path.stem}.pdf"
             if pdf_path.exists():
+                pbar.update(1)
                 return (html_path.name, "skipped")
             async with sem:
                 try:
@@ -83,11 +86,14 @@ async def html_to_pdf_batch(html_paths: list[Path], pdf_dir: Path,
                         print_background=True,
                     )
                     await page.close()
+                    pbar.update(1)
                     return (html_path.name, "ok")
                 except Exception as e:
+                    pbar.update(1)
                     return (html_path.name, f"error: {e}")
 
         results = await asyncio.gather(*[convert_one(p) for p in html_paths])
+        pbar.close()
         await browser.close()
 
     return results
@@ -145,12 +151,16 @@ async def ocr_page(session: aiohttp.ClientSession, image_path: Path,
 async def ocr_document_pages(session: aiohttp.ClientSession,
                              image_paths: list[Path],
                              api_base: str,
-                             sem: asyncio.Semaphore) -> list[str]:
+                             sem: asyncio.Semaphore,
+                             page_pbar: tqdm | None = None) -> list[str]:
     """OCR all pages of a single document with concurrency control."""
 
     async def do_one(img_path: Path) -> str:
         async with sem:
-            return await ocr_page(session, img_path, api_base)
+            result = await ocr_page(session, img_path, api_base)
+            if page_pbar:
+                page_pbar.update(1)
+            return result
 
     return await asyncio.gather(*[do_one(p) for p in image_paths])
 
@@ -321,11 +331,26 @@ async def main():
     try:
         timeout = aiohttp.ClientTimeout(total=600)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            for i, pdf_path in enumerate(pdf_files):
+            # First pass: count total pages for the progress bar
+            all_page_counts = {}
+            for pdf_path in pdf_files:
+                stem = pdf_path.stem
+                if (output_dir / f"{stem}.md").exists():
+                    continue
+                doc = fitz.open(str(pdf_path))
+                all_page_counts[pdf_path] = len(doc)
+                doc.close()
+
+            docs_to_process = [p for p in pdf_files if p in all_page_counts]
+            total_page_count = sum(all_page_counts.values())
+
+            file_pbar = tqdm(docs_to_process, desc="Files", unit="file")
+            page_pbar = tqdm(total=total_page_count, desc="Pages (OCR)", unit="pg")
+
+            for pdf_path in file_pbar:
                 stem = pdf_path.stem
                 md_path = output_dir / f"{stem}.md"
-                if md_path.exists():
-                    continue
+                file_pbar.set_postfix_str(stem[:30])
 
                 # PDF → page images
                 doc_img_dir = img_dir / stem
@@ -333,12 +358,9 @@ async def main():
                 n_pages = len(images)
                 total_pages += n_pages
 
-                print(f"  [{i+1}/{len(pdf_files)}] {stem} ({n_pages} pages) ",
-                      end="", flush=True)
-
                 try:
                     pages_md = await ocr_document_pages(
-                        session, images, api_base, sem
+                        session, images, api_base, sem, page_pbar
                     )
 
                     # Combine pages with separator
@@ -350,13 +372,15 @@ async def main():
 
                     md_path.write_text(full_md, encoding="utf-8")
                     n_done += 1
-                    print(f"-> {len(full_md):,} chars")
                 except Exception as e:
                     n_errors += 1
-                    print(f"FAILED: {e}")
+                    tqdm.write(f"  FAILED {stem}: {e}")
 
                 # Cleanup page images for this document
                 shutil.rmtree(doc_img_dir, ignore_errors=True)
+
+            file_pbar.close()
+            page_pbar.close()
 
     finally:
         if vllm_proc:
