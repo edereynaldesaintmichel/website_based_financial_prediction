@@ -14,11 +14,11 @@ pip install git+https://github.com/huggingface/transformers.git 2>&1 | tail -5
 pip install playwright 2>&1 | tail -3
 playwright install --with-deps chromium
 
-# GLM-OCR SDK (layout detection + OCR pipeline)
-pip install glmocr 2>&1 | tail -3
+# HTML → Markdown conversion (bs4 already on Colab)
+pip install markdownify 2>&1 | tail -3
 
-# aiohttp, pymupdf, tqdm — already on Colab, just ensure present
-pip install -q aiohttp pymupdf tqdm
+# aiohttp, tqdm — already on Colab, just ensure present
+pip install -q aiohttp tqdm
 
 echo ""
 echo "=== Pre-downloading GLM-OCR model ==="
@@ -28,7 +28,10 @@ echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Start vLLM server:"
-echo "  nohup vllm serve zai-org/GLM-OCR --allowed-local-media-path / --served-model-name glm-ocr --port 8000 > vllm.log 2>&1 &"
+echo "  nohup vllm serve zai-org/GLM-OCR --served-model-name glm-ocr --port 8000 \\"
+echo "      --gpu-memory-utilization 0.95 --max-num-seqs 128 \\"
+echo "      --enable-prefix-caching --enable-chunked-prefill --dtype bfloat16 \\"
+echo "      > vllm.log 2>&1 &"
 echo ""
 echo "Then run:"
 echo "  python glm_ocr_pipeline/convert.py <input_dir_or_zip> --no-server --limit 5"
