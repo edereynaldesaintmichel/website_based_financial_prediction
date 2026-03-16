@@ -14,8 +14,8 @@ pip install git+https://github.com/huggingface/transformers.git
 pip install playwright
 playwright install --with-deps chromium
 
-# PDF → images + async HTTP
-pip install pymupdf aiohttp
+# PDF → images + async HTTP + progress bars
+pip install pymupdf aiohttp tqdm
 
 echo ""
 echo "=== Pre-downloading GLM-OCR model ==="
