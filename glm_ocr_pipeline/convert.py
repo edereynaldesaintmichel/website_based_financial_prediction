@@ -250,7 +250,10 @@ async def main():
         sys.exit(1)
 
     # ── Discover HTML files ──────────────────────────────────
-    html_files = sorted(input_dir.rglob("*.html"))
+    html_files = sorted(
+        f for f in input_dir.rglob("*.html")
+        if not f.name.startswith("._")  # skip macOS resource fork files
+    )
     if args.limit > 0:
         html_files = html_files[:args.limit]
 
