@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Unified HTML -> Markdown pipeline using GLM-OCR via vLLM.
+Unified HTML -> Markdown pipeline using GLM-OCR SDK + vLLM.
 
 Converts HTML financial filings to clean markdown by rendering them
-to PDF (Playwright/Chromium), splitting into page images (PyMuPDF),
-and OCR'ing each page with GLM-OCR served by vLLM.
+to PDF (Playwright/Chromium), then using the GLM-OCR SDK for
+layout-aware OCR (PP-DocLayoutV3 → region-specific recognition).
+
+The SDK handles: PDF → page images → layout detection → parallel
+region OCR with task-specific prompts (Text/Table/Formula Recognition)
+→ structured Markdown + JSON output.
 
 Usage:
     # 1. Start vLLM server (or let this script auto-start it):
@@ -19,17 +23,15 @@ Usage:
 Options:
     --output DIR        Output directory (default: {input}_cleaned_up)
     --limit N           Process only first N files
-    --concurrency N     Max concurrent OCR requests (default: 16)
-    --dpi N             DPI for page rendering (default: 200)
     --port N            vLLM server port (default: 8080)
     --no-tag            Skip number tagging
     --no-zip            Skip zipping output
     --no-server         Don't auto-start vLLM (assume it's already running)
+    --no-layout         Disable layout detection (faster but no table/formula handling)
 """
 
 import argparse
 import asyncio
-import base64
 import os
 import shutil
 import subprocess
@@ -39,8 +41,6 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-import aiohttp
-import fitz  # PyMuPDF
 from tqdm import tqdm
 
 # Allow running as `python convert.py` from any directory
@@ -100,72 +100,6 @@ async def html_to_pdf_batch(html_paths: list[Path], pdf_dir: Path,
 
 
 # ──────────────────────────────────────────────────────────────
-# Phase 2: PDF → page images via PyMuPDF
-# ──────────────────────────────────────────────────────────────
-
-def pdf_to_images(pdf_path: Path, img_dir: Path, dpi: int = 200) -> list[Path]:
-    """Split a PDF into per-page PNG images. Returns list of image paths."""
-    img_dir.mkdir(parents=True, exist_ok=True)
-    doc = fitz.open(str(pdf_path))
-    paths = []
-    for i in range(len(doc)):
-        img_path = img_dir / f"p{i:04d}.png"
-        if not img_path.exists():
-            pix = doc[i].get_pixmap(dpi=dpi)
-            pix.save(str(img_path))
-        paths.append(img_path)
-    doc.close()
-    return paths
-
-
-# ──────────────────────────────────────────────────────────────
-# Phase 3: OCR via vLLM (OpenAI-compatible API)
-# ──────────────────────────────────────────────────────────────
-
-async def ocr_page(session: aiohttp.ClientSession, image_path: Path,
-                   api_base: str) -> str:
-    """OCR a single page image. Uses file:// URL (requires --allowed-local-media-path)."""
-    payload = {
-        "model": MODEL,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"file://{image_path.resolve()}"},
-                },
-                {"type": "text", "text": "Text Recognition:"},
-            ],
-        }],
-        "max_tokens": 8192,
-    }
-
-    async with session.post(f"{api_base}/chat/completions", json=payload) as resp:
-        if resp.status != 200:
-            body = await resp.text()
-            raise RuntimeError(f"OCR API error {resp.status}: {body[:300]}")
-        result = await resp.json()
-        return result["choices"][0]["message"]["content"]
-
-
-async def ocr_document_pages(session: aiohttp.ClientSession,
-                             image_paths: list[Path],
-                             api_base: str,
-                             sem: asyncio.Semaphore,
-                             page_pbar: tqdm | None = None) -> list[str]:
-    """OCR all pages of a single document with concurrency control."""
-
-    async def do_one(img_path: Path) -> str:
-        async with sem:
-            result = await ocr_page(session, img_path, api_base)
-            if page_pbar:
-                page_pbar.update(1)
-            return result
-
-    return await asyncio.gather(*[do_one(p) for p in image_paths])
-
-
-# ──────────────────────────────────────────────────────────────
 # vLLM server management
 # ──────────────────────────────────────────────────────────────
 
@@ -222,9 +156,6 @@ async def main():
     parser.add_argument("input", help="Input directory or .zip of HTML files")
     parser.add_argument("--output", help="Output directory (default: {input}_cleaned_up)")
     parser.add_argument("--limit", type=int, default=0, help="Process only first N files")
-    parser.add_argument("--concurrency", type=int, default=16,
-                        help="Max concurrent OCR requests")
-    parser.add_argument("--dpi", type=int, default=200, help="DPI for page rendering")
     parser.add_argument("--port", type=int, default=8080, help="vLLM server port")
     parser.add_argument("--no-tag", action="store_true", help="Skip number tagging")
     parser.add_argument("--no-zip", action="store_true", help="Skip zipping output")
@@ -232,6 +163,8 @@ async def main():
                         help="Don't auto-start vLLM (assume already running)")
     parser.add_argument("--keep-server", action="store_true",
                         help="Don't kill vLLM server when done")
+    parser.add_argument("--no-layout", action="store_true",
+                        help="Disable layout detection (faster but worse tables)")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -287,9 +220,7 @@ async def main():
     # ── Temp directories ─────────────────────────────────────
     tmp_dir = Path("_glm_ocr_tmp")
     pdf_dir = tmp_dir / "pdfs"
-    img_dir = tmp_dir / "images"
     pdf_dir.mkdir(parents=True, exist_ok=True)
-    img_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
 
@@ -315,8 +246,10 @@ async def main():
         print("No PDFs to process!")
         return
 
-    # ── Phase 2+3: vLLM server + OCR ────────────────────────
-    print(f"\n=== Phase 2+3: PDF → images → OCR ({len(pdf_files)} files) ===")
+    # ── Phase 2: vLLM server + GLM-OCR SDK ───────────────────
+    enable_layout = not args.no_layout
+    mode = "layout-aware" if enable_layout else "OCR-only"
+    print(f"\n=== Phase 2: GLM-OCR SDK ({mode}, {len(pdf_files)} files) ===")
 
     vllm_proc = None
     if not args.no_server and not is_server_running(args.port):
@@ -327,67 +260,63 @@ async def main():
         print(f"  ERROR: No vLLM server on port {args.port}. Start one or remove --no-server")
         sys.exit(1)
 
-    api_base = f"http://localhost:{args.port}/v1"
-    sem = asyncio.Semaphore(args.concurrency)
-    total_pages = 0
+    # Initialize GLM-OCR SDK in self-hosted mode
+    from glmocr import GlmOcr
+
+    config_path = str(Path(__file__).parent / "config.yaml")
+    parser_ocr = GlmOcr(
+        config_path=config_path,
+        mode="selfhosted",
+        ocr_api_host="localhost",
+        ocr_api_port=args.port,
+        enable_layout=enable_layout,
+    )
+
     n_done = 0
     n_errors = 0
 
+    # Process PDFs in batches: large enough to keep the GPU saturated
+    # (many pages/regions in the pipeline at once), small enough to
+    # bound RAM (the SDK holds all page images in memory per parse call).
+    BATCH_SIZE = 20
+    path_to_stem = {str(p): p.stem for p in pdf_files}
+
     try:
-        timeout = aiohttp.ClientTimeout(total=600)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            # First pass: count total pages for the progress bar
-            all_page_counts = {}
-            for pdf_path in pdf_files:
-                stem = pdf_path.stem
-                if (output_dir / f"{stem}.md").exists():
+        pbar = tqdm(total=len(pdf_files), desc="OCR", unit="file")
+        for batch_start in range(0, len(pdf_files), BATCH_SIZE):
+            batch = pdf_files[batch_start:batch_start + BATCH_SIZE]
+            batch_strs = [str(p) for p in batch]
+
+            for result in parser_ocr.parse(batch_strs, stream=True):
+                source = result.original_images[0] if result.original_images else None
+                stem = path_to_stem.get(source)
+
+                if stem is None:
+                    n_errors += 1
+                    tqdm.write(f"  Could not map result back to source file")
+                    pbar.update(1)
                     continue
-                doc = fitz.open(str(pdf_path))
-                all_page_counts[pdf_path] = len(doc)
-                doc.close()
-
-            docs_to_process = [p for p in pdf_files if p in all_page_counts]
-            total_page_count = sum(all_page_counts.values())
-
-            file_pbar = tqdm(docs_to_process, desc="Files", unit="file")
-            page_pbar = tqdm(total=total_page_count, desc="Pages (OCR)", unit="pg")
-
-            for pdf_path in file_pbar:
-                stem = pdf_path.stem
-                md_path = output_dir / f"{stem}.md"
-                file_pbar.set_postfix_str(stem[:30])
-
-                # PDF → page images
-                doc_img_dir = img_dir / stem
-                images = pdf_to_images(pdf_path, doc_img_dir, dpi=args.dpi)
-                n_pages = len(images)
-                total_pages += n_pages
 
                 try:
-                    pages_md = await ocr_document_pages(
-                        session, images, api_base, sem, page_pbar
-                    )
+                    full_md = result.markdown_result
+                    if hasattr(result, '_error') and result._error:
+                        raise RuntimeError(result._error)
 
-                    # Combine pages with separator
-                    full_md = "\n\n---\n\n".join(pages_md)
-
-                    # Tag numbers
                     if not args.no_tag:
                         full_md = tag_numbers_in_text(full_md)
 
-                    md_path.write_text(full_md, encoding="utf-8")
+                    (output_dir / f"{stem}.md").write_text(full_md, encoding="utf-8")
                     n_done += 1
                 except Exception as e:
                     n_errors += 1
                     tqdm.write(f"  FAILED {stem}: {e}")
 
-                # Cleanup page images for this document
-                shutil.rmtree(doc_img_dir, ignore_errors=True)
-
-            file_pbar.close()
-            page_pbar.close()
+                pbar.update(1)
+        pbar.close()
 
     finally:
+        parser_ocr.close()
+
         if vllm_proc and not args.keep_server:
             print("\nStopping vLLM server...")
             vllm_proc.terminate()
@@ -400,7 +329,7 @@ async def main():
 
     elapsed = time.time() - t0
 
-    # ── Phase 4: Zip output ──────────────────────────────────
+    # ── Phase 3: Zip output ──────────────────────────────────
     if not args.no_zip:
         zip_path = output_dir.with_suffix(".zip")
         print(f"\nZipping → {zip_path}")
@@ -414,10 +343,7 @@ async def main():
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ── Summary ──────────────────────────────────────────────
-    print(f"\nDone! {n_done} files, {total_pages} pages in {elapsed:.0f}s")
-    if total_pages:
-        print(f"  {elapsed / total_pages:.2f}s/page, "
-              f"{total_pages / elapsed:.1f} pages/s")
+    print(f"\nDone! {n_done} files in {elapsed:.0f}s")
     if n_errors:
         print(f"  {n_errors} errors")
 
