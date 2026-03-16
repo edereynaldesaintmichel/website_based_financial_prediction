@@ -1,0 +1,25 @@
+#!/bin/bash
+# Lightweight setup for Google Colab (most deps already installed).
+set -e
+
+echo "=== Installing missing dependencies ==="
+
+# vLLM (nightly required for GLM-OCR support) — skip upgrade of existing packages
+pip install vllm --extra-index-url https://wheels.vllm.ai/nightly 2>&1 | tail -5
+
+# Transformers from git (GLM-OCR model support)
+pip install --no-deps git+https://github.com/huggingface/transformers.git 2>&1 | tail -3
+
+# Playwright (not on Colab by default)
+pip install --no-deps playwright 2>&1 | tail -3
+playwright install --with-deps chromium
+
+# aiohttp, pymupdf, tqdm — already on Colab, just ensure present
+pip install -q aiohttp pymupdf tqdm
+
+echo ""
+echo "=== Pre-downloading GLM-OCR model ==="
+python -c "from huggingface_hub import snapshot_download; snapshot_download('zai-org/GLM-OCR')"
+
+echo ""
+echo "=== Setup complete ==="
