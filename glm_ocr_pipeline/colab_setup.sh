@@ -8,7 +8,7 @@ echo "=== Installing missing dependencies ==="
 pip install vllm --extra-index-url https://wheels.vllm.ai/nightly 2>&1 | tail -5
 
 # Transformers from git (GLM-OCR model support)
-pip install --no-deps git+https://github.com/huggingface/transformers.git 2>&1 | tail -3
+pip install git+https://github.com/huggingface/transformers.git 2>&1 | tail -5
 
 # Playwright (not on Colab by default)
 pip install --no-deps playwright 2>&1 | tail -3
