@@ -230,6 +230,8 @@ async def main():
     parser.add_argument("--no-zip", action="store_true", help="Skip zipping output")
     parser.add_argument("--no-server", action="store_true",
                         help="Don't auto-start vLLM (assume already running)")
+    parser.add_argument("--keep-server", action="store_true",
+                        help="Don't kill vLLM server when done")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -386,13 +388,15 @@ async def main():
             page_pbar.close()
 
     finally:
-        if vllm_proc:
+        if vllm_proc and not args.keep_server:
             print("\nStopping vLLM server...")
             vllm_proc.terminate()
             try:
                 vllm_proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 vllm_proc.kill()
+        elif vllm_proc:
+            print("\nvLLM server left running (--keep-server)")
 
     elapsed = time.time() - t0
 
