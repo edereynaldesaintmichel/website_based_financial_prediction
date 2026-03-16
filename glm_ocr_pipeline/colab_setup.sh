@@ -26,3 +26,9 @@ python -c "from huggingface_hub import snapshot_download; snapshot_download('zai
 
 echo ""
 echo "=== Setup complete ==="
+echo ""
+echo "Start vLLM server:"
+echo "  nohup vllm serve zai-org/GLM-OCR --allowed-local-media-path / --served-model-name glm-ocr --port 8000 > vllm.log 2>&1 &"
+echo ""
+echo "Then run:"
+echo "  python glm_ocr_pipeline/convert.py <input_dir_or_zip> --no-server --limit 5"

@@ -12,7 +12,7 @@ region OCR with task-specific prompts (Text/Table/Formula Recognition)
 
 Usage:
     # 1. Start vLLM server (or let this script auto-start it):
-    #    vllm serve zai-org/GLM-OCR --allowed-local-media-path / --port 8080
+    #    vllm serve zai-org/GLM-OCR --allowed-local-media-path / --served-model-name glm-ocr --port 8000
     #
     # 2. Run the pipeline:
     python convert.py <input_dir_or_zip> [options]
@@ -23,8 +23,7 @@ Usage:
 Options:
     --output DIR        Output directory (default: {input}_cleaned_up)
     --limit N           Process only first N files
-    --port N            vLLM server port (default: 8080)
-    --no-tag            Skip number tagging
+    --port N            vLLM server port (default: 8000)
     --no-zip            Skip zipping output
     --no-server         Don't auto-start vLLM (assume it's already running)
     --no-layout         Disable layout detection (faster but no table/formula handling)
@@ -45,7 +44,6 @@ from tqdm import tqdm
 
 # Allow running as `python convert.py` from any directory
 sys.path.insert(0, str(Path(__file__).parent))
-from tag_numbers import tag_numbers_in_text
 
 MODEL = "zai-org/GLM-OCR"
 
@@ -156,8 +154,7 @@ async def main():
     parser.add_argument("input", help="Input directory or .zip of HTML files")
     parser.add_argument("--output", help="Output directory (default: {input}_cleaned_up)")
     parser.add_argument("--limit", type=int, default=0, help="Process only first N files")
-    parser.add_argument("--port", type=int, default=8080, help="vLLM server port")
-    parser.add_argument("--no-tag", action="store_true", help="Skip number tagging")
+    parser.add_argument("--port", type=int, default=8000, help="vLLM server port")
     parser.add_argument("--no-zip", action="store_true", help="Skip zipping output")
     parser.add_argument("--no-server", action="store_true",
                         help="Don't auto-start vLLM (assume already running)")
@@ -302,9 +299,6 @@ async def main():
                     full_md = result.markdown_result
                     if hasattr(result, '_error') and result._error:
                         raise RuntimeError(result._error)
-
-                    if not args.no_tag:
-                        full_md = tag_numbers_in_text(full_md)
 
                     (output_dir / f"{stem}.md").write_text(full_md, encoding="utf-8")
                     n_done += 1
