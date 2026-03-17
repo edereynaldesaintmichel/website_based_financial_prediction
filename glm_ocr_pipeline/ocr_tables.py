@@ -52,6 +52,7 @@ async def main():
     all_png_names = sorted(
         name for name in zf.namelist()
         if name.lower().endswith(".png") and not name.endswith("/")
+        and not name.startswith("__MACOSX") and "/._" not in name
     )
 
     if args.output:
