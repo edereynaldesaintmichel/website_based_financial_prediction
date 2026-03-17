@@ -78,7 +78,7 @@ async def main():
 
     # Cap in-flight requests to limit client-side memory (each payload holds a full
     # base64 PNG). vLLM handles batching/scheduling on its own.
-    sem = asyncio.Semaphore(512)
+    sem = asyncio.Semaphore(1024)
     # Separate semaphore for file writes — Google Drive is slow, don't let
     # thousands of pending writes pile up.
     write_sem = asyncio.Semaphore(64)
