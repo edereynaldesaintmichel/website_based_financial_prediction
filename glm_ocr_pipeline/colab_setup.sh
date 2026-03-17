@@ -15,7 +15,7 @@ pip install playwright 2>&1 | tail -3
 playwright install --with-deps chromium
 
 # HTML → Markdown conversion (bs4 already on Colab)
-pip install markdownify 2>&1 | tail -3
+pip install glmocr 2>&1 | tail -3
 
 # aiohttp, tqdm — already on Colab, just ensure present
 pip install -q aiohttp tqdm
