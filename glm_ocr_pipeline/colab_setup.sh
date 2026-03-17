@@ -17,8 +17,8 @@ playwright install --with-deps chromium
 # HTML → Markdown conversion (bs4 already on Colab)
 pip install glmocr 2>&1 | tail -3
 
-# aiohttp, tqdm — already on Colab, just ensure present
-pip install -q aiohttp tqdm
+# aiohttp, tqdm, aiofiles — already on Colab, just ensure present
+pip install -q aiohttp tqdm aiofiles
 
 echo ""
 echo "=== Pre-downloading GLM-OCR model ==="
