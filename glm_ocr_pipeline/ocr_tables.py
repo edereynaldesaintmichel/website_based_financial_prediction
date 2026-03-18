@@ -122,7 +122,7 @@ async def main():
                         data = await resp.json()
                         content = data["choices"][0]["message"]["content"]
                 except Exception as e:
-                    tqdm.write(f"  Error {stem}: {e}")
+                    tqdm.write(f"  Error {stem}: {type(e).__name__}: {e}")
                     n_errors += 1
                     return
                 finally:
