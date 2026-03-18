@@ -25,3 +25,11 @@ source env/bin/activate
 - `financial_dataset.py` — Dataset loading and preprocessing.
 - `train_financial.py` / `validate_financial.py` — Training and validation scripts.
 - `train_arithmetic.py` — Auxiliary arithmetic pre-training task.
+
+## Vast.ai / Remote GPU Setup
+
+When connecting to a Vast.ai instance, disable auto-tmux to get a normal bash shell (tmux breaks scroll):
+```
+touch ~/.no_auto_tmux
+```
+Then disconnect and reconnect.
