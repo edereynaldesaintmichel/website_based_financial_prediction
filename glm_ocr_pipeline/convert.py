@@ -240,7 +240,7 @@ async def main():
     # duration of each parse() call — memory grows linearly with batch size.
     # At ~400 KB/page × ~5 pages/file: 500 files ≈ 1 GB peak per batch.
     # Larger batches keep the region queue fuller → better GPU utilisation.
-    BATCH_SIZE = 500
+    BATCH_SIZE = 20
     # The SDK resolves paths to absolute, so key by resolved absolute path
     path_to_stem = {str(p.resolve()): p.stem for p in pdf_files}
 
