@@ -74,6 +74,7 @@ nohup vllm serve zai-org/GLM-OCR \
     --gpu-memory-utilization 0.85 \
     --max-num-seqs 512 \
     --enable-prefix-caching \
+    --enable-chunked-prefill \
     --dtype bfloat16 \
     --speculative_config '{"method":"mtp","num_speculative_tokens":3}' \
     --disable-log-requests \
