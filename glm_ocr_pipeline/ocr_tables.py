@@ -36,7 +36,7 @@ async def main():
     )
     parser.add_argument("input", help="Zip file of table PNG screenshots")
     parser.add_argument("--output", help="Output JSONL file (default: {input_stem}_ocred.jsonl)")
-    parser.add_argument("--port", type=int, default=8000, help="vLLM server port")
+    parser.add_argument("--port", type=int, default=8001, help="vLLM server port")
     args = parser.parse_args()
 
     input_path = Path(args.input)
