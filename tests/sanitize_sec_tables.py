@@ -1,8 +1,9 @@
 import random
+from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 JS_SANITIZE = open("tests/sanitize_sec_tables.js").read()
-URL = "file:///Users/eloireynal/Desktop/test_10K_raw_html/1800_2018-02-16.html"
+URL = "file:///Users/eloireynal/Documents/My%20projects/website_based_financial_prediction/SEC_pipeline/output/10k_html_raw/1584509_2018-11-21.html"
 
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
