@@ -229,7 +229,7 @@ async def main():
     parser_ocr = GlmOcr(
         config_path=config_path,
         mode="selfhosted",
-        ocr_api_host="localhost",
+        ocr_api_host="127.0.0.1",
         ocr_api_port=args.port,
         enable_layout=enable_layout,
     )
