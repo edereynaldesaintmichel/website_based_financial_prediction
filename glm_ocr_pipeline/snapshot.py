@@ -56,9 +56,20 @@ PROCESS_JS = """
 
     let realIdx = 0;
     allTopTables.forEach(t => {
-        const trs = t.querySelectorAll('tr');
-        const tds = t.querySelectorAll('td');
-        const isReal = trs.length >= 5 && (tds.length / trs.length) >= 2;
+        const trs = [...t.querySelectorAll('tbody tr')];
+        const avgTds = trs.length > 0
+            ? trs.reduce((s, r) => s + r.querySelectorAll('td').length, 0) / trs.length
+            : 0;
+        let isReal = trs.length > 5 && avgTds > 2;
+        if (isReal) {
+            const denomText = t.textContent.trim()
+                .replace(/(?<![,\\d])\\d{4}(?![,\\d])/g, '').replace(/\\s/g, '');
+            const clone = t.cloneNode(true);
+            clone.querySelectorAll('a').forEach(a => a.remove());
+            const numText = clone.textContent.trim()
+                .replace(/(?<![,\\d])\\d{4}(?![,\\d])/g, '').replace(/\\s/g, '');
+            isReal = ([...numText.matchAll(/\\d/g)].length) / (denomText.length || 1) > 0.1;
+        }
         if (isReal) {
             t.setAttribute('data-table-idx', realIdx);
             const placeholder = document.createTextNode(
@@ -90,7 +101,7 @@ async def process_file(
         return 0, 0
 
     async with sem:
-        page = await browser.new_page(viewport={"width": 1280, "height": 900})
+        page = await browser.new_page(viewport={"width": 574, "height": 900}, device_scale_factor=1)
         try:
             await page.goto(
                 f"file://{html_path.resolve()}",
