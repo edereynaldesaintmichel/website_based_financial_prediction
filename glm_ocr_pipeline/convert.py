@@ -47,8 +47,6 @@ from tqdm import tqdm
 # Allow running as `python convert.py` from any directory
 sys.path.insert(0, str(Path(__file__).parent))
 
-MODEL = "zai-org/GLM-OCR"
-
 
 # ──────────────────────────────────────────────────────────────
 # Phase 1: HTML → PDF via Playwright
@@ -237,10 +235,12 @@ async def main():
     n_done = 0
     n_errors = 0
 
-    # Process PDFs in batches: large enough to keep the GPU saturated
-    # (many pages/regions in the pipeline at once), small enough to
-    # bound RAM (the SDK holds all page images in memory per parse call).
-    BATCH_SIZE = 20
+    # Batch size trades RAM for GPU saturation.
+    # The SDK accumulates all page images in memory (images_dict) for the
+    # duration of each parse() call — memory grows linearly with batch size.
+    # At ~400 KB/page × ~5 pages/file: 500 files ≈ 1 GB peak per batch.
+    # Larger batches keep the region queue fuller → better GPU utilisation.
+    BATCH_SIZE = 500
     # The SDK resolves paths to absolute, so key by resolved absolute path
     path_to_stem = {str(p.resolve()): p.stem for p in pdf_files}
 

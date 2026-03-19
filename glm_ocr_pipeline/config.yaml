@@ -105,11 +105,11 @@ pipeline:
     connection_pool_size: 128
 
   # Maximum parallel workers for region recognition (layout mode)
-  # Lower values to reduce 503 errors on busy OCR servers
-  max_workers: 32
-  # Queue sizes
-  page_maxsize: 100
-  region_maxsize: 800
+  # High value keeps vLLM request queue full → better GPU batching
+  max_workers: 128
+  # Queue sizes — large enough to not starve workers
+  page_maxsize: 200
+  region_maxsize: 2000
 
   # Page loader: handles image/PDF loading and API request building
   page_loader:
@@ -200,8 +200,8 @@ pipeline:
 
     # Processing
     # batch_size: max images per model forward pass (reduce to 1 if OOM)
-    batch_size: 1
-    workers: 1
+    batch_size: 8
+    workers: 4
     cuda_visible_devices: "0"
     # img_size: null                # resize input (optional)
 
