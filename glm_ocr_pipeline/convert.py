@@ -10,34 +10,36 @@ The SDK handles: PDF → page images → layout detection → parallel
 region OCR with task-specific prompts (Text/Table/Formula Recognition)
 → structured Markdown + JSON output.
 
+Output is a single .jsonl file where each line is:
+    {"stem": "<filename_without_ext>", "markdown": "<content>"}
+
+Lines are written progressively as files complete, so the output is
+safe to inspect mid-run and the pipeline can resume from where it left off.
+
 Usage:
-    # 1. Start vLLM server (or let this script auto-start it):
-    #    vllm serve zai-org/GLM-OCR --allowed-local-media-path / --served-model-name glm-ocr --port 8000
+    # 1. Run setup_companies_house_ocr.sh (starts vLLM, installs deps, downloads data)
     #
     # 2. Run the pipeline:
-    python convert.py <input_dir_or_zip> [options]
+    python3 convert.py <input_dir_or_zip> [options]
 
     # Quick test on 5 files:
-    python convert.py raw_html.zip --limit 5
+    python3 convert.py raw_html.zip --limit 5
 
 Options:
-    --output DIR        Output directory (default: {input}_cleaned_up)
+    --output FILE       Output .jsonl path (default: {input}_cleaned_up.jsonl)
     --limit N           Process only first N files
     --port N            vLLM server port (default: 8000)
-    --no-zip            Skip zipping output
-    --no-server         Don't auto-start vLLM (assume it's already running)
     --no-layout         Disable layout detection (faster but no table/formula handling)
 """
 
 import argparse
 import asyncio
-import os
+import json
 import shutil
-import subprocess
 import sys
 import time
 import urllib.request
-import zipfile
+import zipfile  # used for input .zip extraction
 from pathlib import Path
 
 from tqdm import tqdm
@@ -97,50 +99,12 @@ async def html_to_pdf_batch(html_paths: list[Path], pdf_dir: Path,
     return results
 
 
-# ──────────────────────────────────────────────────────────────
-# vLLM server management
-# ──────────────────────────────────────────────────────────────
-
 def is_server_running(port: int) -> bool:
     try:
         urllib.request.urlopen(f"http://localhost:{port}/health", timeout=3)
         return True
     except Exception:
         return False
-
-
-def start_vllm_server(port: int) -> subprocess.Popen:
-    """Start vLLM in the background. Blocks until the server is ready."""
-    print(f"Starting vLLM server on port {port} (this may take a few minutes)...")
-    log_out = open("vllm_stdout.log", "w")
-    log_err = open("vllm_stderr.log", "w")
-
-    proc = subprocess.Popen(
-        [
-            sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-            "--model", MODEL,
-            "--allowed-local-media-path", "/",
-            "--port", str(port),
-        ],
-        stdout=log_out,
-        stderr=log_err,
-    )
-
-    for i in range(600):  # 10 min timeout (model download on first run)
-        if proc.poll() is not None:
-            log_err.close()
-            err_tail = Path("vllm_stderr.log").read_text()[-500:]
-            raise RuntimeError(
-                f"vLLM exited with code {proc.returncode}.\n"
-                f"Last stderr:\n{err_tail}"
-            )
-        if is_server_running(port):
-            print(f"  vLLM ready (took {i}s)")
-            return proc
-        time.sleep(1)
-
-    proc.kill()
-    raise RuntimeError("vLLM failed to start within 10 minutes. Check vllm_stderr.log")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -152,14 +116,9 @@ async def main():
         description="Convert HTML filings to markdown via GLM-OCR"
     )
     parser.add_argument("input", help="Input directory or .zip of HTML files")
-    parser.add_argument("--output", help="Output directory (default: {input}_cleaned_up)")
+    parser.add_argument("--output", help="Output .jsonl path (default: {input}_cleaned_up.jsonl)")
     parser.add_argument("--limit", type=int, default=0, help="Process only first N files")
     parser.add_argument("--port", type=int, default=8000, help="vLLM server port")
-    parser.add_argument("--no-zip", action="store_true", help="Skip zipping output")
-    parser.add_argument("--no-server", action="store_true",
-                        help="Don't auto-start vLLM (assume already running)")
-    parser.add_argument("--keep-server", action="store_true",
-                        help="Don't kill vLLM server when done")
     parser.add_argument("--no-layout", action="store_true",
                         help="Disable layout detection (faster but worse tables)")
     args = parser.parse_args()
@@ -193,20 +152,30 @@ async def main():
         print(f"No HTML files found in {input_dir}")
         sys.exit(1)
 
-    # ── Output directory ─────────────────────────────────────
+    # ── Output JSONL path ─────────────────────────────────────
     if args.output:
-        output_dir = Path(args.output)
+        jsonl_path = Path(args.output)
     else:
         name = input_dir.name.rstrip("/")
-        output_dir = input_dir.parent / f"{name}_cleaned_up"
-    output_dir.mkdir(parents=True, exist_ok=True)
+        jsonl_path = input_dir.parent / f"{name}_cleaned_up.jsonl"
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Skip already-processed files
-    existing = {p.stem for p in output_dir.glob("*.md")}
+    # Skip already-processed files (scan existing JSONL if present)
+    existing: set[str] = set()
+    if jsonl_path.exists():
+        with jsonl_path.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        existing.add(json.loads(line)["stem"])
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
     todo = [f for f in html_files if f.stem not in existing]
 
     print(f"Input:  {input_dir}  ({len(html_files)} HTML files, {len(existing)} already done)")
-    print(f"Output: {output_dir}")
+    print(f"Output: {jsonl_path}")
 
     if not todo:
         print("All files already processed!")
@@ -248,14 +217,10 @@ async def main():
     mode = "layout-aware" if enable_layout else "OCR-only"
     print(f"\n=== Phase 2: GLM-OCR SDK ({mode}, {len(pdf_files)} files) ===")
 
-    vllm_proc = None
-    if not args.no_server and not is_server_running(args.port):
-        vllm_proc = start_vllm_server(args.port)
-    elif is_server_running(args.port):
-        print(f"  Using existing vLLM server on port {args.port}")
-    else:
-        print(f"  ERROR: No vLLM server on port {args.port}. Start one or remove --no-server")
+    if not is_server_running(args.port):
+        print(f"  ERROR: No vLLM server on port {args.port}. Run setup_companies_house_ocr.sh first.")
         sys.exit(1)
+    print(f"  Using vLLM server on port {args.port}")
 
     # Initialize GLM-OCR SDK in self-hosted mode
     from glmocr import GlmOcr
@@ -281,64 +246,47 @@ async def main():
 
     try:
         pbar = tqdm(total=len(pdf_files), desc="OCR", unit="file")
-        for batch_start in range(0, len(pdf_files), BATCH_SIZE):
-            batch = pdf_files[batch_start:batch_start + BATCH_SIZE]
-            batch_strs = [str(p) for p in batch]
+        with jsonl_path.open("a", encoding="utf-8") as jsonl_fh:
+            for batch_start in range(0, len(pdf_files), BATCH_SIZE):
+                batch = pdf_files[batch_start:batch_start + BATCH_SIZE]
+                batch_strs = [str(p) for p in batch]
 
-            for result in parser_ocr.parse(batch_strs, stream=True, save_layout_visualization=False):
-                source = result.original_images[0] if result.original_images else None
-                stem = path_to_stem.get(source)
+                for result in parser_ocr.parse(batch_strs, stream=True, save_layout_visualization=False):
+                    source = result.original_images[0] if result.original_images else None
+                    stem = path_to_stem.get(source)
 
-                if stem is None:
-                    n_errors += 1
-                    tqdm.write(f"  Could not map result back to source file")
+                    if stem is None:
+                        n_errors += 1
+                        tqdm.write(f"  Could not map result back to source file")
+                        pbar.update(1)
+                        continue
+
+                    try:
+                        full_md = result.markdown_result
+                        if hasattr(result, '_error') and result._error:
+                            raise RuntimeError(result._error)
+
+                        jsonl_fh.write(json.dumps({"stem": stem, "markdown": full_md}, ensure_ascii=False) + "\n")
+                        jsonl_fh.flush()
+                        n_done += 1
+                    except Exception as e:
+                        n_errors += 1
+                        tqdm.write(f"  FAILED {stem}: {e}")
+
                     pbar.update(1)
-                    continue
-
-                try:
-                    full_md = result.markdown_result
-                    if hasattr(result, '_error') and result._error:
-                        raise RuntimeError(result._error)
-
-                    (output_dir / f"{stem}.md").write_text(full_md, encoding="utf-8")
-                    n_done += 1
-                except Exception as e:
-                    n_errors += 1
-                    tqdm.write(f"  FAILED {stem}: {e}")
-
-                pbar.update(1)
         pbar.close()
 
     finally:
         parser_ocr.close()
 
-        if vllm_proc and not args.keep_server:
-            print("\nStopping vLLM server...")
-            vllm_proc.terminate()
-            try:
-                vllm_proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                vllm_proc.kill()
-        elif vllm_proc:
-            print("\nvLLM server left running (--keep-server)")
-
     elapsed = time.time() - t0
-
-    # ── Phase 3: Zip output ──────────────────────────────────
-    if not args.no_zip:
-        zip_path = output_dir.with_suffix(".zip")
-        print(f"\nZipping → {zip_path}")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for md_file in sorted(output_dir.glob("*.md")):
-                zf.write(md_file, md_file.name)
-        size_mb = zip_path.stat().st_size / 1024 / 1024
-        print(f"  {zip_path} ({size_mb:.1f} MB)")
 
     # ── Cleanup tmp ──────────────────────────────────────────
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ── Summary ──────────────────────────────────────────────
-    print(f"\nDone! {n_done} files in {elapsed:.0f}s")
+    size_mb = jsonl_path.stat().st_size / 1024 / 1024
+    print(f"\nDone! {n_done} files in {elapsed:.0f}s → {jsonl_path} ({size_mb:.1f} MB)")
     if n_errors:
         print(f"  {n_errors} errors")
 
