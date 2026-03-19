@@ -36,9 +36,9 @@ import argparse
 import asyncio
 import json
 import shutil
+import socket
 import sys
 import time
-import urllib.request
 import zipfile  # used for input .zip extraction
 from pathlib import Path
 
@@ -101,9 +101,9 @@ async def html_to_pdf_batch(html_paths: list[Path], pdf_dir: Path,
 
 def is_server_running(port: int) -> bool:
     try:
-        urllib.request.urlopen(f"http://localhost:{port}/health", timeout=3)
-        return True
-    except Exception:
+        with socket.create_connection(("127.0.0.1", port), timeout=3):
+            return True
+    except OSError:
         return False
 
 
