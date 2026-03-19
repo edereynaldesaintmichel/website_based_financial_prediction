@@ -15,6 +15,12 @@ pip install git+https://github.com/huggingface/transformers.git
 pip install aiohttp aiofiles tqdm
 
 echo ""
+echo "=== Downloading input data ==="
+pip install gdown -q
+gdown 1CbZdwoxdbkm_QxP74VUlx65tp0JzngiO
+gdown 10Wr4numQpiW-0fuzfr0LmL4AD-Yv0weA
+
+echo ""
 echo "=== Pre-downloading GLM-OCR model ==="
 python -c "from huggingface_hub import snapshot_download; snapshot_download('zai-org/GLM-OCR')"
 
