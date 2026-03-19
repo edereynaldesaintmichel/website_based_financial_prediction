@@ -7,6 +7,7 @@ set -e
 INPUT_ZIP="/workspace/companies_house_html.zip"
 OUTPUT_JSONL="/workspace/companies_house_html_cleaned_up.jsonl"
 GDRIVE_FILE_ID="10oUo0a0HTg0PlU5OIKIUGBS5qUPPkRnn"
+GDRIVE_JSONL_FILE_ID="1q_48xszklw1OtURn7DnyBFm7Tq0zmzhp"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Disable tmux on reconnect (fixes broken scroll)
@@ -75,6 +76,16 @@ else
     echo "  Downloading $INPUT_ZIP ..."
     gdown "$GDRIVE_FILE_ID" -O "$INPUT_ZIP" &
     DL_PID=$!
+fi
+
+# Download WIP output JSONL if not already present
+if [ -f "$OUTPUT_JSONL" ]; then
+    echo "  $OUTPUT_JSONL already exists, skipping download."
+    DL_JSONL_PID=""
+else
+    echo "  Downloading $OUTPUT_JSONL (WIP checkpoint) ..."
+    gdown "$GDRIVE_JSONL_FILE_ID" -O "$OUTPUT_JSONL" &
+    DL_JSONL_PID=$!
 fi
 
 
