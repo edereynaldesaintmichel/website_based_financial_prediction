@@ -23,18 +23,16 @@ pip install gdown -q
 gdown 1CbZdwoxdbkm_QxP74VUlx65tp0JzngiO
 gdown 10Wr4numQpiW-0fuzfr0LmL4AD-Yv0weA
 
-echo ""
-echo "=== Pre-downloading GLM-OCR model ==="
-python3 -c "from huggingface_hub import snapshot_download; snapshot_download('zai-org/GLM-OCR')"
 
 echo ""
-echo "=== Setup complete ==="
-echo "Start vLLM server:"
-echo "  nohup vllm serve zai-org/GLM-OCR --served-model-name glm-ocr --port 8000 \\"
-echo "      --gpu-memory-utilization 0.95 --max-num-seqs 512 \\"
-echo "      --enable-prefix-caching --enable-chunked-prefill --dtype bfloat16 \\"
-echo "      --speculative_config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' \\"
-echo "      > vllm.log 2>&1 &"
+echo "=== Starting vLLM server ==="
+nohup vllm serve zai-org/GLM-OCR --served-model-name glm-ocr --port 8000 \
+    --gpu-memory-utilization 0.95 --max-num-seqs 512 \
+    --enable-prefix-caching --dtype bfloat16 \
+    --speculative_config '{"method":"mtp","num_speculative_tokens":3}' \
+    --disable-log-requests \
+    > vllm.log 2>&1 &
+echo "vLLM server started (PID $!), logging to vllm.log"
 echo ""
-echo "Then run:"
-echo "  python glm_ocr_pipeline/ocr_tables.py <tables.zip>"
+echo "=== Setup complete ==="
+echo "Run: python glm_ocr_pipeline/ocr_tables.py <tables.zip>"
