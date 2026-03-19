@@ -11,6 +11,9 @@ echo "=== Installing dependencies ==="
 # Transformers from git (GLM-OCR model type support)
 pip install git+https://github.com/huggingface/transformers.git
 
+# mistral_common >= 1.6 required by transformers git for ReasoningEffort import
+pip install --upgrade mistral_common
+
 # Async HTTP + file I/O + progress bars
 pip install aiohttp aiofiles tqdm
 
@@ -22,7 +25,7 @@ gdown 10Wr4numQpiW-0fuzfr0LmL4AD-Yv0weA
 
 echo ""
 echo "=== Pre-downloading GLM-OCR model ==="
-python -c "from huggingface_hub import snapshot_download; snapshot_download('zai-org/GLM-OCR')"
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('zai-org/GLM-OCR')"
 
 echo ""
 echo "=== Setup complete ==="
