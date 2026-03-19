@@ -87,7 +87,7 @@ for i in $(seq 1 600); do
         kill $DL_PID 2>/dev/null
         exit 1
     fi
-    if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+    if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
         echo "  vLLM ready (${i}s elapsed)"
         break
     fi
