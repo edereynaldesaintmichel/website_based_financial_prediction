@@ -13,13 +13,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 touch ~/.no_auto_tmux
 
 
+# ── Kill any existing vLLM process ───────────────────────────────────────
+EXISTING_VLLM=$(pgrep -f "vllm serve" || true)
+if [ -n "$EXISTING_VLLM" ]; then
+    echo "Killing existing vLLM process(es): $EXISTING_VLLM"
+    kill $EXISTING_VLLM 2>/dev/null
+    sleep 2
+fi
+
+
 # ── 1. Start vLLM server immediately ─────────────────────────────────────
 echo "=== [1/3] Starting vLLM server ==="
 nohup vllm serve zai-org/GLM-OCR \
     --served-model-name glm-ocr \
     --port 8000 \
     --allowed-local-media-path / \
-    --gpu-memory-utilization 0.95 \
+    --gpu-memory-utilization 0.85 \
     --max-num-seqs 512 \
     --enable-prefix-caching \
     --dtype bfloat16 \
@@ -38,7 +47,8 @@ pip install --quiet \
     mistral_common \
     aiohttp aiofiles tqdm \
     playwright \
-    gdown &
+    gdown \
+    glmocr &
 PIP_PID=$!
 
 
@@ -57,10 +67,15 @@ echo "  Packages installed."
 python3 -m playwright install --with-deps chromium
 echo "  Playwright Chromium installed."
 
-# Start download in background (runs while we wait for vLLM)
-echo "  Downloading $INPUT_ZIP ..."
-gdown "$GDRIVE_FILE_ID" -O "$INPUT_ZIP" &
-DL_PID=$!
+# Start download in background (skip if already present)
+if [ -f "$INPUT_ZIP" ]; then
+    echo "  $INPUT_ZIP already exists, skipping download."
+    DL_PID=""
+else
+    echo "  Downloading $INPUT_ZIP ..."
+    gdown "$GDRIVE_FILE_ID" -O "$INPUT_ZIP" &
+    DL_PID=$!
+fi
 
 
 # ── Wait for vLLM server to be ready ─────────────────────────────────────
@@ -88,13 +103,15 @@ for i in $(seq 1 600); do
 done
 
 # ── Wait for download to finish ───────────────────────────────────────────
-echo "Waiting for download to complete..."
-wait $DL_PID
-if [ $? -ne 0 ]; then
-    echo "  ERROR: Download failed"
-    exit 1
+if [ -n "$DL_PID" ]; then
+    echo "Waiting for download to complete..."
+    wait $DL_PID
+    if [ $? -ne 0 ]; then
+        echo "  ERROR: Download failed"
+        exit 1
+    fi
+    echo "  Download complete."
 fi
-echo "  Download complete."
 
 
 # ── Done ──────────────────────────────────────────────────────────────────
