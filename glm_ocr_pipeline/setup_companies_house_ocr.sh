@@ -113,15 +113,25 @@ for i in $(seq 1 600); do
     fi
 done
 
-# ── Wait for download to finish ───────────────────────────────────────────
+# ── Wait for downloads to finish ─────────────────────────────────────────
 if [ -n "$DL_PID" ]; then
-    echo "Waiting for download to complete..."
+    echo "Waiting for input zip download to complete..."
     wait $DL_PID
     if [ $? -ne 0 ]; then
-        echo "  ERROR: Download failed"
+        echo "  ERROR: Input zip download failed"
         exit 1
     fi
-    echo "  Download complete."
+    echo "  Input zip download complete."
+fi
+
+if [ -n "$DL_JSONL_PID" ]; then
+    echo "Waiting for output JSONL download to complete..."
+    wait $DL_JSONL_PID
+    if [ $? -ne 0 ]; then
+        echo "  ERROR: Output JSONL download failed"
+        exit 1
+    fi
+    echo "  Output JSONL download complete."
 fi
 
 
