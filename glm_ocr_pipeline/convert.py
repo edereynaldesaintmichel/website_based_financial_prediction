@@ -116,7 +116,7 @@ async def main():
     parser.add_argument("input", help="Input directory or .zip of HTML files")
     parser.add_argument("--output", help="Output .jsonl path (default: {input}_cleaned_up.jsonl)")
     parser.add_argument("--limit", type=int, default=0, help="Process only first N files")
-    parser.add_argument("--port", type=int, default=8000, help="vLLM server port")
+    parser.add_argument("--port", type=int, default=8001, help="vLLM server port")
     parser.add_argument("--no-layout", action="store_true",
                         help="Disable layout detection (faster but worse tables)")
     args = parser.parse_args()

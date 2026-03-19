@@ -1,7 +1,7 @@
 #!/bin/bash
 # Setup script for the Companies House HTML OCR pipeline on vast.ai.
 # vLLM is already installed — this installs missing deps, downloads data,
-# and starts the vLLM server concurrently.
+# and starts the vLLM server once deps are ready.
 set -e
 
 INPUT_ZIP="/workspace/companies_house_html.zip"
@@ -23,11 +23,53 @@ if [ -n "$EXISTING_VLLM" ]; then
 fi
 
 
-# ── 1. Start vLLM server immediately ─────────────────────────────────────
-echo "=== [1/3] Starting vLLM server ==="
+# ── 1. Install dependencies (vLLM needs these before starting) ───────────
+echo "=== [1/3] Installing dependencies ==="
+pip install --quiet --upgrade \
+    "mistral_common>=1.6.0" \
+    aiohttp aiofiles tqdm \
+    playwright \
+    gdown \
+    glmocr
+# Force-reinstall transformers from git — pip skips it otherwise if already installed
+pip install --quiet --force-reinstall --no-deps \
+    git+https://github.com/huggingface/transformers.git
+echo "  Packages installed."
+
+# Install Playwright's Chromium browser
+python3 -m playwright install --with-deps chromium
+echo "  Playwright Chromium installed."
+
+
+# ── 2. Start downloads in background ─────────────────────────────────────
+echo ""
+echo "=== [2/3] Downloading input data ==="
+
+if [ -f "$INPUT_ZIP" ]; then
+    echo "  $INPUT_ZIP already exists, skipping download."
+    DL_PID=""
+else
+    echo "  Downloading $INPUT_ZIP ..."
+    gdown "$GDRIVE_FILE_ID" -O "$INPUT_ZIP" &
+    DL_PID=$!
+fi
+
+if [ -f "$OUTPUT_JSONL" ]; then
+    echo "  $OUTPUT_JSONL already exists, skipping download."
+    DL_JSONL_PID=""
+else
+    echo "  Downloading $OUTPUT_JSONL (WIP checkpoint) ..."
+    gdown "$GDRIVE_JSONL_FILE_ID" -O "$OUTPUT_JSONL" &
+    DL_JSONL_PID=$!
+fi
+
+
+# ── 3. Start vLLM server (deps are now installed) ────────────────────────
+echo ""
+echo "=== [3/3] Starting vLLM server ==="
 nohup vllm serve zai-org/GLM-OCR \
     --served-model-name glm-ocr \
-    --port 8000 \
+    --port 8001 \
     --allowed-local-media-path / \
     --gpu-memory-utilization 0.85 \
     --max-num-seqs 512 \
@@ -40,65 +82,15 @@ VLLM_PID=$!
 echo "  vLLM started (PID $VLLM_PID), logging to vllm.log"
 
 
-# ── 2. pip install deps in background (while vLLM warms up) ──────────────
-echo ""
-echo "=== [2/3] Installing dependencies ==="
-pip install --quiet \
-    git+https://github.com/huggingface/transformers.git \
-    mistral_common \
-    aiohttp aiofiles tqdm \
-    playwright \
-    gdown \
-    glmocr &
-PIP_PID=$!
-
-
-# ── 3. Wait for pip, then download data ──────────────────────────────────
-echo ""
-echo "=== [3/3] Downloading input data (waiting for pip first) ==="
-wait $PIP_PID
-if [ $? -ne 0 ]; then
-    echo "  ERROR: pip install failed"
-    kill $VLLM_PID 2>/dev/null
-    exit 1
-fi
-echo "  Packages installed."
-
-# Install Playwright's Chromium browser
-python3 -m playwright install --with-deps chromium
-echo "  Playwright Chromium installed."
-
-# Start download in background (skip if already present)
-if [ -f "$INPUT_ZIP" ]; then
-    echo "  $INPUT_ZIP already exists, skipping download."
-    DL_PID=""
-else
-    echo "  Downloading $INPUT_ZIP ..."
-    gdown "$GDRIVE_FILE_ID" -O "$INPUT_ZIP" &
-    DL_PID=$!
-fi
-
-# Download WIP output JSONL if not already present
-if [ -f "$OUTPUT_JSONL" ]; then
-    echo "  $OUTPUT_JSONL already exists, skipping download."
-    DL_JSONL_PID=""
-else
-    echo "  Downloading $OUTPUT_JSONL (WIP checkpoint) ..."
-    gdown "$GDRIVE_JSONL_FILE_ID" -O "$OUTPUT_JSONL" &
-    DL_JSONL_PID=$!
-fi
-
-
 # ── Wait for vLLM server to be ready ─────────────────────────────────────
 echo ""
 echo "=== Waiting for vLLM server to be ready ==="
 for i in $(seq 1 600); do
     if ! kill -0 $VLLM_PID 2>/dev/null; then
         echo "  ERROR: vLLM exited unexpectedly. Check vllm.log"
-        kill $DL_PID 2>/dev/null
         exit 1
     fi
-    if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
+    if curl -sf http://127.0.0.1:8001/health > /dev/null 2>&1; then
         echo "  vLLM ready (${i}s elapsed)"
         break
     fi
@@ -108,10 +100,10 @@ for i in $(seq 1 600); do
     sleep 1
     if [ $i -eq 600 ]; then
         echo "  ERROR: vLLM failed to start within 10 minutes. Check vllm.log"
-        kill $DL_PID 2>/dev/null
         exit 1
     fi
 done
+
 
 # ── Wait for downloads to finish ─────────────────────────────────────────
 if [ -n "$DL_PID" ]; then
