@@ -124,7 +124,7 @@ async def main():
                         async with session.post(
                             f"http://localhost:{args.port}/v1/chat/completions",
                             json=payload,
-                            timeout=aiohttp.ClientTimeout(total=180),
+                            timeout=aiohttp.ClientTimeout(total=600),
                         ) as resp:
                             if resp.status != 200:
                                 tqdm.write(f"  vLLM {resp.status} for {stem}")
