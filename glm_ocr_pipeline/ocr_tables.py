@@ -127,7 +127,8 @@ async def main():
                             timeout=aiohttp.ClientTimeout(total=600),
                         ) as resp:
                             if resp.status != 200:
-                                tqdm.write(f"  vLLM {resp.status} for {stem}")
+                                err_text = await resp.text()
+                                tqdm.write(f"  vLLM {resp.status} for {stem}: {err_text[:300]}")
                                 n_errors += 1
                                 return
                             data = await resp.json()
