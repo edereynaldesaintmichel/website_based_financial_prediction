@@ -42,7 +42,7 @@ class BucketedMLMDataset(Dataset):
     Expects the format produced by bucket_by_length.py:
         input_ids:      (N, pad_to)    int32
         is_number_mask: (N, pad_to)    int8
-        number_values:  (N, pad_to, 2) float32
+        number_values:  (N, pad_to)    float32
         source_files:   [str, ...]
         pad_to:         int
     """
@@ -53,7 +53,7 @@ class BucketedMLMDataset(Dataset):
         data = torch.load(pt_path, map_location="cpu", weights_only=False)
         self.input_ids = data["input_ids"]            # (N, pad_to) int32
         self.is_number_mask = data["is_number_mask"]   # (N, pad_to) int8
-        self.number_values = data["number_values"]     # (N, pad_to, 2) float32
+        self.number_values = data["number_values"]     # (N, pad_to) float32
         self.position_ids_col = data["position_ids_col"]  # (N, pad_to) float16
         self.position_ids_row = data["position_ids_row"]  # (N, pad_to) float16
         self.source_files = data["source_files"]       # list[str]
@@ -78,24 +78,18 @@ class BucketedMLMDataset(Dataset):
 
         # Create MLM labels and masked input
         labels_text = torch.full((self.pad_to,), -100, dtype=torch.long)
-        labels_sign = torch.full((self.pad_to,), -100, dtype=torch.long)
         labels_magnitude = torch.full((self.pad_to,), -100.0, dtype=torch.float)
         masked_input_ids = input_ids.clone()
 
         for i in range(seq_len):
             if is_number_mask[i] == 1:
-                labels_sign[i] = int(number_values[i, 0].item())
-                labels_magnitude[i] = number_values[i, 1].item()
+                labels_magnitude[i] = number_values[i].item()
                 if random.random() < self.mask_prob:
                     r = random.random()
                     if r < 0.8:
-                        # Dedicated mask embeddings (sign=2, magnitude=mask bin)
-                        number_values[i, 0] = 2.0
-                        number_values[i, 1] = self.magnitude_max + 1
+                        number_values[i] = self.magnitude_max + 1
                     elif r < 0.9:
-                        # Random number
-                        number_values[i, 0] = float(random.randint(0, 1))
-                        number_values[i, 1] = random.uniform(self.magnitude_min, self.magnitude_max)
+                        number_values[i] = random.uniform(self.magnitude_min, self.magnitude_max)
             elif attention_mask[i] == 1:
                 if random.random() < self.mask_prob:
                     labels_text[i] = input_ids[i]
@@ -113,7 +107,6 @@ class BucketedMLMDataset(Dataset):
             "position_ids_col": position_ids_col,
             "position_ids_row": position_ids_row,
             "labels_text": labels_text,
-            "labels_sign": labels_sign,
             "labels_magnitude": labels_magnitude,
         }
 
@@ -195,9 +188,7 @@ def train(args):
 
     # Build model — full parameter training, no LoRA
     print("Building model (full fine-tuning, no LoRA, 2D RoPE)...")
-    model = build_table_model(args.model_name,
-                              sign_embed_dim=args.sign_embed_dim,
-                              magnitude_embed_dim=args.magnitude_embed_dim)
+    model = build_table_model(args.model_name)
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -381,7 +372,7 @@ def train(args):
     MA_WINDOW = 100
 
     for epoch in range(args.epochs):
-        ma = {k: deque(maxlen=MA_WINDOW) for k in ("loss", "text", "sign", "mag", "reg")}
+        ma = {k: deque(maxlen=MA_WINDOW) for k in ("loss", "text", "mag", "reg")}
 
         # Fresh regularization iterator each epoch
         reg_iter = iter(reg_dataloader) if reg_dataloader else None
@@ -400,7 +391,6 @@ def train(args):
                     position_ids_col=batch["position_ids_col"],
                     position_ids_row=batch["position_ids_row"],
                     labels_text=batch["labels_text"],
-                    labels_sign=batch["labels_sign"],
                     labels_magnitude=batch["labels_magnitude"],
                 )
 
@@ -425,7 +415,6 @@ def train(args):
                         position_ids_col=reg_batch["position_ids_col"],
                         position_ids_row=reg_batch["position_ids_row"],
                         labels_text=reg_batch["labels_text"],
-                        labels_sign=reg_batch["labels_sign"],
                         labels_magnitude=reg_batch["labels_magnitude"],
                     )
                 reg_loss = reg_outputs["loss"]
@@ -442,13 +431,11 @@ def train(args):
             global_step += 1
             ma["loss"].append(loss.item())
             ma["text"].append(outputs["loss_text"].item())
-            ma["sign"].append(outputs["loss_sign"].item())
             ma["mag"].append(outputs["loss_mag"].item())
 
             pbar.set_postfix(
                 loss=f"{sum(ma['loss'])/len(ma['loss']):.4f}",
                 txt=f"{sum(ma['text'])/len(ma['text']):.4f}",
-                sgn=f"{sum(ma['sign'])/len(ma['sign']):.4f}",
                 mag=f"{sum(ma['mag'])/len(ma['mag']):.4f}",
                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
                 reg=f"{sum(ma['reg'])/len(ma['reg']):.4f}" if ma["reg"] else "n/a",
@@ -458,13 +445,12 @@ def train(args):
         print(f"Epoch {epoch+1}/{args.epochs} (last {MA_WINDOW} batches) — "
               f"loss: {_ma_avg(ma['loss']):.4f}  "
               f"text: {_ma_avg(ma['text']):.4f}  "
-              f"sign: {_ma_avg(ma['sign']):.4f}  "
               f"mag: {_ma_avg(ma['mag']):.4f}"
               + (f"  reg: {_ma_avg(ma['reg']):.4f}" if ma["reg"] else ""))
 
         # Validation
         model.eval()
-        val_totals = {"loss": 0.0, "text": 0.0, "sign": 0.0, "mag": 0.0}
+        val_totals = {"loss": 0.0, "text": 0.0, "mag": 0.0}
         val_batches = 0
         with torch.no_grad():
             for batch in tqdm(val_dataloader, desc="  Validation", unit="batch"):
@@ -478,20 +464,17 @@ def train(args):
                         position_ids_col=batch["position_ids_col"],
                         position_ids_row=batch["position_ids_row"],
                         labels_text=batch["labels_text"],
-                        labels_sign=batch["labels_sign"],
                         labels_magnitude=batch["labels_magnitude"],
                     )
                 val_batches += 1
                 val_totals["loss"] += outputs["loss"].item()
                 val_totals["text"] += outputs["loss_text"].item()
-                val_totals["sign"] += outputs["loss_sign"].item()
                 val_totals["mag"] += outputs["loss_mag"].item()
 
         vn = max(val_batches, 1)
         print(f"Epoch {epoch+1}/{args.epochs} — "
               f"val loss: {val_totals['loss']/vn:.4f}  "
               f"text: {val_totals['text']/vn:.4f}  "
-              f"sign: {val_totals['sign']/vn:.4f}  "
               f"mag: {val_totals['mag']/vn:.4f}")
         model.train()
 
@@ -541,15 +524,10 @@ def main():
     parser.add_argument("--regularization_ratio", type=float, default=0.3,
                         help="Probability of inserting a regularization batch (.txt data) "
                              "after each financial batch (0.3 = ~30%% of steps)")
-    parser.add_argument("--sign_embed_dim", type=int, default=16,
-                        help="Sign embedding dimension")
-    parser.add_argument("--magnitude_embed_dim", type=int, default=224,
-                        help="Magnitude embedding dimension")
-
     args = parser.parse_args()
     train(args)
 
 
 if __name__ == "__main__":
     main()
-"""python -m training_pipeline.train_mlm_full   --data_dir "/content/drive/MyDrive/website predictor/bucketed"   --lr 1e-4   --num_workers 4   --tokens_per_batch 32768   --dtype bf16   --device cuda   --compile   --sign_embed_dim 8   --magnitude_embed_dim 64"""
+"""python -m training_pipeline.train_mlm_full   --data_dir "/content/drive/MyDrive/website predictor/bucketed"   --lr 1e-4   --num_workers 4   --tokens_per_batch 32768   --dtype bf16   --device cuda   --compile"""

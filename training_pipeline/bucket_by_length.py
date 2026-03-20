@@ -10,7 +10,7 @@ Output per bucket:
     bucket_{bound}.pt = {
         "input_ids":      (N, pad_to)    uint16
         "is_number_mask": (N, pad_to)    int8
-        "number_values":  (N, pad_to, 2) float32
+        "number_values":  (N, pad_to)    float32
         "source_files":   [str, ...]
         "pad_to":         int
     }
@@ -116,7 +116,7 @@ def pad_and_stack(items: list, pad_to: int) -> dict:
     n = len(items)
     input_ids = torch.zeros(n, pad_to, dtype=torch.uint16)
     is_number_mask = torch.zeros(n, pad_to, dtype=torch.int8)
-    number_values = torch.zeros(n, pad_to, 2, dtype=torch.float32)
+    number_values = torch.zeros(n, pad_to, dtype=torch.float32)
     position_ids_col = torch.zeros(n, pad_to, dtype=torch.float16)
     position_ids_row = torch.zeros(n, pad_to, dtype=torch.float16)
     source_files = []

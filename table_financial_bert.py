@@ -139,7 +139,7 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
                 # TABLE_START marker (1D position)
                 all_ids.append(TABLE_START_ID)
                 all_is_num.append(0)
-                all_num_vals.append([0.0, 0.0])
+                all_num_vals.append(0.0)
                 all_pos_col.append(float(seq_pos))
                 all_pos_row.append(float(seq_pos))
                 seq_pos += 1
@@ -197,7 +197,7 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
                     # Tab delimiter after cell content
                     all_ids.append(TAB_ID)
                     all_is_num.append(0)
-                    all_num_vals.append([0.0, 0.0])
+                    all_num_vals.append(0.0)
                     all_pos_col.append(
                         table_origin
                         + base * ROW_DIRECTION_UNIT_VECT[0]
@@ -229,7 +229,7 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
                 # TABLE_END marker (1D position)
                 all_ids.append(TABLE_END_ID)
                 all_is_num.append(0)
-                all_num_vals.append([0.0, 0.0])
+                all_num_vals.append(0.0)
                 all_pos_col.append(float(seq_pos))
                 all_pos_row.append(float(seq_pos))
                 seq_pos += 1
@@ -240,7 +240,7 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
             sep_id = self.base_tokenizer.sep_token_id
             all_ids = [cls_id] + all_ids + [sep_id]
             all_is_num = [0] + all_is_num + [0]
-            all_num_vals = [[0.0, 0.0]] + all_num_vals + [[0.0, 0.0]]
+            all_num_vals = [0.0] + all_num_vals + [0.0]
             all_pos_col = [0.0] + [p + 1 for p in all_pos_col] + [float(seq_pos + 1)]
             all_pos_row = [0.0] + [p + 1 for p in all_pos_row] + [float(seq_pos + 1)]
 
@@ -302,7 +302,7 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
                 batched["input_ids"][i] += [pad_id] * pad_len
                 attn_mask += [0] * pad_len
                 batched["is_number_mask"][i] += [0] * pad_len
-                batched["number_values"][i] += [[0.0, 0.0]] * pad_len
+                batched["number_values"][i] += [0.0] * pad_len
                 batched["position_ids_col"][i] += [0.0] * pad_len
                 batched["position_ids_row"][i] += [0.0] * pad_len
 
@@ -472,7 +472,6 @@ class TableFinancialModernBert(FinancialModernBert):
         position_ids_row: Optional[torch.Tensor] = None,
         labels_text: Optional[torch.Tensor] = None,
         labels_magnitude: Optional[torch.Tensor] = None,
-        labels_sign: Optional[torch.Tensor] = None,
     ):
         # Set 2D positions on all RoPE wrappers before the forward pass
         if position_ids_col is not None and position_ids_row is not None:
@@ -487,7 +486,6 @@ class TableFinancialModernBert(FinancialModernBert):
                 attention_mask=attention_mask,
                 labels_text=labels_text,
                 labels_magnitude=labels_magnitude,
-                labels_sign=labels_sign,
             )
         finally:
             # Always clear to avoid stale state
@@ -498,16 +496,13 @@ class TableFinancialModernBert(FinancialModernBert):
 def build_table_model(
     model_id: str = "answerdotai/ModernBERT-base",
     num_magnitude_bins: int = 128,
-    sign_embed_dim: int = 8,
-    magnitude_embed_dim: int = 64,
+    **kwargs,
 ) -> TableFinancialModernBert:
     """Build a TableFinancialModernBert from a pretrained ModernBERT."""
     donor = ModernBertForMaskedLM.from_pretrained(model_id)
 
     config = FinancialModernBertConfig.from_pretrained(model_id)
     config.num_magnitude_bins = num_magnitude_bins
-    config.sign_embed_dim = sign_embed_dim
-    config.magnitude_embed_dim = magnitude_embed_dim
 
     model = TableFinancialModernBert(config)
 

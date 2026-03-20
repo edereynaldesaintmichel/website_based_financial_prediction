@@ -3,7 +3,7 @@ FinancialModernBert model architecture.
 
 This module contains the model definitions for FinancialModernBert, a BERT-based model
 designed to handle numerical data in financial texts with specialized tokenization
-and encoding for numbers (sign and magnitude).
+and encoding for numbers (log-magnitude).
 """
 import torch
 import torch.nn as nn
@@ -34,32 +34,29 @@ class FinancialBertTokenizer:
     def vocab_size(self) -> int:
         return len(self.base_tokenizer)
 
-    def parse_number_to_log(self, num_str: str) -> tuple:
+    def parse_number_to_log(self, num_str: str) -> float:
         try:
             value = float(num_str.strip())
         except ValueError:
             value = 0.0
-        
-        sign_idx = 1 if value < 0 else 0
+
         abs_val = abs(value)
-        
+
         if abs_val < 1e-20:
             log_val = self.magnitude_min
         else:
             log_val = math.log10(abs_val)
-            
-        log_val = max(self.magnitude_min, min(log_val, self.magnitude_max))
-        return (sign_idx, log_val)
+
+        return max(self.magnitude_min, min(log_val, self.magnitude_max))
 
     def _tokenize_single(self, text: str, add_special_tokens: bool = True) -> Dict[str, List]:
         numbers_data = []
         for match in self.number_pattern.finditer(text):
-            sign_idx, log_val = self.parse_number_to_log(match.group(1))
+            log_val = self.parse_number_to_log(match.group(1))
 
             numbers_data.append({
                 "start": match.start(),
                 "end": match.end(),
-                "sign_idx": sign_idx,
                 "log_val": log_val
             })
 
@@ -103,14 +100,11 @@ class FinancialBertTokenizer:
                 num_idx += 1
                 result_input_ids.append(self.number_placeholder_id)
                 is_number_mask.append(1)
-                number_values.append([
-                    float(num_info["sign_idx"]),
-                    float(num_info["log_val"])
-                ])
+                number_values.append(num_info["log_val"])
             else:
                 result_input_ids.append(token_id)
                 is_number_mask.append(0)
-                number_values.append([0.0, 0.0])
+                number_values.append(0.0)
 
         return {
             "input_ids": result_input_ids,
@@ -165,7 +159,7 @@ class FinancialBertTokenizer:
                 batch_input_ids[i] += [pad_id] * pad_len
                 attention_mask += [0] * pad_len
                 batch_is_number_mask[i] += [0] * pad_len
-                batch_number_values[i] += [[0.0, 0.0]] * pad_len
+                batch_number_values[i] += [0.0] * pad_len
 
             batch_attention_mask.append(attention_mask)
 
@@ -192,106 +186,91 @@ class FinancialBertTokenizer:
 
     def decode_number(
         self,
-        sign_logits: torch.Tensor,
         magnitude_logits: torch.Tensor,
         model_config,
         k: int = 5,
     ) -> dict:
         """
-        Decode a single number from model outputs using peak_window strategy.
-        
+        Decode a single number's magnitude from model outputs (peak_window strategy).
+
+        Sign is not predicted — inferred from text context by the caller.
+
         Args:
-            sign_logits: Sign logits from model (shape: [2])
             magnitude_logits: Magnitude logits from model (shape: [num_bins])
             model_config: Model config with magnitude_min, magnitude_max, num_magnitude_bins
             k: Window size for peak_window strategy
-        
+
         Returns:
-            Dict with 'value', 'sign', 'log_magnitude'
+            Dict with 'magnitude' (absolute value) and 'log_magnitude'
         """
         device = magnitude_logits.device
-        
-        # Decode sign
-        pred_sign_class = torch.argmax(sign_logits).item()
-        sign_val = -1.0 if pred_sign_class == 1 else 1.0
-        
-        # Decode magnitude using peak_window strategy
+
         mag_probs = torch.softmax(magnitude_logits, dim=-1)
         num_bins = model_config.num_magnitude_bins
         bin_indices = torch.arange(num_bins, device=device).float()
-        
+
         peak_idx = torch.argmax(mag_probs).item()
         radius = (k - 1) // 2
         start_idx = max(0, peak_idx - radius)
         end_idx = min(num_bins, peak_idx + radius + 1)
-        
+
         window_probs = mag_probs[start_idx:end_idx]
         window_indices = bin_indices[start_idx:end_idx]
-        
-        # Re-normalize within the window
+
         window_probs = window_probs / window_probs.sum()
         expected_bin_idx = (window_probs * window_indices).sum().item()
-        
-        # Convert bin index to log value
+
         min_v = model_config.magnitude_min
         max_v = model_config.magnitude_max
         pred_log_val = (expected_bin_idx / (num_bins - 1)) * (max_v - min_v) + min_v
-        final_value = sign_val * (10.0 ** pred_log_val)
-        
+
         return {
-            'value': final_value,
-            'sign': pred_sign_class,
+            'magnitude': 10.0 ** pred_log_val,
             'log_magnitude': pred_log_val,
         }
 
     def decode_numbers(
         self,
-        sign_logits: torch.Tensor,
         magnitude_logits: torch.Tensor,
         is_number_mask: torch.Tensor,
         model_config,
         k: int = 5,
     ) -> list:
         """
-        Decode all numbers in a sequence from model outputs.
-        
+        Decode all numbers' magnitudes in a sequence from model outputs.
+
         Args:
-            sign_logits: Sign logits from model (shape: [seq_len, 2])
             magnitude_logits: Magnitude logits from model (shape: [seq_len, num_bins])
             is_number_mask: Mask indicating number positions (shape: [seq_len])
             model_config: Model config with magnitude_min, magnitude_max, num_magnitude_bins
             k: Window size for peak_window strategy
-        
+
         Returns:
             List of dicts, one per number in sequence order, each with:
                 - 'token_position': position in the tokenized sequence
-                - 'value': decoded numeric value
-                - 'sign': predicted sign class (0=positive, 1=negative)
+                - 'magnitude': predicted absolute value (10 ** log_magnitude)
                 - 'log_magnitude': predicted log10 magnitude
         """
         results = []
-        
-        # Find all number positions
+
         number_positions = (is_number_mask == 1).nonzero(as_tuple=True)[0].tolist()
-        
+
         for pos in number_positions:
             decoded = self.decode_number(
-                sign_logits[pos],
                 magnitude_logits[pos],
                 model_config,
                 k=k,
             )
             decoded['token_position'] = pos
             results.append(decoded)
-        
+
         return results
 
-    def log_to_value(self, sign_idx: int, log_val: float) -> float:
-        """Convert sign index and log value back to original number."""
-        sign = -1.0 if sign_idx == 1 else 1.0
+    def log_to_value(self, log_val: float) -> float:
+        """Convert log magnitude back to absolute value."""
         if log_val < -11:  # Effectively zero
             return 0.0
-        return sign * (10.0 ** log_val)
+        return 10.0 ** log_val
 
 class FinancialModernBertConfig(ModernBertConfig):
     def __init__(
@@ -299,16 +278,12 @@ class FinancialModernBertConfig(ModernBertConfig):
         num_magnitude_bins=128,
         magnitude_min=-12.0,
         magnitude_max=12.0,
-        sign_embed_dim=8,
-        magnitude_embed_dim=64,
         **kwargs
     ):
         super().__init__(**kwargs)
         self.num_magnitude_bins = num_magnitude_bins
         self.magnitude_min = magnitude_min
         self.magnitude_max = magnitude_max
-        self.sign_embed_dim = sign_embed_dim
-        self.magnitude_embed_dim = magnitude_embed_dim
 
 class PredictionHead(nn.Module):
     def __init__(self, config):
@@ -325,17 +300,18 @@ class PredictionHead(nn.Module):
         hidden_states = self.decoder(hidden_states)
         return hidden_states
 
-class GatedNumberEmbedder(nn.Module):
+class NumberEmbedder(nn.Module):
+    """Embeds numbers via interpolated magnitude bin embeddings.
+
+    Sign is NOT encoded — the model relies on text tokens ('-', '(', ')')
+    to infer sign from context. number_values is a plain tensor of
+    log-magnitude floats (shape: batch × seq_len).
+    """
+
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.sign_emb = nn.Embedding(3, config.sign_embed_dim)  # 0=pos, 1=neg, 2=mask
-        self.magnitude_emb = nn.Embedding(config.num_magnitude_bins + 1, config.magnitude_embed_dim)  # last bin = mask
-
-        input_dim = config.sign_embed_dim + config.magnitude_embed_dim
-        self.gate_proj = nn.Linear(input_dim, config.hidden_size)
-        self.val_proj = nn.Linear(input_dim, config.hidden_size)
-        self.out_norm = nn.LayerNorm(config.hidden_size)
+        self.magnitude_emb = nn.Embedding(config.num_magnitude_bins + 1, config.hidden_size)  # last bin = mask
 
     def _get_magnitude_embeddings(self, log_vals):
         min_v = self.config.magnitude_min
@@ -363,20 +339,11 @@ class GatedNumberEmbedder(nn.Module):
         return torch.where(is_mask.unsqueeze(-1), mask_emb, interpolated)
 
     def forward(self, number_values):
-        sign_ids = number_values[..., 0].long()
-        log_vals = number_values[..., 1]
+        return self._get_magnitude_embeddings(number_values)
 
-        s_emb = self.sign_emb(sign_ids)
-        m_emb = self._get_magnitude_embeddings(log_vals)
+class NumberHead(nn.Module):
+    """Predicts magnitude (log-scale) from hidden states. No sign prediction."""
 
-        concat_feats = torch.cat([s_emb, m_emb], dim=-1)
-
-        gate = F.silu(self.gate_proj(concat_feats))
-        val = self.val_proj(concat_feats)
-
-        return self.out_norm(gate * val)
-
-class GatedNumberHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -385,15 +352,13 @@ class GatedNumberHead(nn.Module):
         self.val_proj = nn.Linear(config.hidden_size, config.hidden_size)
         self.out_norm = nn.LayerNorm(config.hidden_size)
 
-        self.decoder = nn.Linear(config.hidden_size, config.num_magnitude_bins + 2)
+        self.decoder = nn.Linear(config.hidden_size, config.num_magnitude_bins)
 
     def forward(self, sequence_output):
         gate = F.silu(self.gate_proj(sequence_output))
         val = self.val_proj(sequence_output)
         h = self.out_norm(gate * val)
-
-        logits = self.decoder(h)
-        return logits[..., :2], logits[..., 2:]
+        return self.decoder(h)
 
 class FinancialModernBert(ModernBertPreTrainedModel):
     config_class = FinancialModernBertConfig
@@ -402,9 +367,9 @@ class FinancialModernBert(ModernBertPreTrainedModel):
         super().__init__(config)
         self.config = config
         self.modernbert = ModernBertModel(config)
-        self.number_embedder = GatedNumberEmbedder(config)
+        self.number_embedder = NumberEmbedder(config)
         self.lm_head = PredictionHead(config)
-        self.number_head = GatedNumberHead(config)
+        self.number_head = NumberHead(config)
         self.post_init()
 
     def _get_embedding_layer(self):
@@ -423,7 +388,6 @@ class FinancialModernBert(ModernBertPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         labels_text: Optional[torch.Tensor] = None,
         labels_magnitude: Optional[torch.Tensor] = None,
-        labels_sign: Optional[torch.Tensor] = None
     ):
         text_embeds = self._get_embedding_layer()(input_ids)
         num_embeds = self.number_embedder(number_values)
@@ -438,11 +402,13 @@ class FinancialModernBert(ModernBertPreTrainedModel):
             attention_mask=attention_mask
         )
         sequence_output = outputs.last_hidden_state
-        
+
         text_logits = self.lm_head(sequence_output)
-        sign_logits, magnitude_logits = self.number_head(sequence_output)
+        magnitude_logits = self.number_head(sequence_output)
 
         loss = None
+        loss_text = None
+        loss_mag = None
         if labels_text is not None:
             text_mask = (is_number_mask == 0)
             num_mask = (is_number_mask == 1)
@@ -453,54 +419,45 @@ class FinancialModernBert(ModernBertPreTrainedModel):
             active_text_labels = torch.where(text_mask.view(-1), active_text_labels, torch.tensor(-100).to(labels_text.device))
             loss_text = loss_fct_text(active_text_logits, active_text_labels) if (active_text_labels != -100).any() else torch.tensor(0.0, device=labels_text.device)
 
-            active_sign_logits = sign_logits.view(-1, 2)
-            active_sign_labels = labels_sign.view(-1)
-            active_sign_labels = torch.where(num_mask.view(-1), active_sign_labels, torch.tensor(-100).to(labels_sign.device))
-            loss_sign = loss_fct_text(active_sign_logits, active_sign_labels) if (active_sign_labels != -100).any() else torch.tensor(0.0, device=labels_sign.device)
-
             valid_mag_mask = (num_mask.view(-1)) & (labels_magnitude.view(-1) != -100)
             if valid_mag_mask.any():
                 target_mags = labels_magnitude.view(-1)[valid_mag_mask]
                 pred_mag_logits = magnitude_logits.view(-1, self.config.num_magnitude_bins)[valid_mag_mask]
-                
+
                 min_v = self.config.magnitude_min
                 max_v = self.config.magnitude_max
                 n_bins = self.config.num_magnitude_bins
-                
+
                 norm_pos = (target_mags.clamp(min_v, max_v) - min_v) / (max_v - min_v) * (n_bins - 1)
                 lower_idx = norm_pos.floor().long()
                 upper_idx = norm_pos.ceil().long()
-                
+
                 weight_upper = norm_pos - lower_idx.float()
                 weight_lower = 1.0 - weight_upper
-                
+
                 log_probs = F.log_softmax(pred_mag_logits, dim=-1)
-                
-                loss_mag = -(weight_lower * log_probs.gather(1, lower_idx.unsqueeze(1)).squeeze(1) + 
+
+                loss_mag = -(weight_lower * log_probs.gather(1, lower_idx.unsqueeze(1)).squeeze(1) +
                              weight_upper * log_probs.gather(1, upper_idx.unsqueeze(1)).squeeze(1))
                 loss_mag = loss_mag.mean()
             else:
                 loss_mag = torch.tensor(0.0, device=labels_magnitude.device)
 
-            loss = loss_text + loss_sign + loss_mag
+            loss = loss_text + loss_mag
 
         return {
             "loss": loss,
-            "loss_text": loss_text if loss is not None else None,
-            "loss_sign": loss_sign if loss is not None else None,
-            "loss_mag": loss_mag if loss is not None else None,
+            "loss_text": loss_text,
+            "loss_mag": loss_mag,
             "text_logits": text_logits,
-            "sign_logits": sign_logits,
-            "magnitude_logits": magnitude_logits
+            "magnitude_logits": magnitude_logits,
         }
 
 def build_model(model_id="answerdotai/ModernBERT-base", num_magnitude_bins=128,
-                sign_embed_dim=8, magnitude_embed_dim=64):
+                **kwargs):
     donor_model = ModernBertForMaskedLM.from_pretrained(model_id)
     config = FinancialModernBertConfig.from_pretrained(model_id)
     config.num_magnitude_bins = num_magnitude_bins
-    config.sign_embed_dim = sign_embed_dim
-    config.magnitude_embed_dim = magnitude_embed_dim
     
     financial_model = FinancialModernBert(config)
     financial_model.modernbert.load_state_dict(donor_model.model.state_dict())
