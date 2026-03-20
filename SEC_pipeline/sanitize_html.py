@@ -1,312 +1,233 @@
+#!/usr/bin/env python3
 """
-Sanitize SEC 10-K HTML filings for LLM consumption.
+Sanitize 10-K HTML filings: fix broken tables, extract raw text + clean HTML tables.
 
-Adapted from the UK Companies House sanitizer. SEC 10-K HTML filings
-differ from iXBRL in that they typically:
-  - Have more complex CSS and JavaScript
-  - Use <font> tags extensively (older filings)
-  - Contain embedded images (base64 or linked)
-  - Include EDGAR-specific header/footer boilerplate
-  - May have XBRL inline tags (ix:*) in newer filings
+For each HTML file:
+1. Strips scripts, styles, links, HRs, page numbers, boilerplate
+2. Runs table sanitizer (fixes colspan/rowspan, merges prefix/suffix columns)
+3. Replaces every table with a placeholder, captures its sanitized outerHTML
+4. Extracts body.innerText (raw text), splices table HTML back at placeholders
 
-Techniques applied (similar to UK pipeline):
-1. Remove EDGAR header/footer boilerplate.
-2. Remove <script>, <style> blocks.
-3. Remove hidden elements (display:none).
-4. Unwrap XBRL inline tags and formatting wrappers.
-5. Strip attributes (keep only colspan, rowspan, href).
-6. Purge empty elements.
-7. Flatten degenerate (single-column, no-header) tables.
-8. Flatten single-child nesting.
-9. Normalize entities and whitespace.
-10. Extract body content only.
+Output: {output}/{stem}.md  — raw text with <table> HTML blocks inline
 
 Usage:
-    python sanitize_html.py [input_dir] [output_dir]
+    python sanitize_html.py [--output DIR] [--limit N] [--concurrency N]
 """
 
+import argparse
+import asyncio
 import re
 import sys
-import os
-import time
-import multiprocessing as mp
 from pathlib import Path
 
-from bs4 import BeautifulSoup, NavigableString, Comment, Doctype, ProcessingInstruction, Tag
+from tqdm import tqdm
 
-from config import RAW_HTML_DIR, SANITIZED_HTML_DIR
+from config import RAW_HTML_DIR, LLM_SANITIZED_DIR
 
-# ──────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────
+JS_SANITIZE = (Path(__file__).parent / "sanitize_tables.js").read_text(encoding="utf-8")
 
-INPUT_DIR = str(RAW_HTML_DIR)
-OUTPUT_DIR = str(SANITIZED_HTML_DIR)
+# JS injected into every page: strips junk, sanitizes tables, extracts raw text.
+PROCESS_JS = (
+    """
+() => {
+    // ── Phase 1: Strip junk ──────────────────────────────────────
+    document.querySelectorAll('script, style, a, hr')
+        .forEach(el => el.remove());
 
-KEEP_ATTRS = {"colspan", "rowspan", "href"}
+    document.querySelectorAll('p[align="center"], div[align="center"], font')
+        .forEach(el => {
+            const t = el.innerText.trim();
+            if (/^\\d{1,3}$/.test(t)) el.remove();
+        });
 
-UNWRAP_TAGS = {
-    # Inline XBRL wrappers (present in some 2018 filings)
-    "ix:nonnumeric", "ix:nonfraction", "ix:numeric", "ix:fraction",
-    "ix:continuation", "ix:header", "ix:references", "ix:resources",
-    "ix:exclude",
-    # Pure formatting wrappers
-    "span", "font",
+    document.querySelectorAll('p, div, span').forEach(el => {
+        const t = el.innerText.trim().toLowerCase();
+        if (t === 'use these links to rapidly review the document' ||
+            t === 'table of contents') {
+            el.remove();
+        }
+    });
+
+    // ── Phase 2: Sanitize tables ─────────────────────────────────
+    """
+    + JS_SANITIZE
+    + """
+
+    // ── Phase 3: Classify tables, strip attrs, extract ─────────────
+    const allTopTables = Array.from(document.querySelectorAll('table'))
+        .filter(t => !t.parentElement.closest('table'));
+
+    let realIdx = 0;
+    const tableHtml = {};
+
+    allTopTables.forEach(t => {
+        const trs = [...t.querySelectorAll('tbody tr')];
+        const avgTds = trs.length > 0
+            ? trs.reduce((s, r) => s + r.querySelectorAll('td').length, 0) / trs.length
+            : 0;
+        let isReal = trs.length > 5 && avgTds > 2;
+        if (isReal) {
+            const txt = t.textContent.trim()
+                .replace(/(?<![,\\d])\\d{4}(?![,\\d])/g, '').replace(/\\s/g, '');
+            isReal = ([...txt.matchAll(/\\d/g)].length) / (txt.length || 1) > 0.1;
+        }
+
+        if (isReal) {
+            // Strip all attributes from the table and every descendant
+            [t, ...t.querySelectorAll('*')].forEach(el => {
+                while (el.attributes.length > 0)
+                    el.removeAttribute(el.attributes[0].name);
+            });
+            // Re-add structural attrs (colspan/rowspan) where needed
+            t.querySelectorAll('td, th').forEach(cell => {
+                if (cell.colSpan > 1) cell.setAttribute('colspan', cell.colSpan);
+                if (cell.rowSpan > 1) cell.setAttribute('rowspan', cell.rowSpan);
+            });
+
+            // Collapse to single line: strip newlines and runs of whitespace between tags
+            tableHtml[realIdx] = t.outerHTML.replace(/\\s*\\n\\s*/g, '').replace(/>\\s+</g, '><');
+            const placeholder = document.createTextNode('GLMTABLE' + realIdx + 'GLMTABLE');
+            t.parentNode.insertBefore(placeholder, t);
+            t.remove();
+            realIdx++;
+        } else {
+            // Degenerate table: replace with its textContent
+            const text = document.createTextNode(t.textContent);
+            t.parentNode.replaceChild(text, t);
+        }
+    });
+
+    return { text: document.body.innerText, tables: tableHtml };
 }
+"""
+)
 
-BLOCK_TAGS = {
-    "html", "body", "div", "p", "h1", "h2", "h3", "h4", "h5", "h6",
-    "table", "thead", "tbody", "tfoot", "tr", "th", "td",
-    "ul", "ol", "li", "dl", "dt", "dd",
-    "blockquote", "pre", "hr", "br",
-    "section", "article", "header", "footer", "main", "nav",
-    "a", "b", "strong", "i", "em", "u", "sub", "sup",
-}
+PLACEHOLDER_RE = re.compile(r"GLMTABLE(\d+)GLMTABLE")
 
 
-def read_file(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        return f.read()
+def splice_tables(text: str, tables: dict[str, str]) -> str:
+    """Replace placeholders with sanitized table HTML."""
+    def replace_match(m):
+        idx = m.group(1)
+        html = tables.get(idx, tables.get(int(idx), ""))
+        if html:
+            return f"\n\n{html}\n\n"
+        return ""
+
+    return PLACEHOLDER_RE.sub(replace_match, text)
 
 
-def write_file(path: str, content: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+async def process_file(
+    html_path: Path, browser, sem: asyncio.Semaphore, output_dir: Path, stem: str,
+) -> bool:
+    """Sanitize one HTML file. Returns True on success."""
+    out_path = output_dir / f"{stem}.md"
+    if out_path.exists():
+        return True
+
+    async with sem:
+        page = await browser.new_page(
+            viewport={"width": 574, "height": 900}, device_scale_factor=1
+        )
+        try:
+            await page.goto(
+                f"file://{html_path.resolve()}",
+                wait_until="load",
+                timeout=120_000,
+            )
+
+            result = await page.evaluate(PROCESS_JS)
+            text = result["text"]
+            tables = result["tables"]
+
+            # Splice sanitized table HTML back in
+            final = splice_tables(text, tables)
+
+            await asyncio.to_thread(out_path.write_text, final, "utf-8")
+            return True
+
+        except Exception as e:
+            tqdm.write(f"  Error {html_path.name}: {e}")
+            return False
+        finally:
+            await page.close()
 
 
-# ──────────────────────────────────────────────────────────────
-# Step 0 – Pre-parse cleanup
-# ──────────────────────────────────────────────────────────────
-def pre_parse_cleanup(html: str) -> str:
-    """Remove XML declarations, EDGAR document separators, and namespace cruft."""
-    html = re.sub(r"<\?xml[^?]*\?>", "", html, flags=re.IGNORECASE)
-    # Remove EDGAR document type/header tags
-    html = re.sub(r"<DOCUMENT>.*?<TYPE>.*?\n", "", html, flags=re.IGNORECASE)
-    html = re.sub(r"</DOCUMENT>", "", html, flags=re.IGNORECASE)
-    html = re.sub(r"<SEC-DOCUMENT>.*?</SEC-HEADER>", "", html, flags=re.DOTALL | re.IGNORECASE)
-    return html
+async def main():
+    parser = argparse.ArgumentParser(
+        description="Sanitize 10-K HTML: fix tables, extract raw text + HTML tables"
+    )
+    parser.add_argument(
+        "--input", type=Path, default=RAW_HTML_DIR,
+        help=f"Input directory of raw HTML files (default: {RAW_HTML_DIR})",
+    )
+    parser.add_argument(
+        "--output", type=Path, default=LLM_SANITIZED_DIR,
+        help=f"Output directory (default: {LLM_SANITIZED_DIR})",
+    )
+    parser.add_argument("--limit", type=int, default=0, help="Process only first N files")
+    parser.add_argument(
+        "--concurrency", type=int, default=8,
+        help="Max concurrent Playwright pages (default: 8)",
+    )
+    args = parser.parse_args()
 
-
-# ──────────────────────────────────────────────────────────────
-# Step 1 – Remove <script> and <style> blocks
-# ──────────────────────────────────────────────────────────────
-def remove_script_and_style(soup: BeautifulSoup) -> None:
-    for tag in soup.find_all(["style", "script", "noscript"]):
-        tag.decompose()
-
-
-# ──────────────────────────────────────────────────────────────
-# Step 2 – Remove display:none elements
-# ──────────────────────────────────────────────────────────────
-def remove_hidden_elements(soup: BeautifulSoup) -> None:
-    for tag in soup.find_all(style=re.compile(r"display\s*:\s*none", re.I)):
-        tag.decompose()
-
-
-# ──────────────────────────────────────────────────────────────
-# Step 3 – Unwrap XBRL + formatting-only tags
-# ──────────────────────────────────────────────────────────────
-def unwrap_xbrl_and_formatting(soup: BeautifulSoup) -> None:
-    changed = True
-    while changed:
-        changed = False
-        for tag in soup.find_all():
-            if tag.name and tag.name.lower() in UNWRAP_TAGS:
-                tag.unwrap()
-                changed = True
-
-
-# ──────────────────────────────────────────────────────────────
-# Step 4 – Strip attributes
-# ──────────────────────────────────────────────────────────────
-def strip_attributes(soup: BeautifulSoup) -> None:
-    for tag in soup.find_all(True):
-        attrs_to_keep = {}
-        for attr in KEEP_ATTRS:
-            if attr in tag.attrs:
-                attrs_to_keep[attr] = tag.attrs[attr]
-        tag.attrs = attrs_to_keep
-
-
-# ──────────────────────────────────────────────────────────────
-# Step 5 – Remove images (base64 and linked)
-# ──────────────────────────────────────────────────────────────
-def remove_images(soup: BeautifulSoup) -> None:
-    for tag in soup.find_all("img"):
-        tag.decompose()
-
-
-# ──────────────────────────────────────────────────────────────
-# Step 6 – Purge empty elements
-# ──────────────────────────────────────────────────────────────
-def is_effectively_empty(tag) -> bool:
-    if isinstance(tag, NavigableString):
-        return False
-    if tag.name in ("br", "hr", "img", "input"):
-        return False
-    text = tag.get_text(strip=True)
-    text = text.replace("\u00a0", "").strip()
-    return len(text) == 0
-
-
-def purge_empty_elements(soup: BeautifulSoup) -> None:
-    changed = True
-    while changed:
-        changed = False
-        for tag in soup.find_all(True):
-            if is_effectively_empty(tag):
-                tag.decompose()
-                changed = True
-
-
-# ──────────────────────────────────────────────────────────────
-# Step 7 – Remove ALL tables
-# ──────────────────────────────────────────────────────────────
-# Financial tables will be reconstructed from parsed XBRL data
-# (see recreate_filings.py), so we strip them entirely here.
-
-def remove_all_tables(soup: BeautifulSoup) -> None:
-    """Remove every <table> element from the document."""
-    for table in soup.find_all("table"):
-        table.decompose()
-
-
-# ──────────────────────────────────────────────────────────────
-# Step 8 – Flatten single-child nesting
-# ──────────────────────────────────────────────────────────────
-def flatten_single_child(soup: BeautifulSoup) -> None:
-    changed = True
-    while changed:
-        changed = False
-        for tag in soup.find_all(True):
-            children = [c for c in tag.children
-                        if not (isinstance(c, NavigableString) and c.strip() == "")]
-            if len(children) == 1 and not isinstance(children[0], NavigableString):
-                child = children[0]
-                if tag.name == child.name or tag.name in ("div", "body"):
-                    tag.unwrap()
-                    changed = True
-
-
-# ──────────────────────────────────────────────────────────────
-# Step 9 – Normalize entities & whitespace
-# ──────────────────────────────────────────────────────────────
-def normalize_text(html: str) -> str:
-    html = html.replace("\u00a0", " ")
-    html = re.sub(r"&#160;", " ", html)
-    html = re.sub(r"&nbsp;", " ", html, flags=re.IGNORECASE)
-    lines = html.split("\n")
-    cleaned = []
-    for line in lines:
-        stripped = line.lstrip(" \t")
-        indent = line[:len(line) - len(stripped)]
-        stripped = re.sub(r"[ \t]+", " ", stripped)
-        cleaned.append(indent + stripped)
-    html = "\n".join(cleaned)
-    html = re.sub(r"\n{3,}", "\n\n", html)
-    html = re.sub(r"\n[ \t]+\n", "\n\n", html)
-    return html.strip()
-
-
-# ──────────────────────────────────────────────────────────────
-# Step 10 – Extract body / remove comments
-# ──────────────────────────────────────────────────────────────
-def extract_body(soup: BeautifulSoup) -> BeautifulSoup:
-    body = soup.find("body")
-    if body:
-        return BeautifulSoup(str(body), "lxml")
-    return soup
-
-
-def remove_comments(soup: BeautifulSoup) -> None:
-    for comment in soup.find_all(
-        string=lambda t: isinstance(t, (Comment, Doctype, ProcessingInstruction))
-    ):
-        comment.extract()
-
-
-# ──────────────────────────────────────────────────────────────
-# Main pipeline
-# ──────────────────────────────────────────────────────────────
-def sanitize(input_path: str) -> str:
-    raw = read_file(input_path)
-    print(f"Original size: {len(raw):,} chars")
-
-    raw = pre_parse_cleanup(raw)
-    soup = BeautifulSoup(raw, "lxml")
-
-    remove_comments(soup)
-    remove_script_and_style(soup)
-    remove_hidden_elements(soup)
-    remove_images(soup)
-    unwrap_xbrl_and_formatting(soup)
-    strip_attributes(soup)
-    purge_empty_elements(soup)
-    soup = extract_body(soup)
-    remove_all_tables(soup)
-    flatten_single_child(soup)
-    purge_empty_elements(soup)
-
-    result = soup.prettify()
-    result = normalize_text(result)
-
-    print(f"Sanitized size: {len(result):,} chars")
-    print(f"Reduction: {100 * (1 - len(result) / max(len(raw), 1)):.1f}%")
-    return result
-
-
-def _process_one(args: tuple) -> tuple[str, bool, str]:
-    """Worker function for multiprocessing. Returns (filename, success, message)."""
-    html_path, output_dir = args
-    output_path = Path(output_dir) / Path(html_path).name
-    if output_path.exists():
-        return (Path(html_path).name, True, "skipped (exists)")
-    try:
-        result = sanitize(html_path)
-        write_file(str(output_path), result)
-        return (Path(html_path).name, True, "ok")
-    except Exception as e:
-        return (Path(html_path).name, False, str(e))
-
-
-def main():
-    input_dir = INPUT_DIR
-    output_dir = OUTPUT_DIR
-    if len(sys.argv) > 1:
-        input_dir = sys.argv[1]
-    if len(sys.argv) > 2:
-        output_dir = sys.argv[2]
-
-    if not os.path.exists(input_dir):
-        print(f"Error: directory not found: {input_dir}")
+    input_dir = args.input
+    if not input_dir.is_dir():
+        print(f"Error: {input_dir} is not a directory")
         sys.exit(1)
 
-    os.makedirs(output_dir, exist_ok=True)
+    html_files = sorted(
+        f for f in input_dir.rglob("*.html")
+        if not f.name.startswith("._")
+    )
+    if args.limit > 0:
+        html_files = html_files[: args.limit]
 
-    html_files = sorted(Path(input_dir).glob("*.html"))
-    print(f"Found {len(html_files)} HTML files in {input_dir}")
-    print(f"Output directory: {output_dir}")
+    if not html_files:
+        print(f"No HTML files found in {input_dir}")
+        sys.exit(1)
 
-    num_workers = max(1, mp.cpu_count() - 1)
-    print(f"Using {num_workers} worker processes\n")
+    output_dir = args.output
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = [(str(p), output_dir) for p in html_files]
-    t0 = time.time()
-    done = 0
-    errors = 0
+    already_done = sum(1 for f in html_files if (output_dir / f"{f.stem}.md").exists())
 
-    with mp.Pool(num_workers) as pool:
-        for filename, success, msg in pool.imap_unordered(_process_one, tasks):
-            done += 1
-            if not success:
-                errors += 1
-                print(f"  [{done}/{len(tasks)}] x {filename}: {msg}")
-            elif msg != "skipped (exists)":
-                print(f"  [{done}/{len(tasks)}] {filename}")
+    print(f"Input:   {input_dir} ({len(html_files)} files, {already_done} already done)")
+    print(f"Output:  {output_dir}")
+    print(f"To do:   {len(html_files) - already_done}")
 
-    elapsed = time.time() - t0
-    print(f"\nDone! {done} files in {elapsed:.1f}s ({errors} errors).")
+    if already_done == len(html_files):
+        print("All done!")
+        return
+
+    from playwright.async_api import async_playwright
+
+    n_ok = 0
+    n_err = 0
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        sem = asyncio.Semaphore(args.concurrency)
+        pbar = tqdm(total=len(html_files) - already_done, desc="Sanitize", unit="file")
+
+        async def do_one(html_path: Path):
+            nonlocal n_ok, n_err
+            ok = await process_file(html_path, browser, sem, output_dir, html_path.stem)
+            if ok:
+                n_ok += 1
+            else:
+                n_err += 1
+            pbar.update(1)
+
+        todo = [f for f in html_files if not (output_dir / f"{f.stem}.md").exists()]
+        await asyncio.gather(*[do_one(f) for f in todo])
+        pbar.close()
+        await browser.close()
+
+    print(f"\nDone! {n_ok} files sanitized, {n_err} errors")
+    print(f"Output: {output_dir}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

@@ -1,7 +1,7 @@
 """
-Step 2: Tokenize chunks using FinancialBertTokenizer.
+Step 2: Tokenize chunks using TableFinancialBertTokenizer.
 
-Reads chunks from JSONL, tokenizes each with the custom tokenizer,
+Reads chunks from JSONL, tokenizes each with the table-aware tokenizer,
 and saves tokenized results ready for bucketing.
 
 Usage:
@@ -17,10 +17,10 @@ import sys
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from financial_bert import FinancialBertTokenizer
+from table_financial_bert import TableFinancialBertTokenizer
 
 
-def tokenize_chunk(tokenizer: FinancialBertTokenizer, chunk: dict, max_length: int = 512) -> dict:
+def tokenize_chunk(tokenizer: TableFinancialBertTokenizer, chunk: dict, max_length: int = 512) -> dict:
     """Tokenize a single chunk. Returns tokenized data dict."""
     result = tokenizer(
         chunk["text"],
@@ -38,12 +38,14 @@ def tokenize_chunk(tokenizer: FinancialBertTokenizer, chunk: dict, max_length: i
         "input_ids": result["input_ids"][0],
         "is_number_mask": result["is_number_mask"][0],
         "number_values": result["number_values"][0],
+        "position_ids_col": result["position_ids_col"][0],
+        "position_ids_row": result["position_ids_row"][0],
         "seq_length": len(result["input_ids"][0]),
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Tokenize chunks with FinancialBertTokenizer")
+    parser = argparse.ArgumentParser(description="Tokenize chunks with TableFinancialBertTokenizer")
     parser.add_argument("--input", required=True, help="Input chunks JSONL file")
     parser.add_argument("--output", required=True, help="Output tokenized JSONL file")
     parser.add_argument("--max_length", type=int, default=512, help="Max sequence length")
@@ -51,7 +53,7 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading tokenizer from {args.model_name}...")
-    tokenizer = FinancialBertTokenizer(args.model_name)
+    tokenizer = TableFinancialBertTokenizer(args.model_name)
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
