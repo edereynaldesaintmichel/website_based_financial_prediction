@@ -1,8 +1,8 @@
 """
-Full-parameter MLM training for FinancialModernBert (no LoRA).
+Full-parameter MLM training for TableFinancialModernBert (no LoRA).
 
 Same data pipeline as train_mlm.py but trains ALL parameters of the
-ModernBERT backbone, number embedder, and number head.
+ModernBERT backbone (with 2D RoPE), number embedder, and number head.
 
 To mitigate catastrophic forgetting, regularization data (.txt source files)
 is interleaved with financial data (.md source files) at a configurable ratio.
@@ -29,7 +29,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler, ConcatDataset
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from financial_bert import build_model, FinancialBertTokenizer
+from table_financial_bert import build_table_model, TableFinancialBertTokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +54,8 @@ class BucketedMLMDataset(Dataset):
         self.input_ids = data["input_ids"]            # (N, pad_to) int32
         self.is_number_mask = data["is_number_mask"]   # (N, pad_to) int8
         self.number_values = data["number_values"]     # (N, pad_to, 2) float32
+        self.position_ids_col = data["position_ids_col"]  # (N, pad_to) float16
+        self.position_ids_row = data["position_ids_row"]  # (N, pad_to) float16
         self.source_files = data["source_files"]       # list[str]
         self.pad_to = data["pad_to"]
         self.mask_prob = mask_prob
@@ -69,6 +71,8 @@ class BucketedMLMDataset(Dataset):
         input_ids = self.input_ids[idx].to(torch.long).clone()
         is_number_mask = self.is_number_mask[idx].float()
         number_values = self.number_values[idx].clone()
+        position_ids_col = self.position_ids_col[idx].float()
+        position_ids_row = self.position_ids_row[idx].float()
         attention_mask = (input_ids != self.pad_token_id).long()
         seq_len = attention_mask.sum().item()
 
@@ -106,6 +110,8 @@ class BucketedMLMDataset(Dataset):
             "attention_mask": attention_mask,
             "is_number_mask": is_number_mask,
             "number_values": number_values,
+            "position_ids_col": position_ids_col,
+            "position_ids_row": position_ids_row,
             "labels_text": labels_text,
             "labels_sign": labels_sign,
             "labels_magnitude": labels_magnitude,
@@ -188,10 +194,10 @@ def train(args):
     print(f"Device: {device}, dtype: {args.dtype}" + (" (AMP)" if use_amp else ""))
 
     # Build model — full parameter training, no LoRA
-    print("Building model (full fine-tuning, no LoRA)...")
-    model = build_model(args.model_name,
-                        sign_embed_dim=args.sign_embed_dim,
-                        magnitude_embed_dim=args.magnitude_embed_dim)
+    print("Building model (full fine-tuning, no LoRA, 2D RoPE)...")
+    model = build_table_model(args.model_name,
+                              sign_embed_dim=args.sign_embed_dim,
+                              magnitude_embed_dim=args.magnitude_embed_dim)
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -203,7 +209,7 @@ def train(args):
         model = torch.compile(model)
 
     # Load tokenizer
-    tokenizer = FinancialBertTokenizer(args.model_name)
+    tokenizer = TableFinancialBertTokenizer(args.model_name)
 
     # ------------------------------------------------------------------
     # Load bucketed data
@@ -391,6 +397,8 @@ def train(args):
                     attention_mask=batch["attention_mask"],
                     is_number_mask=batch["is_number_mask"],
                     number_values=batch["number_values"],
+                    position_ids_col=batch["position_ids_col"],
+                    position_ids_row=batch["position_ids_row"],
                     labels_text=batch["labels_text"],
                     labels_sign=batch["labels_sign"],
                     labels_magnitude=batch["labels_magnitude"],
@@ -414,6 +422,8 @@ def train(args):
                         attention_mask=reg_batch["attention_mask"],
                         is_number_mask=reg_batch["is_number_mask"],
                         number_values=reg_batch["number_values"],
+                        position_ids_col=reg_batch["position_ids_col"],
+                        position_ids_row=reg_batch["position_ids_row"],
                         labels_text=reg_batch["labels_text"],
                         labels_sign=reg_batch["labels_sign"],
                         labels_magnitude=reg_batch["labels_magnitude"],
@@ -465,6 +475,8 @@ def train(args):
                         attention_mask=batch["attention_mask"],
                         is_number_mask=batch["is_number_mask"],
                         number_values=batch["number_values"],
+                        position_ids_col=batch["position_ids_col"],
+                        position_ids_row=batch["position_ids_row"],
                         labels_text=batch["labels_text"],
                         labels_sign=batch["labels_sign"],
                         labels_magnitude=batch["labels_magnitude"],
@@ -502,7 +514,7 @@ def train(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Full-parameter MLM training for FinancialModernBert")
+        description="Full-parameter MLM training for TableFinancialModernBert")
     parser.add_argument("--data_dir", required=True, help="Directory with bucketed JSONL files")
     parser.add_argument("--save_dir", default="checkpoints/mlm_full",
                         help="Checkpoint save directory")

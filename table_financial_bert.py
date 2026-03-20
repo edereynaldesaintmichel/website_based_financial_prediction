@@ -2,24 +2,23 @@
 TableFinancialModernBert: FinancialModernBert with 2D RoPE for HTML tables.
 
 Tokenizer parses HTML <table> structure and computes two position-ID arrays:
-    - position_ids_col: first half of RoPE rotation pairs use column positions
-    - position_ids_row: second half of RoPE rotation pairs use row positions
+    - position_ids_col (axis 1, even RoPE pairs): column/horizontal positions
+    - position_ids_row (axis 2, odd RoPE pairs): row/vertical positions
 
 Outside tables, both arrays hold identical sequential positions (standard RoPE).
-Inside table cells, column positions reflect horizontal structure, row positions
-reflect vertical structure, so the model attends within rows and columns with
-appropriate distance sensitivity.
-
-Column budgets are proportional to the widest cell's total token count (including
-tags) in each column, plus overhead for <tr> tags and a small margin. All tokens
-(content and tags) are sequentially spaced within their budget. Row positions are
-evenly spaced. Colspan cells span the combined budget of their columns.
+Inside tables, positions follow a column-aligned 2D layout:
+    - Within cells: (+1, +1) per token (vanilla RoPE preserved)
+    - Columns are aligned: each column occupies max_tokens_in_col + D_RC
+      along ROW_DIRECTION_UNIT_VECT, so same-column cells start at the
+      same position regardless of neighboring cell sizes.
+    - Row-to-row: offset of D_COL along COLUMN_DIRECTION_UNIT_VECT per row
 """
 
 import torch
 import torch.nn as nn
 import re
 from typing import Dict, Any, List, Optional, Union, Tuple
+from bs4 import BeautifulSoup
 
 from financial_bert import (
     FinancialBertTokenizer,
@@ -29,239 +28,64 @@ from financial_bert import (
 from transformers import ModernBertForMaskedLM
 
 
-# ─────────────────────────────────────────────────────────────
-# HTML Table Parsing
-# ─────────────────────────────────────────────────────────────
+_TABLE_RE = re.compile(r'<table[^>]*>.*?</table>', re.DOTALL | re.IGNORECASE)
 
-_TABLE_RE = re.compile(r'<table[^>]*>(.*?)</table>', re.DOTALL | re.IGNORECASE)
-_TR_RE = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL | re.IGNORECASE)
-_CELL_RE = re.compile(r'<(td|th)([^>]*)>(.*?)</\1>', re.DOTALL | re.IGNORECASE)
-_COLSPAN_RE = re.compile(r'colspan\s*=\s*["\']?(\d+)', re.IGNORECASE)
+# Structural tokens for table boundaries and cell delimiters.
+# [unused0] and [unused1] are pre-allocated in ModernBERT's vocabulary
+# with random embeddings — they'll learn table semantics during fine-tuning.
+TABLE_START_ID = 50285  # [unused0]
+TABLE_END_ID = 50286    # [unused1]
+TAB_ID = 186            # \t — cell delimiter
+
+# Direction vectors for 2D RoPE, as (col_axis_component, row_axis_component).
+# Row direction: primary axis for horizontal cell-to-cell traversal.
+# Column direction: primary axis for vertical row-to-row traversal.
+# Symmetric by construction: swapping components mirrors the vector.
+ROW_DIRECTION_UNIT_VECT = (1.0, 1)
+COLUMN_DIRECTION_UNIT_VECT = (0.3, 1.0)
+
+# Inter-cell gap within a row, measured along ROW_DIRECTION_UNIT_VECT.
+D_RC = 4
+# Inter-row spacing, measured along COLUMN_DIRECTION_UNIT_VECT.
+D_COL = 8
 
 
-def parse_tables(text: str) -> List[dict]:
+def parse_table_grid(table_html: str) -> List[List[Tuple[int, str]]]:
+    """Parse an HTML table into a grid of (col_index, cell_content) per row.
+
+    Handles colspan and rowspan. Cell content preserves inner HTML (including
+    <number> tags) but strips whitespace. Spanned cells are omitted.
+
+    Returns: grid[row] = [(col_idx, content_html), ...]
     """
-    Parse HTML tables in text and return their structure.
+    soup = BeautifulSoup(table_html, 'html.parser')
+    trs = soup.find_all('tr')
+    occupied: Dict[Tuple[int, int], bool] = {}
+    grid: List[List[Tuple[int, str]]] = []
 
-    Returns a list of dicts, one per table:
-        char_start, char_end: character range of the full <table>...</table>
-        rows: list of row dicts with:
-            tag_start, tag_end: character range of the full <tr>...</tr>
-            cells: list of cell dicts with:
-                row, col, colspan,
-                content_start, content_end: cell content only
-                tag_start, tag_end: full <td>...</td> range
-        num_rows, num_cols
-    """
-    tables = []
-    for tm in _TABLE_RE.finditer(text):
-        table_start = tm.start()
-        table_html = tm.group(0)
-        rows = []
+    for ri, tr in enumerate(trs):
+        cells = []
+        c = 0
+        for cell in tr.find_all(['td', 'th']):
+            while occupied.get((ri, c)):
+                c += 1
+            try:
+                cs = int(re.sub(r'<[^>]+>', '', str(cell.get('colspan', 1))))
+            except (ValueError, TypeError):
+                cs = 1
+            try:
+                rs = int(re.sub(r'<[^>]+>', '', str(cell.get('rowspan', 1))))
+            except (ValueError, TypeError):
+                rs = 1
+            content = cell.decode_contents().strip()
+            cells.append((c, content))
+            for dr in range(rs):
+                for dc in range(cs):
+                    occupied[(ri + dr, c + dc)] = True
+            c += cs
+        grid.append(cells)
 
-        for row_idx, rm in enumerate(_TR_RE.finditer(table_html)):
-            row_html = rm.group(0)
-            row_abs_start = table_start + rm.start()
-            cells = []
-            col = 0
-
-            for cm in _CELL_RE.finditer(row_html):
-                colspan = 1
-                cs = _COLSPAN_RE.search(cm.group(2))
-                if cs:
-                    colspan = int(cs.group(1))
-                cells.append({
-                    'row': row_idx,
-                    'col': col,
-                    'colspan': colspan,
-                    'content_start': row_abs_start + cm.start(3),
-                    'content_end': row_abs_start + cm.end(3),
-                    'tag_start': row_abs_start + cm.start(),
-                    'tag_end': row_abs_start + cm.end(),
-                })
-                col += colspan
-            rows.append({
-                'tag_start': row_abs_start + rm.start(),
-                'tag_end': row_abs_start + rm.end(),
-                'cells': cells,
-            })
-
-        num_cols = max(
-            (sum(c['colspan'] for c in row['cells']) for row in rows), default=0
-        )
-        tables.append({
-            'char_start': tm.start(),
-            'char_end': tm.end(),
-            'rows': rows,
-            'num_rows': len(rows),
-            'num_cols': num_cols,
-        })
-    return tables
-
-
-def _tokens_in_range(
-    offset_mapping: list, char_start: int, char_end: int
-) -> List[int]:
-    """Return token indices whose character span overlaps [char_start, char_end)."""
-    return [
-        i for i, (s, e) in enumerate(offset_mapping)
-        if s < char_end and e > char_start
-    ]
-
-
-def compute_2d_positions(
-    processed_text: str,
-    offset_mapping: list,
-    seq_len: int,
-    margin: int = 10,
-) -> Tuple[List[float], List[float]]:
-    """
-    Compute 2D RoPE position arrays for a tokenized sequence.
-
-    Outside tables: both arrays are identical sequential positions.
-    Inside tables: all tokens (content AND tags) are included in the
-    budget and get sequentially spaced 2D positions. Column budgets
-    are proportional to the widest cell's total token count (including
-    <td>/<th> tags) per column, plus overhead for <tr> tags and margin.
-
-    Returns (position_ids_col, position_ids_row), both of length seq_len.
-    """
-    pos_col = [float(i) for i in range(seq_len)]
-    pos_row = [float(i) for i in range(seq_len)]
-
-    tables = parse_tables(processed_text)
-    if not tables:
-        return pos_col, pos_row
-
-    for table in tables:
-        table_tokens = _tokens_in_range(
-            offset_mapping, table['char_start'], table['char_end']
-        )
-        if not table_tokens:
-            continue
-
-        t_start = table_tokens[0]
-        budget = len(table_tokens)
-        pos_range = budget - 1  # position range [t_start, t_start + pos_range]
-        num_rows = table['num_rows']
-        num_cols = table['num_cols']
-
-        if num_cols == 0 or pos_range == 0:
-            continue
-
-        # Find ALL tokens for each cell (including <td>/<th> tags)
-        for row_dict in table['rows']:
-            for cell in row_dict['cells']:
-                cell['all_tokens'] = _tokens_in_range(
-                    offset_mapping, cell['tag_start'], cell['tag_end']
-                )
-
-        # Find <tr> tag tokens per row (outside any cell)
-        for row_dict in table['rows']:
-            all_row_toks = set(_tokens_in_range(
-                offset_mapping, row_dict['tag_start'], row_dict['tag_end']
-            ))
-            cell_toks = set()
-            for cell in row_dict['cells']:
-                cell_toks.update(cell['all_tokens'])
-            row_dict['tr_tokens'] = sorted(all_row_toks - cell_toks)
-
-        # Max total tokens per column (including tags, non-colspan only)
-        col_max = {}
-        for row_dict in table['rows']:
-            for c in row_dict['cells']:
-                if c['colspan'] == 1:
-                    col_max[c['col']] = max(
-                        col_max.get(c['col'], 0), len(c['all_tokens'])
-                    )
-        for j in range(num_cols):
-            col_max.setdefault(j, 1)
-
-        # <tr> tag overhead: max tr_tokens count across rows
-        tr_overhead = max(
-            (len(rd['tr_tokens']) for rd in table['rows']), default=0
-        )
-
-        total_max = sum(col_max[j] for j in range(num_cols)) + tr_overhead + margin
-        total_max = max(total_max, 1)
-
-        # Budget allocation: columns + tr overhead + margin
-        col_budget = {}
-        col_cumstart = {}
-        # Reserve space for opening <tr> tags at the start of each row
-        tr_open_budget = (tr_overhead / 2 / total_max) * pos_range
-        running = tr_open_budget
-        for j in range(num_cols):
-            col_cumstart[j] = running
-            col_budget[j] = (col_max[j] / total_max) * pos_range
-            running += col_budget[j]
-        tr_close_start = running
-
-        # Assign 2D positions to each row
-        for row_dict in table['rows']:
-            row_idx = row_dict['cells'][0]['row'] if row_dict['cells'] else 0
-            row_pos = t_start + (row_idx / max(num_rows - 1, 1)) * pos_range
-
-            for c in row_dict['cells']:
-                all_tokens = c['all_tokens']
-                if not all_tokens:
-                    continue
-                col_j = c['col']
-
-                # Column range for this cell
-                if c['colspan'] > 1:
-                    span_start = col_cumstart[col_j]
-                    span_budget = sum(
-                        col_budget.get(col_j + k, 0)
-                        for k in range(c['colspan'])
-                    )
-                    n_tok = max(len(all_tokens), 1)
-                else:
-                    span_start = col_cumstart[col_j]
-                    span_budget = col_budget[col_j]
-                    n_tok = col_max[col_j]
-
-                # Spread all tokens (tags + content) evenly across the budget
-                for k, ti in enumerate(all_tokens):
-                    frac = k / max(n_tok - 1, 1) if n_tok > 1 else 0.0
-                    pos_col[ti] = t_start + span_start + frac * span_budget
-                    pos_row[ti] = row_pos
-
-            # <tr> tag tokens: opening before cells, closing after
-            tr_toks = row_dict['tr_tokens']
-            if tr_toks:
-                # Split into opening (before first cell) and closing (after last)
-                if row_dict['cells']:
-                    first_cell_tok = min(
-                        c['all_tokens'][0] for c in row_dict['cells']
-                        if c['all_tokens']
-                    )
-                    last_cell_tok = max(
-                        c['all_tokens'][-1] for c in row_dict['cells']
-                        if c['all_tokens']
-                    )
-                    open_tr = [t for t in tr_toks if t < first_cell_tok]
-                    close_tr = [t for t in tr_toks if t > last_cell_tok]
-                else:
-                    open_tr = tr_toks
-                    close_tr = []
-
-                # Opening <tr> tokens spread across [0, tr_open_budget)
-                for k, ti in enumerate(open_tr):
-                    n = max(len(open_tr), 1)
-                    frac = k / max(n - 1, 1) if n > 1 else 0.0
-                    pos_col[ti] = t_start + frac * tr_open_budget
-                    pos_row[ti] = row_pos
-
-                # Closing </tr> tokens spread across [tr_close_start, ...]
-                tr_close_budget = (tr_overhead / 2 / total_max) * pos_range
-                for k, ti in enumerate(close_tr):
-                    n = max(len(close_tr), 1)
-                    frac = k / max(n - 1, 1) if n > 1 else 0.0
-                    pos_col[ti] = t_start + tr_close_start + frac * tr_close_budget
-                    pos_row[ti] = row_pos
-
-    return pos_col, pos_row
+    return grid
 
 
 # ─────────────────────────────────────────────────────────────
@@ -272,85 +96,160 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
     """
     Extends FinancialBertTokenizer with 2D RoPE position computation.
 
+    HTML tags inside tables are discarded — only cell content is tokenized.
+    Each cell is tokenized independently (no cross-cell token merging).
     Returns two extra fields: position_ids_col and position_ids_row.
     """
 
     def _tokenize_single(
         self, text: str, add_special_tokens: bool = True
     ) -> Dict[str, List]:
-        # ── Number replacement (same as parent) ──
-        numbers_data = []
-        for match in self.number_pattern.finditer(text):
-            sign_idx, log_val = self.parse_number_to_log(match.group(1))
-            numbers_data.append({
-                "start": match.start(), "end": match.end(),
-                "sign_idx": sign_idx, "log_val": log_val,
-            })
+        # Split text into (type, content) regions around <table> blocks
+        regions: List[Tuple[str, str]] = []
+        prev = 0
+        for m in _TABLE_RE.finditer(text):
+            if m.start() > prev:
+                regions.append(('text', text[prev:m.start()]))
+            regions.append(('table', m.group(0)))
+            prev = m.end()
+        if prev < len(text):
+            regions.append(('text', text[prev:]))
 
-        placeholder = "§"
-        processed_text = text
-        offset = 0
-        number_char_positions = []
+        all_ids: List[int] = []
+        all_is_num: List[int] = []
+        all_num_vals: List[List[float]] = []
+        all_pos_col: List[float] = []
+        all_pos_row: List[float] = []
+        seq_pos = 0
 
-        for num_info in numbers_data:
-            start = num_info["start"] + offset
-            end = num_info["end"] + offset
-            processed_text = (
-                processed_text[:start] + placeholder + processed_text[end:]
-            )
-            number_char_positions.append(start)
-            offset += len(placeholder) - (num_info["end"] - num_info["start"])
-
-        # ── Tokenize (keep offset_mapping for 2D position computation) ──
-        encoded = self.base_tokenizer(
-            processed_text,
-            add_special_tokens=add_special_tokens,
-            return_offsets_mapping=True,
-            return_tensors=None,
-        )
-        input_ids = encoded["input_ids"]
-        offset_mapping = encoded["offset_mapping"]
-
-        # ── Map numbers to tokens (same as parent) ──
-        number_token_indices = set()
-        for char_pos in number_char_positions:
-            for tok_idx, (start, end) in enumerate(offset_mapping):
-                if start <= char_pos < end:
-                    number_token_indices.add(tok_idx)
-                    break
-
-        result_input_ids = []
-        is_number_mask = []
-        number_values = []
-        num_idx = 0
-
-        for tok_idx, token_id in enumerate(input_ids):
-            if tok_idx in number_token_indices:
-                num_info = numbers_data[num_idx]
-                num_idx += 1
-                result_input_ids.append(self.number_placeholder_id)
-                is_number_mask.append(1)
-                number_values.append([
-                    float(num_info["sign_idx"]),
-                    float(num_info["log_val"]),
-                ])
+        for rtype, content in regions:
+            if rtype == 'text':
+                seg = super()._tokenize_single(content, add_special_tokens=False)
+                n = len(seg["input_ids"])
+                all_ids.extend(seg["input_ids"])
+                all_is_num.extend(seg["is_number_mask"])
+                all_num_vals.extend(seg["number_values"])
+                for i in range(n):
+                    all_pos_col.append(float(seq_pos + i))
+                    all_pos_row.append(float(seq_pos + i))
+                seq_pos += n
             else:
-                result_input_ids.append(token_id)
-                is_number_mask.append(0)
-                number_values.append([0.0, 0.0])
+                grid = parse_table_grid(content)
 
-        # ── 2D position computation ──
-        seq_len = len(result_input_ids)
-        position_ids_col, position_ids_row = compute_2d_positions(
-            processed_text, offset_mapping, seq_len,
-        )
+                # TABLE_START marker (1D position)
+                all_ids.append(TABLE_START_ID)
+                all_is_num.append(0)
+                all_num_vals.append([0.0, 0.0])
+                all_pos_col.append(float(seq_pos))
+                all_pos_row.append(float(seq_pos))
+                seq_pos += 1
+
+                table_origin = seq_pos
+                table_start_idx = len(all_ids)
+                total_tokens = 0
+
+                # First pass: tokenize all cells, record max tokens per column
+                cell_data: List[Tuple[int, int, Dict, int]] = []
+                max_col_tokens: Dict[int, int] = {}
+                for ri, row_cells in enumerate(grid):
+                    for ci, cell_html in row_cells:
+                        seg = super()._tokenize_single(
+                            cell_html, add_special_tokens=False
+                        )
+                        T_c = len(seg["input_ids"])
+                        cell_data.append((ri, ci, seg, T_c))
+                        max_col_tokens[ci] = max(
+                            max_col_tokens.get(ci, 0), T_c
+                        )
+
+                # Column-aligned start positions along the row direction
+                # Each column slot = max_tokens + 1 (tab delimiter) + D_RC gap
+                col_starts: Dict[int, float] = {}
+                cumulative = 0.0
+                for c in sorted(max_col_tokens.keys()):
+                    col_starts[c] = cumulative
+                    cumulative += max_col_tokens[c] + 1 + D_RC
+
+                # Second pass: assign 2D positions
+                for ri, ci, seg, T_c in cell_data:
+                    all_ids.extend(seg["input_ids"])
+                    all_is_num.extend(seg["is_number_mask"])
+                    all_num_vals.extend(seg["number_values"])
+
+                    base = col_starts[ci]
+                    row_off_col = ri * D_COL * COLUMN_DIRECTION_UNIT_VECT[0]
+                    row_off_row = ri * D_COL * COLUMN_DIRECTION_UNIT_VECT[1]
+                    for t in range(T_c):
+                        # Intra-cell: +t on both axes (vanilla RoPE)
+                        # Inter-cell: column-aligned base along ROW_DIRECTION
+                        # Inter-row: ri * D_COL along COLUMN_DIRECTION
+                        all_pos_col.append(
+                            table_origin
+                            + base * ROW_DIRECTION_UNIT_VECT[0]
+                            + row_off_col + t
+                        )
+                        all_pos_row.append(
+                            table_origin
+                            + base * ROW_DIRECTION_UNIT_VECT[1]
+                            + row_off_row + t
+                        )
+
+                    # Tab delimiter after cell content
+                    all_ids.append(TAB_ID)
+                    all_is_num.append(0)
+                    all_num_vals.append([0.0, 0.0])
+                    all_pos_col.append(
+                        table_origin
+                        + base * ROW_DIRECTION_UNIT_VECT[0]
+                        + row_off_col + T_c
+                    )
+                    all_pos_row.append(
+                        table_origin
+                        + base * ROW_DIRECTION_UNIT_VECT[1]
+                        + row_off_row + T_c
+                    )
+                    total_tokens += T_c + 1  # +1 for tab
+
+                # Center table: place barycenter at midpoint of the
+                # position budget (between last-before and first-after)
+                if total_tokens > 0:
+                    tbl_col = all_pos_col[table_start_idx:table_start_idx + total_tokens]
+                    tbl_row = all_pos_row[table_start_idx:table_start_idx + total_tokens]
+                    bary_col = sum(tbl_col) / total_tokens
+                    bary_row = sum(tbl_row) / total_tokens
+                    midpoint = table_origin + (total_tokens - 1) / 2
+                    shift_col = midpoint - bary_col
+                    shift_row = midpoint - bary_row
+                    for i in range(total_tokens):
+                        all_pos_col[table_start_idx + i] += shift_col
+                        all_pos_row[table_start_idx + i] += shift_row
+
+                seq_pos = table_origin + total_tokens
+
+                # TABLE_END marker (1D position)
+                all_ids.append(TABLE_END_ID)
+                all_is_num.append(0)
+                all_num_vals.append([0.0, 0.0])
+                all_pos_col.append(float(seq_pos))
+                all_pos_row.append(float(seq_pos))
+                seq_pos += 1
+
+        # Add special tokens
+        if add_special_tokens:
+            cls_id = self.base_tokenizer.cls_token_id
+            sep_id = self.base_tokenizer.sep_token_id
+            all_ids = [cls_id] + all_ids + [sep_id]
+            all_is_num = [0] + all_is_num + [0]
+            all_num_vals = [[0.0, 0.0]] + all_num_vals + [[0.0, 0.0]]
+            all_pos_col = [0.0] + [p + 1 for p in all_pos_col] + [float(seq_pos + 1)]
+            all_pos_row = [0.0] + [p + 1 for p in all_pos_row] + [float(seq_pos + 1)]
 
         return {
-            "input_ids": result_input_ids,
-            "is_number_mask": is_number_mask,
-            "number_values": number_values,
-            "position_ids_col": position_ids_col,
-            "position_ids_row": position_ids_row,
+            "input_ids": all_ids,
+            "is_number_mask": all_is_num,
+            "number_values": all_num_vals,
+            "position_ids_col": all_pos_col,
+            "position_ids_row": all_pos_row,
         }
 
     def __call__(
@@ -447,15 +346,17 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
 
 class RoPE2DWrapper(nn.Module):
     """
-    Wraps a rotary embedding module to support 2D table positions.
+    Wraps ModernBertRotaryEmbedding to support 2D table positions.
 
-    When 2D positions are set via set_positions(), computes RoPE using:
-        - First half of frequency bands → column positions
-        - Second half of frequency bands → row positions
+    When 2D positions are set via set_positions(), computes RoPE using
+    interleaved axis assignment:
+        - even-indexed frequency pairs → column positions (axis 1)
+        - odd-indexed frequency pairs  → row positions (axis 2)
 
     When no 2D positions are set, delegates to the original module.
-    The original module has no persistent state (inv_freq is a non-persistent
-    buffer), so wrapping does not affect state_dict compatibility.
+    The original module stores per-layer-type inv_freq buffers
+    (e.g. local_inv_freq, global_inv_freq) as non-persistent buffers,
+    so wrapping does not affect state_dict compatibility.
     """
 
     def __init__(self, original: nn.Module):
@@ -463,10 +364,6 @@ class RoPE2DWrapper(nn.Module):
         self.original = original
         self._pos_col: Optional[torch.Tensor] = None
         self._pos_row: Optional[torch.Tensor] = None
-
-    @property
-    def inv_freq(self):
-        return self.original.inv_freq
 
     def set_positions(self, pos_col: torch.Tensor, pos_row: torch.Tensor):
         self._pos_col = pos_col
@@ -476,14 +373,18 @@ class RoPE2DWrapper(nn.Module):
         self._pos_col = None
         self._pos_row = None
 
-    def forward(self, *args, **kwargs):
+    def forward(self, x, position_ids, layer_type=None):
         if self._pos_col is None:
-            return self.original(*args, **kwargs)
+            return self.original(x, position_ids, layer_type=layer_type)
 
-        inv_freq = self.original.inv_freq  # [head_dim // 2]
+        # Get the inv_freq for this layer type (local or global)
+        inv_freq = getattr(self.original, f"{layer_type}_inv_freq")
+        attention_scaling = getattr(
+            self.original, f"{layer_type}_attention_scaling"
+        )
 
         # Interleave column and row across frequency bands so both
-        # dimensions see the full frequency spectrum:
+        # axes see the full frequency spectrum:
         #   even-indexed pairs → column positions
         #   odd-indexed pairs  → row positions
         col_freqs = torch.einsum(
@@ -498,7 +399,9 @@ class RoPE2DWrapper(nn.Module):
         freqs = freqs.reshape(*col_freqs.shape[:-1], -1)  # [B, S, D/2]
         emb = torch.cat([freqs, freqs], dim=-1)            # [B, S, D]
 
-        return emb.cos(), emb.sin()
+        cos = emb.cos() * attention_scaling
+        sin = emb.sin() * attention_scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 # ─────────────────────────────────────────────────────────────

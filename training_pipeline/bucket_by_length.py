@@ -117,6 +117,8 @@ def pad_and_stack(items: list, pad_to: int) -> dict:
     input_ids = torch.zeros(n, pad_to, dtype=torch.uint16)
     is_number_mask = torch.zeros(n, pad_to, dtype=torch.int8)
     number_values = torch.zeros(n, pad_to, 2, dtype=torch.float32)
+    position_ids_col = torch.zeros(n, pad_to, dtype=torch.float16)
+    position_ids_row = torch.zeros(n, pad_to, dtype=torch.float16)
     source_files = []
 
     for i, item in enumerate(items):
@@ -125,12 +127,17 @@ def pad_and_stack(items: list, pad_to: int) -> dict:
         input_ids[i, :seq_len] = torch.tensor(ids, dtype=torch.uint16)
         is_number_mask[i, :seq_len] = torch.tensor(item["is_number_mask"], dtype=torch.int8)
         number_values[i, :seq_len] = torch.tensor(item["number_values"][:seq_len], dtype=torch.float32)
+        if "position_ids_col" in item:
+            position_ids_col[i, :seq_len] = torch.tensor(item["position_ids_col"][:seq_len], dtype=torch.float16)
+            position_ids_row[i, :seq_len] = torch.tensor(item["position_ids_row"][:seq_len], dtype=torch.float16)
         source_files.append(item.get("source_file", ""))
 
     return {
         "input_ids": input_ids,
         "is_number_mask": is_number_mask,
         "number_values": number_values,
+        "position_ids_col": position_ids_col,
+        "position_ids_row": position_ids_row,
         "source_files": source_files,
         "pad_to": pad_to,
     }
