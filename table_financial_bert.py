@@ -26,6 +26,11 @@ from financial_bert import (
     FinancialModernBert,
 )
 from transformers import ModernBertForMaskedLM
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.modernbert.modeling_modernbert import (
+    apply_rotary_pos_emb,
+    eager_attention_forward,
+)
 
 
 _TABLE_RE = re.compile(r'<table[^>]*>.*?</table>', re.DOTALL | re.IGNORECASE)
@@ -120,12 +125,11 @@ def _interpolate_embedding(
 class TablePosAttentionWrapper(nn.Module):
     """Wraps ModernBertAttention to inject learned table position embeddings.
 
-    Uses explicit linear separation:
+    Rewrites the attention forward up to the attention dispatch to add
+    positional contributions:
         QKV = Wqkv(hidden) + pos @ Wqkv.weight
-    The position contribution is computed via a separate F.linear call
-    (no bias — already present in the hidden path) and added to the Wqkv
-    output through a forward hook.  When use_value_pos is False, the V
-    slice of the position contribution is zeroed before addition.
+    The attention dispatch (FA2/SDPA/eager) and output projection are
+    delegated to the original module's attributes.  No hooks needed.
     """
 
     def __init__(
@@ -184,35 +188,56 @@ class TablePosAttentionWrapper(nn.Module):
                 **kwargs,
             )
 
+        attn = self.original
+        input_shape = hidden_states.shape[:-1]
+
+        # QKV projection + table position contribution
+        qkv = attn.Wqkv(hidden_states)
         pos_emb = self._compute_pos_emb(hidden_states.dtype)
 
-        # pos @ Wqkv.weight (no bias — already in the hidden path)
-        pos_qkv = F.linear(pos_emb, self.original.Wqkv.weight)
+        if self.use_value_pos:
+            qkv = qkv + F.linear(pos_emb, attn.Wqkv.weight)
+        else:
+            # Only project Q and K slices (skip V — 2/3 the compute)
+            qk_size = 2 * self.num_heads * self.head_dim
+            pos_qk = F.linear(pos_emb, attn.Wqkv.weight[:qk_size])
+            qkv[:, :, :qk_size] = qkv[:, :, :qk_size] + pos_qk
 
-        if not self.use_value_pos:
-            B, S = pos_qkv.shape[:2]
-            qkv_mask = pos_qkv.new_ones(3)
-            qkv_mask[2] = 0.0  # zero V
-            pos_qkv = (
-                pos_qkv.view(B, S, 3, self.num_heads, self.head_dim)
-                * qkv_mask[None, None, :, None, None]
-            ).view(B, S, -1)
+        # Split into Q, K, V and apply RoPE (same as original forward)
+        qkv = qkv.view(*input_shape, 3, -1, self.head_dim)
+        query_states, key_states, value_states = qkv.unbind(dim=-3)
 
-        # Hook on Wqkv to add position contribution to its output
-        handle = self.original.Wqkv.register_forward_hook(
-            lambda _mod, _inp, out: out + pos_qkv
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, unsqueeze_dim=1,
         )
-        try:
-            result = self.original(
-                hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-                **kwargs,
-            )
-        finally:
-            handle.remove()
 
-        return result
+        # Attention dispatch (FA2/SDPA/eager) — untouched
+        attention_interface = eager_attention_forward
+        if attn.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[attn.config._attn_implementation]
+
+        attn_output, attn_weights = attention_interface(
+            attn,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=attn.attention_dropout if attn.training else 0.0,
+            scaling=self.head_dim ** -0.5,
+            sliding_window=attn.sliding_window,
+            deterministic=attn.deterministic_flash_attn,
+            **kwargs,
+        )
+
+        # Output projection — untouched
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn.out_drop(attn.Wo(attn_output))
+        return attn_output, attn_weights
 
 
 # ─────────────────────────────────────────────────────────────
