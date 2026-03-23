@@ -490,8 +490,12 @@ class TableFinancialModernBert(FinancialModernBert):
         labels_text: Optional[torch.Tensor] = None,
         labels_magnitude: Optional[torch.Tensor] = None,
     ):
-        # Set table positions on all attention wrappers
-        if table_mask is not None and table_mask.any():
+        # Always set table positions when tensors are provided — even if
+        # table_mask is all zeros.  The mask multiplication in _compute_pos_emb
+        # already handles the no-table case, and keeping a stable type for
+        # _table_pos (always tuple, never None) avoids torch.compile
+        # recompilation guards on None-vs-tuple transitions.
+        if table_mask is not None:
             for w in self._get_attention_wrappers():
                 w.set_table_pos(
                     table_row_index, table_col_index, table_mask,

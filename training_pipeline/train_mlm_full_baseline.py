@@ -515,4 +515,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-"""python -m training_pipeline.train_mlm_full_baseline   --data_dir /workspace/data/   --num_workers 4   --tokens_per_batch 8192   --lr 2.5e-5   --number_lr 1e-4   --dtype bf16   --device cuda   --compile"""
+"""python -m training_pipeline.train_mlm_full_baseline   --data_dir /workspace/data/bucketed   --num_workers 4   --tokens_per_batch 8192   --lr 2.5e-5   --number_lr 1e-4   --dtype bf16   --device cuda   --compile"""

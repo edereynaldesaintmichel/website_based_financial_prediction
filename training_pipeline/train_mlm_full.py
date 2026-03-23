@@ -349,16 +349,32 @@ def train(args):
         for p in m.parameters():
             number_params.add(id(p))
 
-    backbone_group = [p for p in model.parameters() if p.requires_grad and id(p) not in number_params]
+    # Table position embeddings (row_emb / col_emb) get their own LR
+    table_pos_params = set()
+    from table_financial_bert import TablePosAttentionWrapper
+    for module in model.modules():
+        if isinstance(module, TablePosAttentionWrapper):
+            for p in (module.row_emb, module.col_emb):
+                for pp in p.parameters():
+                    table_pos_params.add(id(pp))
+
+    special_params = number_params | table_pos_params
+    backbone_group = [p for p in model.parameters() if p.requires_grad and id(p) not in special_params]
     number_group = [p for p in model.parameters() if p.requires_grad and id(p) in number_params]
+    table_pos_group = [p for p in model.parameters() if p.requires_grad and id(p) in table_pos_params]
 
     print(f"Param groups — backbone: {sum(p.numel() for p in backbone_group):,} params @ lr={args.lr}, "
-          f"number: {sum(p.numel() for p in number_group):,} params @ lr={args.number_lr}")
+          f"number: {sum(p.numel() for p in number_group):,} params @ lr={args.number_lr}, "
+          f"table_pos: {sum(p.numel() for p in table_pos_group):,} params @ lr={args.table_pos_lr}")
 
-    optimizer = torch.optim.AdamW([
+    param_groups = [
         {"params": backbone_group, "lr": args.lr},
         {"params": number_group, "lr": args.number_lr},
-    ], weight_decay=args.weight_decay)
+    ]
+    if table_pos_group:
+        param_groups.append({"params": table_pos_group, "lr": args.table_pos_lr})
+
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
 
     # Linear warmup + cosine decay schedule (applied uniformly to both groups)
     total_steps = len(batch_sampler) * args.epochs
@@ -370,7 +386,9 @@ def train(args):
         progress = (step - lr_warmup_steps) / max(1, total_steps - lr_warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda, lr_lambda])
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, [lr_lambda] * len(param_groups)
+    )
 
     # ------------------------------------------------------------------
     # Training loop
@@ -447,6 +465,16 @@ def train(args):
             ma["loss"].append(loss.item())
             ma["text"].append(outputs["loss_text"].item())
             ma["mag"].append(outputs["loss_mag"].item())
+
+            if table_pos_group and global_step % 1000 == 0:
+                row_norms, col_norms = [], []
+                for module in model.modules():
+                    if isinstance(module, TablePosAttentionWrapper):
+                        row_norms.append(module.row_emb.weight.data.norm().item())
+                        col_norms.append(module.col_emb.weight.data.norm().item())
+                print(f"  [step {global_step}] table_pos norms — "
+                      f"row: {sum(row_norms)/len(row_norms):.4f} (max {max(row_norms):.4f}), "
+                      f"col: {sum(col_norms)/len(col_norms):.4f} (max {max(col_norms):.4f})")
 
             pbar.set_postfix(
                 loss=f"{sum(ma['loss'])/len(ma['loss']):.4f}",
@@ -529,6 +557,8 @@ def main():
                         help="Backbone learning rate")
     parser.add_argument("--number_lr", type=float, default=2e-4,
                         help="Learning rate for number_embedder + number_head")
+    parser.add_argument("--table_pos_lr", type=float, default=1e-3,
+                        help="Learning rate for table position embeddings (row_emb/col_emb)")
     parser.add_argument("--mask_prob", type=float, default=0.15)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_steps", type=int, default=500,
@@ -548,4 +578,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-"""python -m training_pipeline.train_mlm_full   --data_dir /workspace/data/   --num_workers 4   --tokens_per_batch 8192   --lr 2.5e-5   --number_lr 1e-4   --dtype bf16   --device cuda   --compile"""
+"""python -m training_pipeline.train_mlm_full   --data_dir /workspace/data/bucketed   --num_workers 4   --tokens_per_batch 8192   --lr 2.5e-5   --number_lr 1e-4   --dtype bf16   --device cuda   --compile"""
