@@ -229,8 +229,8 @@ class TablePosAttentionWrapper(nn.Module):
             attention_mask,
             dropout=attn.attention_dropout if attn.training else 0.0,
             scaling=self.head_dim ** -0.5,
-            sliding_window=attn.sliding_window,
-            deterministic=attn.deterministic_flash_attn,
+            sliding_window=getattr(attn, 'sliding_window', None),
+            deterministic=getattr(attn, 'deterministic_flash_attn', False),
             **kwargs,
         )
 
