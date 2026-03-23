@@ -26,11 +26,6 @@ from financial_bert import (
     FinancialModernBert,
 )
 from transformers import ModernBertForMaskedLM
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.models.modernbert.modeling_modernbert import (
-    apply_rotary_pos_emb,
-    eager_attention_forward,
-)
 
 
 _TABLE_RE = re.compile(r'<table[^>]*>.*?</table>', re.DOTALL | re.IGNORECASE)
@@ -125,11 +120,11 @@ def _interpolate_embedding(
 class TablePosAttentionWrapper(nn.Module):
     """Wraps ModernBertAttention to inject learned table position embeddings.
 
-    Rewrites the attention forward up to the attention dispatch to add
-    positional contributions:
+    Uses explicit linear separation:
         QKV = Wqkv(hidden) + pos @ Wqkv.weight
-    The attention dispatch (FA2/SDPA/eager) and output projection are
-    delegated to the original module's attributes.  No hooks needed.
+    A permanent forward hook on Wqkv adds the position contribution.
+    The hook reads from self._pos_qkv (set before each forward, cleared after),
+    giving torch.compile a stable graph structure.
     """
 
     def __init__(
@@ -156,6 +151,15 @@ class TablePosAttentionWrapper(nn.Module):
         nn.init.zeros_(self.col_emb.weight)
 
         self._table_pos: Optional[Tuple] = None
+        self._pos_qkv: Optional[torch.Tensor] = None
+
+        # Permanent hook — stable graph structure for torch.compile
+        self.original.Wqkv.register_forward_hook(self._wqkv_hook)
+
+    def _wqkv_hook(self, _mod, _inp, out):
+        if self._pos_qkv is not None:
+            return out + self._pos_qkv
+        return out
 
     def set_table_pos(self, row_idx, col_idx, table_mask, num_rows, num_cols):
         self._table_pos = (row_idx, col_idx, table_mask, num_rows, num_cols)
@@ -180,64 +184,29 @@ class TablePosAttentionWrapper(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if self._table_pos is None:
-            return self.original(
+        if self._table_pos is not None:
+            pos_emb = self._compute_pos_emb(hidden_states.dtype)
+
+            if self.use_value_pos:
+                self._pos_qkv = F.linear(pos_emb, self.original.Wqkv.weight)
+            else:
+                # Only project Q and K slices (skip V — 2/3 the compute)
+                qk_size = 2 * self.num_heads * self.head_dim
+                full = F.linear(pos_emb, self.original.Wqkv.weight[:qk_size])
+                # Pad with zeros for V slice so addition in hook is shape-compatible
+                self._pos_qkv = F.pad(full, (0, self.num_heads * self.head_dim))
+
+        try:
+            result = self.original(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 **kwargs,
             )
+        finally:
+            self._pos_qkv = None
 
-        attn = self.original
-        input_shape = hidden_states.shape[:-1]
-
-        # QKV projection + table position contribution
-        qkv = attn.Wqkv(hidden_states)
-        pos_emb = self._compute_pos_emb(hidden_states.dtype)
-
-        if self.use_value_pos:
-            qkv = qkv + F.linear(pos_emb, attn.Wqkv.weight)
-        else:
-            # Only project Q and K slices (skip V — 2/3 the compute)
-            qk_size = 2 * self.num_heads * self.head_dim
-            pos_qk = F.linear(pos_emb, attn.Wqkv.weight[:qk_size])
-            qkv[:, :, :qk_size] = qkv[:, :, :qk_size] + pos_qk
-
-        # Split into Q, K, V and apply RoPE (same as original forward)
-        qkv = qkv.view(*input_shape, 3, -1, self.head_dim)
-        query_states, key_states, value_states = qkv.unbind(dim=-3)
-
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, unsqueeze_dim=1,
-        )
-
-        # Attention dispatch (FA2/SDPA/eager) — untouched
-        attention_interface = eager_attention_forward
-        if attn.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[attn.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            attn,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=attn.attention_dropout if attn.training else 0.0,
-            scaling=self.head_dim ** -0.5,
-            sliding_window=getattr(attn, 'sliding_window', None),
-            deterministic=getattr(attn, 'deterministic_flash_attn', False),
-            **kwargs,
-        )
-
-        # Output projection — untouched
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = attn.out_drop(attn.Wo(attn_output))
-        return attn_output, attn_weights
+        return result
 
 
 # ─────────────────────────────────────────────────────────────
