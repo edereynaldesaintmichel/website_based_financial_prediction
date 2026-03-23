@@ -482,7 +482,7 @@ class TableFinancialModernBert(FinancialModernBert):
         super().__init__(config)
         self.max_row_pos = getattr(config, 'max_row_positions', MAX_ROW_POSITIONS)
         self.max_col_pos = getattr(config, 'max_col_positions', MAX_COL_POSITIONS)
-        self.use_value_pos = getattr(config, 'use_value_pos', True)
+        self.use_value_pos = getattr(config, 'use_value_pos', False)
         self._wrap_attention_layers()
 
     def _wrap_attention_layers(self):
@@ -548,7 +548,7 @@ def build_table_model(
     num_magnitude_bins: int = 128,
     max_row_positions: int = MAX_ROW_POSITIONS,
     max_col_positions: int = MAX_COL_POSITIONS,
-    use_value_pos: bool = True,
+    use_value_pos: bool = False,
     **kwargs,
 ) -> TableFinancialModernBert:
     """Build a TableFinancialModernBert from a pretrained ModernBERT."""
