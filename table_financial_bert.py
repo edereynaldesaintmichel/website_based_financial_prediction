@@ -36,6 +36,7 @@ _TABLE_RE = re.compile(r'<table[^>]*>.*?</table>', re.DOTALL | re.IGNORECASE)
 TABLE_START_ID = 50285  # [unused0]
 TABLE_END_ID = 50286    # [unused1]
 TAB_ID = 186            # \t — cell delimiter
+NEWLINE_ID = 187        # \n — row delimiter
 
 # Default limits for position embedding tables
 MAX_ROW_POSITIONS = 40
@@ -299,6 +300,16 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
                         all_table_mask.append(1)
                         all_num_rows.append(n_rows)
                         all_num_cols.append(n_cols)
+
+                    # Newline delimiter after each row
+                    all_ids.append(NEWLINE_ID)
+                    all_is_num.append(0)
+                    all_num_vals.append(0.0)
+                    all_row_idx.append(ri)
+                    all_col_idx.append(0)
+                    all_table_mask.append(1)
+                    all_num_rows.append(n_rows)
+                    all_num_cols.append(n_cols)
 
                 # TABLE_END marker
                 all_ids.append(TABLE_END_ID)
