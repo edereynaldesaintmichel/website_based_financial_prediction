@@ -557,7 +557,7 @@ def main():
                         help="Backbone learning rate")
     parser.add_argument("--number_lr", type=float, default=2e-4,
                         help="Learning rate for number_embedder + number_head")
-    parser.add_argument("--table_pos_lr", type=float, default=1e-3,
+    parser.add_argument("--table_pos_lr", type=float, default=0,
                         help="Learning rate for table position embeddings (row_emb/col_emb)")
     parser.add_argument("--mask_prob", type=float, default=0.15)
     parser.add_argument("--weight_decay", type=float, default=0.01)
