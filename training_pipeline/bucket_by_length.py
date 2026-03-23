@@ -117,8 +117,11 @@ def pad_and_stack(items: list, pad_to: int) -> dict:
     input_ids = torch.zeros(n, pad_to, dtype=torch.uint16)
     is_number_mask = torch.zeros(n, pad_to, dtype=torch.int8)
     number_values = torch.zeros(n, pad_to, dtype=torch.float32)
-    position_ids_col = torch.zeros(n, pad_to, dtype=torch.float16)
-    position_ids_row = torch.zeros(n, pad_to, dtype=torch.float16)
+    table_row_index = torch.zeros(n, pad_to, dtype=torch.int16)
+    table_col_index = torch.zeros(n, pad_to, dtype=torch.int16)
+    table_mask = torch.zeros(n, pad_to, dtype=torch.int8)
+    table_num_rows = torch.zeros(n, pad_to, dtype=torch.int16)
+    table_num_cols = torch.zeros(n, pad_to, dtype=torch.int16)
     source_files = []
 
     for i, item in enumerate(items):
@@ -127,17 +130,23 @@ def pad_and_stack(items: list, pad_to: int) -> dict:
         input_ids[i, :seq_len] = torch.tensor(ids, dtype=torch.uint16)
         is_number_mask[i, :seq_len] = torch.tensor(item["is_number_mask"], dtype=torch.int8)
         number_values[i, :seq_len] = torch.tensor(item["number_values"][:seq_len], dtype=torch.float32)
-        if "position_ids_col" in item:
-            position_ids_col[i, :seq_len] = torch.tensor(item["position_ids_col"][:seq_len], dtype=torch.float16)
-            position_ids_row[i, :seq_len] = torch.tensor(item["position_ids_row"][:seq_len], dtype=torch.float16)
+        if "table_row_index" in item:
+            table_row_index[i, :seq_len] = torch.tensor(item["table_row_index"][:seq_len], dtype=torch.int16)
+            table_col_index[i, :seq_len] = torch.tensor(item["table_col_index"][:seq_len], dtype=torch.int16)
+            table_mask[i, :seq_len] = torch.tensor(item["table_mask"][:seq_len], dtype=torch.int8)
+            table_num_rows[i, :seq_len] = torch.tensor(item["table_num_rows"][:seq_len], dtype=torch.int16)
+            table_num_cols[i, :seq_len] = torch.tensor(item["table_num_cols"][:seq_len], dtype=torch.int16)
         source_files.append(item.get("source_file", ""))
 
     return {
         "input_ids": input_ids,
         "is_number_mask": is_number_mask,
         "number_values": number_values,
-        "position_ids_col": position_ids_col,
-        "position_ids_row": position_ids_row,
+        "table_row_index": table_row_index,
+        "table_col_index": table_col_index,
+        "table_mask": table_mask,
+        "table_num_rows": table_num_rows,
+        "table_num_cols": table_num_cols,
         "source_files": source_files,
         "pad_to": pad_to,
     }

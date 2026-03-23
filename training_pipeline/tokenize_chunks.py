@@ -38,8 +38,11 @@ def tokenize_chunk(tokenizer: TableFinancialBertTokenizer, chunk: dict, max_leng
         "input_ids": result["input_ids"][0],
         "is_number_mask": result["is_number_mask"][0],
         "number_values": result["number_values"][0],
-        "position_ids_col": result["position_ids_col"][0],
-        "position_ids_row": result["position_ids_row"][0],
+        "table_row_index": result["table_row_index"][0],
+        "table_col_index": result["table_col_index"][0],
+        "table_mask": result["table_mask"][0],
+        "table_num_rows": result["table_num_rows"][0],
+        "table_num_cols": result["table_num_cols"][0],
         "seq_length": len(result["input_ids"][0]),
     }
 

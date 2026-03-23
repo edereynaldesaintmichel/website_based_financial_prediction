@@ -71,7 +71,7 @@ def main():
                 num_val = result["number_values"][tok_cursor]
 
                 if is_num:
-                    token_str = f"[NUM sign={int(num_val[0])} mag={num_val[1]:.2f}]"
+                    token_str = f"[NUM mag={num_val:.2f}]"
                 else:
                     token_str = base_tok.decode([orig_ids[j]])
 
@@ -88,8 +88,7 @@ def main():
                 tokens.append({
                     "index": tok_cursor, "token_id": tid,
                     "text": token_str, "is_number": is_num,
-                    "number_sign": int(num_val[0]),
-                    "number_magnitude": round(num_val[1], 4),
+                    "number_magnitude": round(num_val, 4),
                     "col_pos": round(result["position_ids_col"][tok_cursor], 4),
                     "row_pos": round(result["position_ids_row"][tok_cursor], 4),
                     "newlines_before": nl, "region": "text",
@@ -106,7 +105,6 @@ def main():
             tokens.append({
                 "index": tok_cursor, "token_id": TABLE_START_ID,
                 "text": "[TABLE]", "is_number": False,
-                "number_sign": 0, "number_magnitude": 0.0,
                 "col_pos": round(result["position_ids_col"][tok_cursor], 4),
                 "row_pos": round(result["position_ids_row"][tok_cursor], 4),
                 "newlines_before": gap_newlines, "region": "special",
@@ -132,7 +130,7 @@ def main():
                         num_val = result["number_values"][tok_cursor]
 
                         if is_num:
-                            token_str = f"[NUM sign={int(num_val[0])} mag={num_val[1]:.2f}]"
+                            token_str = f"[NUM mag={num_val:.2f}]"
                         else:
                             token_str = base_tok.decode([orig_ids[j]])
 
@@ -143,8 +141,7 @@ def main():
                         tokens.append({
                             "index": tok_cursor, "token_id": tid,
                             "text": token_str, "is_number": is_num,
-                            "number_sign": int(num_val[0]),
-                            "number_magnitude": round(num_val[1], 4),
+                            "number_magnitude": round(num_val, 4),
                             "col_pos": round(result["position_ids_col"][tok_cursor], 4),
                             "row_pos": round(result["position_ids_row"][tok_cursor], 4),
                             "newlines_before": nl, "region": "table",

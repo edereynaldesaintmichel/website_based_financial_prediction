@@ -1,21 +1,21 @@
 """
-TableFinancialModernBert: FinancialModernBert with 2D RoPE for HTML tables.
+TableFinancialModernBert: FinancialModernBert with learned 2D positional
+embeddings for HTML tables.
 
-Tokenizer parses HTML <table> structure and computes two position-ID arrays:
-    - position_ids_col (axis 1, even RoPE pairs): column/horizontal positions
-    - position_ids_row (axis 2, odd RoPE pairs): row/vertical positions
+Each attention layer has two small embedding tables — one for row position,
+one for column position — whose outputs are added to hidden states before the
+QKV projection.  Standard 1D RoPE still runs on all tokens for sequential
+position; the learned embeddings provide *additional* structural row/column
+information for table tokens only.
 
-Outside tables, both arrays hold identical sequential positions (standard RoPE).
-Inside tables, positions follow a column-aligned 2D layout:
-    - Within cells: (+1, +1) per token (vanilla RoPE preserved)
-    - Columns are aligned: each column occupies max_tokens_in_col + D_RC
-      along ROW_DIRECTION_UNIT_VECT, so same-column cells start at the
-      same position regardless of neighboring cell sizes.
-    - Row-to-row: offset of D_COL along COLUMN_DIRECTION_UNIT_VECT per row
+Tables with more rows (or columns) than the embedding table size are handled
+via proportional remapping + linear interpolation between the two nearest
+embeddings (similar to ViT position embedding interpolation at new resolutions).
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import re
 from typing import Dict, Any, List, Optional, Union, Tuple
 from bs4 import BeautifulSoup
@@ -37,17 +37,9 @@ TABLE_START_ID = 50285  # [unused0]
 TABLE_END_ID = 50286    # [unused1]
 TAB_ID = 186            # \t — cell delimiter
 
-# Direction vectors for 2D RoPE, as (col_axis_component, row_axis_component).
-# Row direction: primary axis for horizontal cell-to-cell traversal.
-# Column direction: primary axis for vertical row-to-row traversal.
-# Symmetric by construction: swapping components mirrors the vector.
-ROW_DIRECTION_UNIT_VECT = (1.0, 1)
-COLUMN_DIRECTION_UNIT_VECT = (0.3, 1.0)
-
-# Inter-cell gap within a row, measured along ROW_DIRECTION_UNIT_VECT.
-D_RC = 4
-# Inter-row spacing, measured along COLUMN_DIRECTION_UNIT_VECT.
-D_COL = 8
+# Default limits for position embedding tables
+MAX_ROW_POSITIONS = 40
+MAX_COL_POSITIONS = 8
 
 
 def parse_table_grid(table_html: str) -> List[List[Tuple[int, str]]]:
@@ -89,16 +81,152 @@ def parse_table_grid(table_html: str) -> List[List[Tuple[int, str]]]:
 
 
 # ─────────────────────────────────────────────────────────────
+# Position embedding helpers
+# ─────────────────────────────────────────────────────────────
+
+def _interpolate_embedding(
+    emb: nn.Embedding,
+    indices: torch.Tensor,
+    num_positions: torch.Tensor,
+    max_pos: int,
+) -> torch.Tensor:
+    """Look up or interpolate positional embeddings.
+
+    For tables with <= max_pos positions along an axis, uses direct lookup.
+    For tables with > max_pos, remaps ALL indices proportionally to
+    [0, max_pos-1] and linearly interpolates between the two nearest
+    embeddings.
+    """
+    needs_interp = num_positions > max_pos
+
+    # Proportional remapping for large tables
+    denom = (num_positions.float() - 1).clamp(min=1)
+    remapped = indices.float() * (max_pos - 1) / denom
+
+    # Direct indices for small tables, remapped for large
+    effective = torch.where(needs_interp, remapped, indices.float())
+
+    idx_lo = effective.floor().long().clamp(0, max_pos - 1)
+    idx_hi = effective.ceil().long().clamp(0, max_pos - 1)
+    weight_hi = (effective - idx_lo.float()).unsqueeze(-1)
+
+    return (1.0 - weight_hi) * emb(idx_lo) + weight_hi * emb(idx_hi)
+
+
+# ─────────────────────────────────────────────────────────────
+# Attention wrapper
+# ─────────────────────────────────────────────────────────────
+
+class TablePosAttentionWrapper(nn.Module):
+    """Wraps ModernBertAttention to inject learned table position embeddings.
+
+    Uses explicit linear separation:
+        QKV = Wqkv(hidden) + pos @ Wqkv.weight
+    The position contribution is computed via a separate F.linear call
+    (no bias — already present in the hidden path) and added to the Wqkv
+    output through a forward hook.  When use_value_pos is False, the V
+    slice of the position contribution is zeroed before addition.
+    """
+
+    def __init__(
+        self,
+        original_attn: nn.Module,
+        hidden_size: int,
+        max_row_pos: int,
+        max_col_pos: int,
+        use_value_pos: bool,
+        num_heads: int,
+        head_dim: int,
+    ):
+        super().__init__()
+        self.original = original_attn
+        self.row_emb = nn.Embedding(max_row_pos, hidden_size)
+        self.col_emb = nn.Embedding(max_col_pos, hidden_size)
+        self.max_row_pos = max_row_pos
+        self.max_col_pos = max_col_pos
+        self.use_value_pos = use_value_pos
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+        nn.init.zeros_(self.row_emb.weight)
+        nn.init.zeros_(self.col_emb.weight)
+
+        self._table_pos: Optional[Tuple] = None
+
+    def set_table_pos(self, row_idx, col_idx, table_mask, num_rows, num_cols):
+        self._table_pos = (row_idx, col_idx, table_mask, num_rows, num_cols)
+
+    def clear_table_pos(self):
+        self._table_pos = None
+
+    def _compute_pos_emb(self, dtype: torch.dtype) -> torch.Tensor:
+        row_idx, col_idx, table_mask, num_rows, num_cols = self._table_pos
+        row_e = _interpolate_embedding(
+            self.row_emb, row_idx, num_rows, self.max_row_pos,
+        )
+        col_e = _interpolate_embedding(
+            self.col_emb, col_idx, num_cols, self.max_col_pos,
+        )
+        return ((row_e + col_e) * table_mask.unsqueeze(-1)).to(dtype)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self._table_pos is None:
+            return self.original(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+
+        pos_emb = self._compute_pos_emb(hidden_states.dtype)
+
+        # pos @ Wqkv.weight (no bias — already in the hidden path)
+        pos_qkv = F.linear(pos_emb, self.original.Wqkv.weight)
+
+        if not self.use_value_pos:
+            B, S = pos_qkv.shape[:2]
+            qkv_mask = pos_qkv.new_ones(3)
+            qkv_mask[2] = 0.0  # zero V
+            pos_qkv = (
+                pos_qkv.view(B, S, 3, self.num_heads, self.head_dim)
+                * qkv_mask[None, None, :, None, None]
+            ).view(B, S, -1)
+
+        # Hook on Wqkv to add position contribution to its output
+        handle = self.original.Wqkv.register_forward_hook(
+            lambda _mod, _inp, out: out + pos_qkv
+        )
+        try:
+            result = self.original(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+        finally:
+            handle.remove()
+
+        return result
+
+
+# ─────────────────────────────────────────────────────────────
 # Tokenizer
 # ─────────────────────────────────────────────────────────────
 
 class TableFinancialBertTokenizer(FinancialBertTokenizer):
     """
-    Extends FinancialBertTokenizer with 2D RoPE position computation.
+    Extends FinancialBertTokenizer with integer table row/column indices.
 
     HTML tags inside tables are discarded — only cell content is tokenized.
     Each cell is tokenized independently (no cross-cell token merging).
-    Returns two extra fields: position_ids_col and position_ids_row.
+    Returns extra fields: table_row_index, table_col_index, table_mask,
+    table_num_rows, table_num_cols.
     """
 
     def _tokenize_single(
@@ -117,10 +245,12 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
 
         all_ids: List[int] = []
         all_is_num: List[int] = []
-        all_num_vals: List[List[float]] = []
-        all_pos_col: List[float] = []
-        all_pos_row: List[float] = []
-        seq_pos = 0
+        all_num_vals: List = []
+        all_row_idx: List[int] = []
+        all_col_idx: List[int] = []
+        all_table_mask: List[int] = []
+        all_num_rows: List[int] = []
+        all_num_cols: List[int] = []
 
         for rtype, content in regions:
             if rtype == 'text':
@@ -129,110 +259,62 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
                 all_ids.extend(seg["input_ids"])
                 all_is_num.extend(seg["is_number_mask"])
                 all_num_vals.extend(seg["number_values"])
-                for i in range(n):
-                    all_pos_col.append(float(seq_pos + i))
-                    all_pos_row.append(float(seq_pos + i))
-                seq_pos += n
+                all_row_idx.extend([0] * n)
+                all_col_idx.extend([0] * n)
+                all_table_mask.extend([0] * n)
+                all_num_rows.extend([0] * n)
+                all_num_cols.extend([0] * n)
             else:
                 grid = parse_table_grid(content)
+                n_rows = len(grid)
+                n_cols = max(
+                    (ci for row in grid for ci, _ in row), default=-1
+                ) + 1
 
-                # TABLE_START marker (1D position)
+                # TABLE_START marker (not a table cell — no position)
                 all_ids.append(TABLE_START_ID)
                 all_is_num.append(0)
                 all_num_vals.append(0.0)
-                all_pos_col.append(float(seq_pos))
-                all_pos_row.append(float(seq_pos))
-                seq_pos += 1
+                all_row_idx.append(0)
+                all_col_idx.append(0)
+                all_table_mask.append(0)
+                all_num_rows.append(0)
+                all_num_cols.append(0)
 
-                table_origin = seq_pos
-                table_start_idx = len(all_ids)
-                total_tokens = 0
-
-                # First pass: tokenize all cells, record max tokens per column
-                cell_data: List[Tuple[int, int, Dict, int]] = []
-                max_col_tokens: Dict[int, int] = {}
                 for ri, row_cells in enumerate(grid):
                     for ci, cell_html in row_cells:
                         seg = super()._tokenize_single(
                             cell_html, add_special_tokens=False
                         )
                         T_c = len(seg["input_ids"])
-                        cell_data.append((ri, ci, seg, T_c))
-                        max_col_tokens[ci] = max(
-                            max_col_tokens.get(ci, 0), T_c
-                        )
+                        all_ids.extend(seg["input_ids"])
+                        all_is_num.extend(seg["is_number_mask"])
+                        all_num_vals.extend(seg["number_values"])
+                        all_row_idx.extend([ri] * T_c)
+                        all_col_idx.extend([ci] * T_c)
+                        all_table_mask.extend([1] * T_c)
+                        all_num_rows.extend([n_rows] * T_c)
+                        all_num_cols.extend([n_cols] * T_c)
 
-                # Column-aligned start positions along the row direction
-                # Each column slot = max_tokens + 1 (tab delimiter) + D_RC gap
-                col_starts: Dict[int, float] = {}
-                cumulative = 0.0
-                for c in sorted(max_col_tokens.keys()):
-                    col_starts[c] = cumulative
-                    cumulative += max_col_tokens[c] + 1 + D_RC
+                        # Tab delimiter (same row/col as preceding cell)
+                        all_ids.append(TAB_ID)
+                        all_is_num.append(0)
+                        all_num_vals.append(0.0)
+                        all_row_idx.append(ri)
+                        all_col_idx.append(ci)
+                        all_table_mask.append(1)
+                        all_num_rows.append(n_rows)
+                        all_num_cols.append(n_cols)
 
-                # Second pass: assign 2D positions
-                for ri, ci, seg, T_c in cell_data:
-                    all_ids.extend(seg["input_ids"])
-                    all_is_num.extend(seg["is_number_mask"])
-                    all_num_vals.extend(seg["number_values"])
-
-                    base = col_starts[ci]
-                    row_off_col = ri * D_COL * COLUMN_DIRECTION_UNIT_VECT[0]
-                    row_off_row = ri * D_COL * COLUMN_DIRECTION_UNIT_VECT[1]
-                    for t in range(T_c):
-                        # Intra-cell: +t on both axes (vanilla RoPE)
-                        # Inter-cell: column-aligned base along ROW_DIRECTION
-                        # Inter-row: ri * D_COL along COLUMN_DIRECTION
-                        all_pos_col.append(
-                            table_origin
-                            + base * ROW_DIRECTION_UNIT_VECT[0]
-                            + row_off_col + t
-                        )
-                        all_pos_row.append(
-                            table_origin
-                            + base * ROW_DIRECTION_UNIT_VECT[1]
-                            + row_off_row + t
-                        )
-
-                    # Tab delimiter after cell content
-                    all_ids.append(TAB_ID)
-                    all_is_num.append(0)
-                    all_num_vals.append(0.0)
-                    all_pos_col.append(
-                        table_origin
-                        + base * ROW_DIRECTION_UNIT_VECT[0]
-                        + row_off_col + T_c
-                    )
-                    all_pos_row.append(
-                        table_origin
-                        + base * ROW_DIRECTION_UNIT_VECT[1]
-                        + row_off_row + T_c
-                    )
-                    total_tokens += T_c + 1  # +1 for tab
-
-                # Center table: place barycenter at midpoint of the
-                # position budget (between last-before and first-after)
-                if total_tokens > 0:
-                    tbl_col = all_pos_col[table_start_idx:table_start_idx + total_tokens]
-                    tbl_row = all_pos_row[table_start_idx:table_start_idx + total_tokens]
-                    bary_col = sum(tbl_col) / total_tokens
-                    bary_row = sum(tbl_row) / total_tokens
-                    midpoint = table_origin + (total_tokens - 1) / 2
-                    shift_col = midpoint - bary_col
-                    shift_row = midpoint - bary_row
-                    for i in range(total_tokens):
-                        all_pos_col[table_start_idx + i] += shift_col
-                        all_pos_row[table_start_idx + i] += shift_row
-
-                seq_pos = table_origin + total_tokens
-
-                # TABLE_END marker (1D position)
+                # TABLE_END marker
                 all_ids.append(TABLE_END_ID)
                 all_is_num.append(0)
                 all_num_vals.append(0.0)
-                all_pos_col.append(float(seq_pos))
-                all_pos_row.append(float(seq_pos))
-                seq_pos += 1
+                all_row_idx.append(0)
+                all_col_idx.append(0)
+                all_table_mask.append(0)
+                all_num_rows.append(0)
+                all_num_cols.append(0)
 
         # Add special tokens
         if add_special_tokens:
@@ -241,15 +323,21 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
             all_ids = [cls_id] + all_ids + [sep_id]
             all_is_num = [0] + all_is_num + [0]
             all_num_vals = [0.0] + all_num_vals + [0.0]
-            all_pos_col = [0.0] + [p + 1 for p in all_pos_col] + [float(seq_pos + 1)]
-            all_pos_row = [0.0] + [p + 1 for p in all_pos_row] + [float(seq_pos + 1)]
+            all_row_idx = [0] + all_row_idx + [0]
+            all_col_idx = [0] + all_col_idx + [0]
+            all_table_mask = [0] + all_table_mask + [0]
+            all_num_rows = [0] + all_num_rows + [0]
+            all_num_cols = [0] + all_num_cols + [0]
 
         return {
             "input_ids": all_ids,
             "is_number_mask": all_is_num,
             "number_values": all_num_vals,
-            "position_ids_col": all_pos_col,
-            "position_ids_row": all_pos_row,
+            "table_row_index": all_row_idx,
+            "table_col_index": all_col_idx,
+            "table_mask": all_table_mask,
+            "table_num_rows": all_num_rows,
+            "table_num_cols": all_num_cols,
         }
 
     def __call__(
@@ -270,7 +358,8 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
 
         keys = [
             "input_ids", "is_number_mask", "number_values",
-            "position_ids_col", "position_ids_row",
+            "table_row_index", "table_col_index", "table_mask",
+            "table_num_rows", "table_num_cols",
         ]
         batched = {k: [r[k] for r in batch_results] for k in keys}
 
@@ -303,30 +392,42 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
                 attn_mask += [0] * pad_len
                 batched["is_number_mask"][i] += [0] * pad_len
                 batched["number_values"][i] += [0.0] * pad_len
-                batched["position_ids_col"][i] += [0.0] * pad_len
-                batched["position_ids_row"][i] += [0.0] * pad_len
+                batched["table_row_index"][i] += [0] * pad_len
+                batched["table_col_index"][i] += [0] * pad_len
+                batched["table_mask"][i] += [0] * pad_len
+                batched["table_num_rows"][i] += [0] * pad_len
+                batched["table_num_cols"][i] += [0] * pad_len
 
             batch_attention_mask.append(attn_mask)
 
         if return_tensors == "pt":
             return {
                 "input_ids": torch.tensor(
-                    batched["input_ids"], dtype=torch.long
+                    batched["input_ids"], dtype=torch.long,
                 ),
                 "attention_mask": torch.tensor(
-                    batch_attention_mask, dtype=torch.long
+                    batch_attention_mask, dtype=torch.long,
                 ),
                 "is_number_mask": torch.tensor(
-                    batched["is_number_mask"], dtype=torch.float
+                    batched["is_number_mask"], dtype=torch.float,
                 ),
                 "number_values": torch.tensor(
-                    batched["number_values"], dtype=torch.float
+                    batched["number_values"], dtype=torch.float,
                 ),
-                "position_ids_col": torch.tensor(
-                    batched["position_ids_col"], dtype=torch.float
+                "table_row_index": torch.tensor(
+                    batched["table_row_index"], dtype=torch.long,
                 ),
-                "position_ids_row": torch.tensor(
-                    batched["position_ids_row"], dtype=torch.float
+                "table_col_index": torch.tensor(
+                    batched["table_col_index"], dtype=torch.long,
+                ),
+                "table_mask": torch.tensor(
+                    batched["table_mask"], dtype=torch.float,
+                ),
+                "table_num_rows": torch.tensor(
+                    batched["table_num_rows"], dtype=torch.long,
+                ),
+                "table_num_cols": torch.tensor(
+                    batched["table_num_cols"], dtype=torch.long,
                 ),
             }
 
@@ -335,73 +436,12 @@ class TableFinancialBertTokenizer(FinancialBertTokenizer):
             "attention_mask": batch_attention_mask,
             "is_number_mask": batched["is_number_mask"],
             "number_values": batched["number_values"],
-            "position_ids_col": batched["position_ids_col"],
-            "position_ids_row": batched["position_ids_row"],
+            "table_row_index": batched["table_row_index"],
+            "table_col_index": batched["table_col_index"],
+            "table_mask": batched["table_mask"],
+            "table_num_rows": batched["table_num_rows"],
+            "table_num_cols": batched["table_num_cols"],
         }
-
-
-# ─────────────────────────────────────────────────────────────
-# 2D RoPE Wrapper
-# ─────────────────────────────────────────────────────────────
-
-class RoPE2DWrapper(nn.Module):
-    """
-    Wraps ModernBertRotaryEmbedding to support 2D table positions.
-
-    When 2D positions are set via set_positions(), computes RoPE using
-    interleaved axis assignment:
-        - even-indexed frequency pairs → column positions (axis 1)
-        - odd-indexed frequency pairs  → row positions (axis 2)
-
-    When no 2D positions are set, delegates to the original module.
-    The original module stores per-layer-type inv_freq buffers
-    (e.g. local_inv_freq, global_inv_freq) as non-persistent buffers,
-    so wrapping does not affect state_dict compatibility.
-    """
-
-    def __init__(self, original: nn.Module):
-        super().__init__()
-        self.original = original
-        self._pos_col: Optional[torch.Tensor] = None
-        self._pos_row: Optional[torch.Tensor] = None
-
-    def set_positions(self, pos_col: torch.Tensor, pos_row: torch.Tensor):
-        self._pos_col = pos_col
-        self._pos_row = pos_row
-
-    def clear_positions(self):
-        self._pos_col = None
-        self._pos_row = None
-
-    def forward(self, x, position_ids, layer_type=None):
-        if self._pos_col is None:
-            return self.original(x, position_ids, layer_type=layer_type)
-
-        # Get the inv_freq for this layer type (local or global)
-        inv_freq = getattr(self.original, f"{layer_type}_inv_freq")
-        attention_scaling = getattr(
-            self.original, f"{layer_type}_attention_scaling"
-        )
-
-        # Interleave column and row across frequency bands so both
-        # axes see the full frequency spectrum:
-        #   even-indexed pairs → column positions
-        #   odd-indexed pairs  → row positions
-        col_freqs = torch.einsum(
-            "bs,d->bsd", self._pos_col.float(), inv_freq[0::2]
-        )  # [B, S, D/4]
-        row_freqs = torch.einsum(
-            "bs,d->bsd", self._pos_row.float(), inv_freq[1::2]
-        )  # [B, S, D/4]
-
-        # Interleave: [col_f0, row_f0, col_f1, row_f1, ...]
-        freqs = torch.stack([col_freqs, row_freqs], dim=-1)
-        freqs = freqs.reshape(*col_freqs.shape[:-1], -1)  # [B, S, D/2]
-        emb = torch.cat([freqs, freqs], dim=-1)            # [B, S, D]
-
-        cos = emb.cos() * attention_scaling
-        sin = emb.sin() * attention_scaling
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -409,58 +449,38 @@ class RoPE2DWrapper(nn.Module):
 # ─────────────────────────────────────────────────────────────
 
 class TableFinancialModernBert(FinancialModernBert):
-    """FinancialModernBert with 2D RoPE for HTML table regions."""
+    """FinancialModernBert with learned 2D positional embeddings for tables."""
 
     config_class = FinancialModernBertConfig
 
     def __init__(self, config):
         super().__init__(config)
-        self._wrap_rotary_embeddings()
+        self.max_row_pos = getattr(config, 'max_row_positions', MAX_ROW_POSITIONS)
+        self.max_col_pos = getattr(config, 'max_col_positions', MAX_COL_POSITIONS)
+        self.use_value_pos = getattr(config, 'use_value_pos', True)
+        self._wrap_attention_layers()
 
-    def _wrap_rotary_embeddings(self):
-        """Find and wrap all rotary embedding modules with RoPE2DWrapper."""
-        model = self.modernbert
-        wrapped = False
+    def _wrap_attention_layers(self):
+        """Wrap each attention module with TablePosAttentionWrapper."""
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
 
-        # Model-level rotary embedding (common in newer HF transformers)
-        if hasattr(model, 'rotary_emb'):
-            model.rotary_emb = RoPE2DWrapper(model.rotary_emb)
-            wrapped = True
-
-        # Per-layer rotary embeddings
-        if hasattr(model, 'layers'):
-            for layer in model.layers:
-                attn = (
-                    getattr(layer, 'attn', None)
-                    or getattr(layer, 'self_attn', None)
-                )
-                if attn and hasattr(attn, 'rotary_emb'):
-                    attn.rotary_emb = RoPE2DWrapper(attn.rotary_emb)
-                    wrapped = True
-
-        if not wrapped:
-            raise RuntimeError(
-                "Could not find rotary_emb in ModernBertModel. "
-                "Check your transformers version."
+        for layer in self.modernbert.layers:
+            layer.attn = TablePosAttentionWrapper(
+                original_attn=layer.attn,
+                hidden_size=self.config.hidden_size,
+                max_row_pos=self.max_row_pos,
+                max_col_pos=self.max_col_pos,
+                use_value_pos=self.use_value_pos,
+                num_heads=num_heads,
+                head_dim=head_dim,
             )
 
-    def _get_rope_wrappers(self) -> List[RoPE2DWrapper]:
-        """Collect all RoPE2DWrapper instances in the model."""
-        wrappers = []
-        model = self.modernbert
-        if isinstance(getattr(model, 'rotary_emb', None), RoPE2DWrapper):
-            wrappers.append(model.rotary_emb)
-        if hasattr(model, 'layers'):
-            for layer in model.layers:
-                attn = (
-                    getattr(layer, 'attn', None)
-                    or getattr(layer, 'self_attn', None)
-                )
-                if attn and isinstance(
-                    getattr(attn, 'rotary_emb', None), RoPE2DWrapper
-                ):
-                    wrappers.append(attn.rotary_emb)
-        return wrappers
+    def _get_attention_wrappers(self) -> List[TablePosAttentionWrapper]:
+        return [
+            layer.attn for layer in self.modernbert.layers
+            if isinstance(layer.attn, TablePosAttentionWrapper)
+        ]
 
     def forward(
         self,
@@ -468,15 +488,21 @@ class TableFinancialModernBert(FinancialModernBert):
         number_values: torch.Tensor,
         is_number_mask: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids_col: Optional[torch.Tensor] = None,
-        position_ids_row: Optional[torch.Tensor] = None,
+        table_row_index: Optional[torch.Tensor] = None,
+        table_col_index: Optional[torch.Tensor] = None,
+        table_mask: Optional[torch.Tensor] = None,
+        table_num_rows: Optional[torch.Tensor] = None,
+        table_num_cols: Optional[torch.Tensor] = None,
         labels_text: Optional[torch.Tensor] = None,
         labels_magnitude: Optional[torch.Tensor] = None,
     ):
-        # Set 2D positions on all RoPE wrappers before the forward pass
-        if position_ids_col is not None and position_ids_row is not None:
-            for w in self._get_rope_wrappers():
-                w.set_positions(position_ids_col, position_ids_row)
+        # Set table positions on all attention wrappers
+        if table_mask is not None and table_mask.any():
+            for w in self._get_attention_wrappers():
+                w.set_table_pos(
+                    table_row_index, table_col_index, table_mask,
+                    table_num_rows, table_num_cols,
+                )
 
         try:
             return super().forward(
@@ -488,14 +514,16 @@ class TableFinancialModernBert(FinancialModernBert):
                 labels_magnitude=labels_magnitude,
             )
         finally:
-            # Always clear to avoid stale state
-            for w in self._get_rope_wrappers():
-                w.clear_positions()
+            for w in self._get_attention_wrappers():
+                w.clear_table_pos()
 
 
 def build_table_model(
     model_id: str = "answerdotai/ModernBERT-base",
     num_magnitude_bins: int = 128,
+    max_row_positions: int = MAX_ROW_POSITIONS,
+    max_col_positions: int = MAX_COL_POSITIONS,
+    use_value_pos: bool = True,
     **kwargs,
 ) -> TableFinancialModernBert:
     """Build a TableFinancialModernBert from a pretrained ModernBERT."""
@@ -503,13 +531,22 @@ def build_table_model(
 
     config = FinancialModernBertConfig.from_pretrained(model_id)
     config.num_magnitude_bins = num_magnitude_bins
+    config.max_row_positions = max_row_positions
+    config.max_col_positions = max_col_positions
+    config.use_value_pos = use_value_pos
 
     model = TableFinancialModernBert(config)
 
-    # strict=False because RoPE2DWrapper adds an 'original' submodule prefix,
-    # but rotary_emb only has non-persistent buffers (inv_freq) so no keys
-    # are actually missing or unexpected in practice.
-    model.modernbert.load_state_dict(donor.model.state_dict(), strict=False)
+    # Remap donor keys: attention weights live under .attn.original. now
+    donor_sd = donor.model.state_dict()
+    remapped = {}
+    for k, v in donor_sd.items():
+        if '.attn.' in k:
+            k = k.replace('.attn.', '.attn.original.', 1)
+        remapped[k] = v
+
+    # strict=False: new row_emb/col_emb weights have no donor counterpart
+    model.modernbert.load_state_dict(remapped, strict=False)
     model.lm_head.dense.load_state_dict(donor.head.dense.state_dict())
     model.lm_head.norm.load_state_dict(donor.head.norm.state_dict())
 

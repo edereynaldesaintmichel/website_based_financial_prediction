@@ -3,7 +3,7 @@ Full-parameter MLM training for FinancialModernBert (no 2D RoPE baseline).
 
 Same data pipeline and training loop as train_mlm_full.py but uses the base
 FinancialModernBert (standard 1D RoPE) instead of TableFinancialModernBert.
-Position_ids_col / position_ids_row from the bucketed data are ignored.
+Table position fields from the bucketed data are ignored.
 
 Usage:
     python -m training_pipeline.train_mlm_full_baseline \
@@ -515,4 +515,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-"""python -m training_pipeline.train_mlm_full_baseline   --data_dir "/content/drive/MyDrive/website predictor/bucketed"   --lr 1e-4   --num_workers 4   --tokens_per_batch 32768   --dtype bf16   --device cuda   --compile"""
+"""python -m training_pipeline.train_mlm_full_baseline   --data_dir "/content/drive/MyDrive/website predictor/bucketed"   --num_workers 4   --tokens_per_batch 32768   --dtype bf16   --device cuda   --compile"""
