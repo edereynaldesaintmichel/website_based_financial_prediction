@@ -2,12 +2,12 @@
 Test FinancialModernBert MLM predictions on a single SEC filing.
 
 Chunks the file, tokenizes, masks 15% of tokens, runs inference with the
-trained LoRA model, then reconstructs each chunk showing predictions inline.
+trained model, then reconstructs each chunk showing predictions inline.
 
 Usage:
     python test_mlm_predictions.py \
-        --file training_data/processed/sec_markdown_fixed/3197_2018-03-09.md \
-        --checkpoint checkpoints/mlm_lora/best_model_base \
+        --file training_data/processed/SEC_10k_markdown_tagged/1750_2018-07-11.md \
+        --checkpoint checkpoints/mlm_full_baseline/checkpoint_epoch2 \
         --max_chunks 5
 """
 import argparse
@@ -19,31 +19,35 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from financial_bert import build_model, FinancialBertTokenizer
-from training_pipeline.chunk_markdown import chunk_file
+from mlm_training_pipeline.chunk_markdown import chunk_file
 
 
 def mask_sequence(input_ids, is_number_mask, number_values, mask_prob=0.15,
-                  mask_token_id=50264, vocab_size=50264):
+                  mask_token_id=50264, vocab_size=50264,
+                  magnitude_max=12.0):
     """
     Apply MLM masking. Returns masked inputs and per-position ground-truth labels.
     Returns lists of dicts describing each masked position for later display.
     """
     seq_len = len(input_ids)
     masked_ids = list(input_ids)
-    masked_number_values = [list(v) for v in number_values]
+    masked_number_values = list(number_values)
     masked_positions = []  # records for display
 
     for i in range(seq_len):
         if is_number_mask[i] == 1:
-            # Number position: always record as a prediction target
+            # Number position
             if random.random() < mask_prob:
                 masked_positions.append({
                     "pos": i,
                     "type": "number",
-                    "original_sign": int(number_values[i][0]),
-                    "original_log": number_values[i][1],
+                    "original_log": number_values[i],
                 })
-                masked_number_values[i] = [0.0, 0.0]
+                r = random.random()
+                if r < 0.8:
+                    masked_number_values[i] = magnitude_max + 1  # mask sentinel
+                elif r < 0.9:
+                    masked_number_values[i] = random.uniform(-12.0, magnitude_max)
         else:
             if random.random() < mask_prob:
                 masked_positions.append({
@@ -74,8 +78,8 @@ def format_number(value):
 
 
 def reconstruct_chunk(tokenizer, input_ids, is_number_mask, number_values,
-                      masked_positions, text_logits, sign_logits,
-                      magnitude_logits, model_config):
+                      masked_positions, text_logits, magnitude_logits,
+                      model_config):
     """
     Reconstruct text token-by-token with inline annotations for masked positions.
     Returns a markdown-formatted string.
@@ -116,12 +120,11 @@ def reconstruct_chunk(tokenizer, input_ids, is_number_mask, number_values,
                     )
             else:  # number
                 decoded = tokenizer.decode_number(
-                    sign_logits[i], magnitude_logits[i], model_config
+                    magnitude_logits[i], model_config
                 )
-                pred_value = decoded["value"]
-                orig_value = tokenizer.log_to_value(
-                    m["original_sign"], m["original_log"]
-                )
+                pred_log = decoded["log_magnitude"]
+                pred_value = tokenizer.log_to_value(pred_log)
+                orig_value = tokenizer.log_to_value(m["original_log"])
                 tokens_output.append(
                     f"(~~{format_number(pred_value)}~~**{format_number(orig_value)}**)"
                 )
@@ -130,9 +133,7 @@ def reconstruct_chunk(tokenizer, input_ids, is_number_mask, number_values,
             if input_ids[i] in skip_ids:
                 continue
             if is_number_mask[i] == 1:
-                value = tokenizer.log_to_value(
-                    int(number_values[i][0]), number_values[i][1]
-                )
+                value = tokenizer.log_to_value(number_values[i])
                 tokens_output.append(format_number(value))
             else:
                 tokens_output.append(tokenizer.decode([input_ids[i]]))
@@ -143,8 +144,8 @@ def reconstruct_chunk(tokenizer, input_ids, is_number_mask, number_values,
 def main():
     parser = argparse.ArgumentParser(description="Test MLM predictions on a single file")
     parser.add_argument("--file", required=True, help="Markdown file to test")
-    parser.add_argument("--checkpoint", default="checkpoints/mlm_lora/best_model_gated_head",
-                        help="Path to LoRA checkpoint directory")
+    parser.add_argument("--checkpoint", default="checkpoints/mlm_full_baseline/checkpoint_epoch2",
+                        help="Path to checkpoint directory (contains full_model.pt)")
     parser.add_argument("--model_name", default="answerdotai/ModernBERT-base")
     parser.add_argument("--max_tokens", type=int, default=512, help="Max tokens per chunk")
     parser.add_argument("--max_chunks", type=int, default=0,
@@ -186,7 +187,7 @@ def main():
             chunk["text"],
             padding=False,
             truncation=True,
-            max_length=4192, #args.max_tokens,
+            max_length=4192,
             return_tensors=None,
             add_special_tokens=True,
         )
@@ -198,21 +199,22 @@ def main():
             "chunk_index": chunk["chunk_index"],
         })
 
-    # 3. Build model and load LoRA checkpoint
+    # 3. Build model and load full checkpoint
     print("### Building model...")
     model = build_model(args.model_name)
 
-    print(f"### Loading LoRA from {args.checkpoint}...")
-    from peft import PeftModel
-    model = PeftModel.from_pretrained(
-        model,
-        args.checkpoint,
-        torch_dtype=torch.float32,  # cast from bf16 to fp32 for CPU/MPS compat
-    )
+    ckpt_file = os.path.join(args.checkpoint, "full_model.pt")
+    print(f"### Loading checkpoint from {ckpt_file}...")
+    ckpt = torch.load(ckpt_file, map_location=device, weights_only=False)
+    # Strip _orig_mod. prefix from torch.compile'd checkpoints
+    state_dict = ckpt["model_state_dict"]
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+
     model = model.to(device)
     model.eval()
 
-    model_config = model.config if hasattr(model, "config") else model.base_model.config
+    model_config = model.config
 
     # Output file path
     if args.output:
@@ -258,6 +260,7 @@ def main():
             input_ids, is_number_mask, number_values,
             mask_prob=args.mask_prob,
             mask_token_id=tokenizer.mask_token_id,
+            magnitude_max=model_config.magnitude_max,
         )
 
         # Prepare tensors (batch size 1)
@@ -276,7 +279,6 @@ def main():
             )
 
         text_logits = outputs["text_logits"][0].cpu()      # [seq_len, vocab]
-        sign_logits = outputs["sign_logits"][0].cpu()       # [seq_len, 2]
         mag_logits = outputs["magnitude_logits"][0].cpu()   # [seq_len, bins]
 
         # Compute accuracy stats
@@ -296,17 +298,16 @@ def main():
                 total_num_masked += 1
                 chunk_num_masked += 1
                 decoded = tokenizer.decode_number(
-                    sign_logits[m["pos"]], mag_logits[m["pos"]], model_config
+                    mag_logits[m["pos"]], model_config
                 )
-                if (abs(m["original_log"] - decoded["log_magnitude"]) < 1.0
-                        and m["original_sign"] == decoded["sign"]):
+                if abs(m["original_log"] - decoded["log_magnitude"]) < 1.0:
                     total_num_close += 1
                     chunk_num_close += 1
 
         # Reconstruct
         reconstructed = reconstruct_chunk(
             tokenizer, input_ids, is_number_mask, number_values,
-            masked_positions, text_logits, sign_logits, mag_logits,
+            masked_positions, text_logits, mag_logits,
             model_config,
         )
 

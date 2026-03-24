@@ -12,3 +12,4 @@ cc_data_sec
 training_data
 .DS_Store
 
+t5_training_data

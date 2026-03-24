@@ -9,9 +9,59 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import ModernBertModel, ModernBertPreTrainedModel, ModernBertConfig, ModernBertForMaskedLM, AutoTokenizer
-from typing import List, Union, Optional, Dict, Any
+from typing import List, Tuple, Union, Optional, Dict, Any
 import re
 import math
+from bs4 import BeautifulSoup
+
+
+_TABLE_RE = re.compile(r'<table[^>]*>.*?</table>', re.DOTALL | re.IGNORECASE)
+
+# Structural tokens for table boundaries and cell delimiters.
+# [unused0] and [unused1] are pre-allocated in ModernBERT's vocabulary
+# with random embeddings — they'll learn table semantics during fine-tuning.
+TABLE_START_ID = 50285  # [unused0]
+TABLE_END_ID = 50286    # [unused1]
+TAB_ID = 186            # \t — cell delimiter
+NEWLINE_ID = 187        # \n — row delimiter
+
+
+def parse_table_grid(table_html: str) -> List[List[Tuple[int, str]]]:
+    """Parse an HTML table into a grid of (col_index, cell_content) per row.
+
+    Handles colspan and rowspan. Cell content preserves inner HTML (including
+    <number> tags) but strips whitespace. Spanned cells are omitted.
+
+    Returns: grid[row] = [(col_idx, content_html), ...]
+    """
+    soup = BeautifulSoup(table_html, 'html.parser')
+    trs = soup.find_all('tr')
+    occupied: Dict[Tuple[int, int], bool] = {}
+    grid: List[List[Tuple[int, str]]] = []
+
+    for ri, tr in enumerate(trs):
+        cells = []
+        c = 0
+        for cell in tr.find_all(['td', 'th']):
+            while occupied.get((ri, c)):
+                c += 1
+            try:
+                cs = int(re.sub(r'<[^>]+>', '', str(cell.get('colspan', 1))))
+            except (ValueError, TypeError):
+                cs = 1
+            try:
+                rs = int(re.sub(r'<[^>]+>', '', str(cell.get('rowspan', 1))))
+            except (ValueError, TypeError):
+                rs = 1
+            content = cell.decode_contents().strip()
+            cells.append((c, content))
+            for dr in range(rs):
+                for dc in range(cs):
+                    occupied[(ri + dr, c + dc)] = True
+            c += cs
+        grid.append(cells)
+
+    return grid
 
 class FinancialBertTokenizer:
     def __init__(
@@ -49,7 +99,8 @@ class FinancialBertTokenizer:
 
         return max(self.magnitude_min, min(log_val, self.magnitude_max))
 
-    def _tokenize_single(self, text: str, add_special_tokens: bool = True) -> Dict[str, List]:
+    def _tokenize_text_fragment(self, text: str) -> Dict[str, List]:
+        """Tokenize a plain text fragment (no special tokens, no table handling)."""
         numbers_data = []
         for match in self.number_pattern.finditer(text):
             log_val = self.parse_number_to_log(match.group(1))
@@ -74,7 +125,7 @@ class FinancialBertTokenizer:
 
         encoded = self.base_tokenizer(
             processed_text,
-            add_special_tokens=add_special_tokens,
+            add_special_tokens=False,
             return_offsets_mapping=True,
             return_tensors=None
         )
@@ -110,6 +161,83 @@ class FinancialBertTokenizer:
             "input_ids": result_input_ids,
             "is_number_mask": is_number_mask,
             "number_values": number_values,
+        }
+
+    def _tokenize_single(self, text: str, add_special_tokens: bool = True) -> Dict[str, List]:
+        # Split text into (type, content) regions around <table> blocks
+        regions: List[Tuple[str, str]] = []
+        prev = 0
+        for m in _TABLE_RE.finditer(text):
+            if m.start() > prev:
+                regions.append(('text', text[prev:m.start()]))
+            regions.append(('table', m.group(0)))
+            prev = m.end()
+        if prev < len(text):
+            regions.append(('text', text[prev:]))
+
+        # If no tables, fall back to simple path (preserves add_special_tokens
+        # behaviour of the original base-tokenizer call)
+        if all(rtype == 'text' for rtype, _ in regions):
+            seg = self._tokenize_text_fragment(text)
+            if add_special_tokens:
+                cls_id = self.base_tokenizer.cls_token_id
+                sep_id = self.base_tokenizer.sep_token_id
+                seg["input_ids"] = [cls_id] + seg["input_ids"] + [sep_id]
+                seg["is_number_mask"] = [0] + seg["is_number_mask"] + [0]
+                seg["number_values"] = [0.0] + seg["number_values"] + [0.0]
+            return seg
+
+        all_ids: List[int] = []
+        all_is_num: List[int] = []
+        all_num_vals: List = []
+
+        for rtype, content in regions:
+            if rtype == 'text':
+                seg = self._tokenize_text_fragment(content)
+                all_ids.extend(seg["input_ids"])
+                all_is_num.extend(seg["is_number_mask"])
+                all_num_vals.extend(seg["number_values"])
+            else:
+                grid = parse_table_grid(content)
+
+                # TABLE_START marker
+                all_ids.append(TABLE_START_ID)
+                all_is_num.append(0)
+                all_num_vals.append(0.0)
+
+                for row_cells in grid:
+                    for _, cell_html in row_cells:
+                        seg = self._tokenize_text_fragment(cell_html)
+                        all_ids.extend(seg["input_ids"])
+                        all_is_num.extend(seg["is_number_mask"])
+                        all_num_vals.extend(seg["number_values"])
+
+                        # Tab delimiter between cells
+                        all_ids.append(TAB_ID)
+                        all_is_num.append(0)
+                        all_num_vals.append(0.0)
+
+                    # Newline delimiter after each row
+                    all_ids.append(NEWLINE_ID)
+                    all_is_num.append(0)
+                    all_num_vals.append(0.0)
+
+                # TABLE_END marker
+                all_ids.append(TABLE_END_ID)
+                all_is_num.append(0)
+                all_num_vals.append(0.0)
+
+        if add_special_tokens:
+            cls_id = self.base_tokenizer.cls_token_id
+            sep_id = self.base_tokenizer.sep_token_id
+            all_ids = [cls_id] + all_ids + [sep_id]
+            all_is_num = [0] + all_is_num + [0]
+            all_num_vals = [0.0] + all_num_vals + [0.0]
+
+        return {
+            "input_ids": all_ids,
+            "is_number_mask": all_is_num,
+            "number_values": all_num_vals,
         }
 
     def __call__(

@@ -26,7 +26,7 @@ from pathlib import Path
 from datasets import load_dataset
 from tqdm import tqdm
 
-from training_pipeline.tag_numbers import tag_numbers_in_text
+from mlm_training_pipeline.tag_numbers import tag_numbers_in_text
 
 # Rough words-to-tokens ratio (same as chunk_markdown.py)
 TOKEN_RATIO = 1.35
