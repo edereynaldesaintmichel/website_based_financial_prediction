@@ -443,7 +443,9 @@ def train(args):
         ckpt = torch.load(ckpt_file, map_location=device, weights_only=False)
         state_dict = {k.removeprefix("_orig_mod."): v
                       for k, v in ckpt["model_state_dict"].items()}
-        model.load_state_dict(state_dict)
+        # Load into the unwrapped model (torch.compile wraps it)
+        unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
+        unwrapped.load_state_dict(state_dict)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_epoch = ckpt["epoch"]
