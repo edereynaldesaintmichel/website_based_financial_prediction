@@ -1,14 +1,14 @@
 """
-MLM Decoder with expanded-memory cross-attention to encoder CLS token.
+MLM Decoder with element-wise CLS gating for encoder CLS conditioning.
 
 Architecture per decoder layer:
-    CrossAttn(expanded CLS memory) → SelfAttn + FFN
+    CLSGating(CLS, hidden_states) → SelfAttn + FFN
 
 - Self-attention + FFN: initialized from pretrained ModernBERT
-- Cross-attention: CLS is expanded into N memory slots via a learned projection,
-  then standard multi-head cross-attention attends to those slots. Different
-  positions retrieve different information (e.g. magnitude vs entity vs temporal).
-  Output projection zero-initialized (no-op at start).
+- CLS conditioning: element-wise gating mechanism where each hidden dimension
+  at each position independently decides how much of each CLS feature to use.
+  affinity = Wq(h) * Wk(CLS), output = sigmoid(affinity) * Wv(CLS).
+  Wv zero-initialized so conditioning starts as a no-op.
 - Number prediction: same magnitude-bin loss as the encoder's NumberHead
 
 The decoder is bidirectional (MLM, not autoregressive). During training, ~50% of
@@ -36,36 +36,27 @@ from financial_bert import (
 )
 
 
-NUM_MEMORY_SLOTS = 16
+class CLSGating(nn.Module):
+    """Element-wise CLS gating for position-dependent CLS conditioning.
 
+    Each hidden dimension at each position independently gates a CLS feature:
+        affinity = Wq(h) * Wk(CLS)        (B, S, D) element-wise
+        output   = sigmoid(affinity) * Wv(CLS)   (B, S, D)
 
-class ExpandedMemoryCrossAttention(nn.Module):
-    """Multi-head cross-attention to expanded CLS memory.
-
-    CLS (B, D) is projected into N memory slots (B, N, D), then standard
-    multi-head cross-attention lets each decoder position attend to different
-    slots based on content. This gives position-dependent retrieval from CLS,
-    unlike single-vector approaches where every position gets the same info.
+    This gives D independent gates per position (~768), compared to the 16-slot
+    routing of expanded-memory cross-attention. Cross-dimension mixing is
+    deferred to the self-attention + FFN that follows.
     """
 
-    def __init__(self, config, num_slots=NUM_MEMORY_SLOTS):
+    def __init__(self, config):
         super().__init__()
-        self.num_heads = config.num_attention_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        self.num_slots = num_slots
         D = config.hidden_size
-
-        # Expand CLS into N memory slots
-        self.W_expand = nn.Linear(D, num_slots * D, bias=False)
-
-        # Standard cross-attention projections
         self.Wq = nn.Linear(D, D, bias=False)
         self.Wk = nn.Linear(D, D, bias=False)
         self.Wv = nn.Linear(D, D, bias=False)
-        self.Wo = nn.Linear(D, D, bias=False)
 
-        # Zero-init output so cross-attention starts as a no-op
-        nn.init.zeros_(self.Wo.weight)
+        # Zero-init Wv so gating starts as a no-op
+        nn.init.zeros_(self.Wv.weight)
 
     def forward(self, hidden_states, cls_hidden):
         """
@@ -73,23 +64,13 @@ class ExpandedMemoryCrossAttention(nn.Module):
             hidden_states: (B, S, D) decoder hidden states
             cls_hidden: (B, D) encoder CLS representation
         Returns:
-            (B, S, D) cross-attention output
+            (B, S, D) gated CLS output
         """
-        B, S, D = hidden_states.shape
-        H, d = self.num_heads, self.head_dim
-        N = self.num_slots
-
-        # Expand CLS into memory slots
-        memory = self.W_expand(cls_hidden).view(B, N, D)  # (B, N, D)
-
-        q = self.Wq(hidden_states).view(B, S, H, d).transpose(1, 2)  # (B, H, S, d)
-        k = self.Wk(memory).view(B, N, H, d).transpose(1, 2)          # (B, H, N, d)
-        v = self.Wv(memory).view(B, N, H, d).transpose(1, 2)          # (B, H, N, d)
-
-        attn_out = F.scaled_dot_product_attention(q, k, v)  # (B, H, S, d)
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
-
-        return self.Wo(attn_out)
+        q = self.Wq(hidden_states)                        # (B, S, D)
+        k = self.Wk(cls_hidden).unsqueeze(1)              # (B, 1, D)
+        v = self.Wv(cls_hidden).unsqueeze(1)              # (B, 1, D)
+        affinity = q * k                                   # (B, S, D)
+        return torch.sigmoid(affinity) * v                 # (B, S, D)
 
 
 class CLSBottleneckDecoder(nn.Module):
@@ -114,7 +95,7 @@ class CLSBottleneckDecoder(nn.Module):
             for _ in range(num_layers)
         ])
         self.cross_attns = nn.ModuleList([
-            ExpandedMemoryCrossAttention(config) for _ in range(num_layers)
+            CLSGating(config) for _ in range(num_layers)
         ])
 
         # Number embedder for decoder input
@@ -313,9 +294,8 @@ def build_t5_model(
     Initialization strategy:
     - Encoder: loaded from MLM training checkpoint (full_model.pt)
     - Decoder backbone: loaded from pretrained ModernBERT
-    - Decoder cross-attention Q/K/V: copied from self-attention Wqkv of each layer
-    - Decoder cross-attention W_expand: random init (irrelevant since Wo=0 at start)
-    - Decoder cross-attention output: zero-initialized (no-op at start)
+    - Decoder CLS gating Wq/Wk: copied from self-attention Wqkv of each layer
+    - Decoder CLS gating Wv: zero-initialized (no-op at start)
     - Decoder number_embedder: copied from encoder
     - Decoder number_head: copied from encoder
     - Decoder lm_head: from pretrained ModernBERT, weight tied to decoder embeddings
@@ -355,15 +335,14 @@ def build_t5_model(
 
     del donor
 
-    # --- Init cross-attention Q/K/V from self-attention weights ---
-    # W_expand stays random-init (irrelevant at start since Wo is zero)
+    # --- Init CLS gating Q/K from self-attention weights ---
+    # Wv stays zero-initialized (no-op at start)
     D = config.hidden_size
     for i in range(config.num_hidden_layers):
         wqkv = model.decoder.backbone.layers[i].attn.Wqkv.weight.data  # (3D, D)
         model.decoder.cross_attns[i].Wq.weight.data = wqkv[:D, :].clone()
         model.decoder.cross_attns[i].Wk.weight.data = wqkv[D:2*D, :].clone()
-        model.decoder.cross_attns[i].Wv.weight.data = wqkv[2*D:, :].clone()
-        # Wo stays zero-initialized
+        # Wv stays zero-initialized
 
     # --- Copy number embedder + head from encoder to decoder ---
     model.decoder.number_embedder.load_state_dict(
