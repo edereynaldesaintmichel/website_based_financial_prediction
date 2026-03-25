@@ -471,8 +471,16 @@ def train(args):
 
         optimizer.zero_grad()
 
+        # How many batches to skip when resuming mid-epoch
+        skip_batches = global_step * args.grad_accum_steps if epoch == start_epoch and global_step > 0 else 0
+
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", unit="batch")
         for batch_idx, batch in enumerate(pbar):
+            if batch_idx < skip_batches:
+                if batch_idx % 1000 == 0 and batch_idx > 0:
+                    pbar.set_description(f"Epoch {epoch+1}/{args.epochs} (skipping to batch {skip_batches})")
+                continue
+
             input_ids = batch["input_ids"].to(device)
             is_number_mask = batch["is_number_mask"].to(device)
             number_values = batch["number_values"].to(device)
