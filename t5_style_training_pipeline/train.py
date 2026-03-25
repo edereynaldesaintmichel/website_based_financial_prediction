@@ -1,8 +1,8 @@
 """
 Training script for T5-style CLS embedding learning.
 
-Encoder sees clean input → CLS. Decoder sees ~50% masked input and
-reconstructs masked tokens using CLS + unmasked context.
+Encoder sees clean input → CLS. Decoder sees masked input (random ratio
+per example, 80/10/10 corruption) and reconstructs using CLS + context.
 
 Supports:
 - BF16 mixed precision
@@ -129,12 +129,21 @@ def create_masked_inputs(
     input_ids: torch.Tensor,
     is_number_mask: torch.Tensor,
     number_values: torch.Tensor,
-    mask_prob: float,
     mask_token_id: int,
     pad_token_id: int,
     magnitude_sentinel: float,
+    vocab_size: int,
+    magnitude_min: float,
+    magnitude_max: float,
+    mask_prob_min: float = 0.15,
+    mask_prob_max: float = 0.85,
 ):
     """Create masked decoder inputs and labels.
+
+    Masking ratio is sampled uniformly per example from [mask_prob_min, mask_prob_max].
+    Both text and number masked positions use 80/10/10 corruption:
+      80% fully masked, 10% random replacement, 10% keep original.
+    For numbers, "random" means a random magnitude from [magnitude_min, magnitude_max].
 
     Returns:
         decoder_input_ids, decoder_number_values, decoder_is_number_mask,
@@ -147,20 +156,37 @@ def create_masked_inputs(
     candidates = (input_ids != pad_token_id)
     candidates[:, 0] = False  # never mask CLS
 
+    # Per-example random mask ratio
+    mask_probs = torch.empty(B, 1, device=device).uniform_(mask_prob_min, mask_prob_max)
     rand = torch.rand(B, S, device=device)
-    mask_positions = (rand < mask_prob) & candidates
+    mask_positions = (rand < mask_probs) & candidates
 
     decoder_input_ids = input_ids.clone()
     decoder_number_values = number_values.clone()
     decoder_is_number_mask = is_number_mask.clone()
 
+    # 80/10/10 corruption split (shared across text and numbers)
+    corruption_rand = torch.rand(B, S, device=device)
+    do_mask = mask_positions & (corruption_rand < 0.8)
+    do_random = mask_positions & (corruption_rand >= 0.8) & (corruption_rand < 0.9)
+    # remaining 10%: keep original
+
+    # --- Text positions ---
     text_mask = mask_positions & ~is_number
-    decoder_input_ids[text_mask] = mask_token_id
+    decoder_input_ids[do_mask & ~is_number] = mask_token_id
+    random_tokens = torch.randint(0, vocab_size, (B, S), device=device)
+    decoder_input_ids[do_random & ~is_number] = random_tokens[do_random & ~is_number]
 
+    # --- Number positions ---
     num_mask = mask_positions & is_number
-    decoder_number_values[num_mask] = magnitude_sentinel
-    decoder_input_ids[num_mask] = mask_token_id
+    decoder_input_ids[do_mask & is_number] = mask_token_id
+    decoder_number_values[do_mask & is_number] = magnitude_sentinel
 
+    random_mags = torch.empty(B, S, device=device).uniform_(magnitude_min, magnitude_max)
+    decoder_number_values[do_random & is_number] = random_mags[do_random & is_number]
+    # (do_random numbers keep their original input_id — the number placeholder token)
+
+    # Labels: predict at ALL masked positions (including keep-original ones)
     labels_text = torch.full_like(input_ids, -100)
     labels_text[text_mask] = input_ids[text_mask]
 
@@ -231,7 +257,8 @@ def load_split(bucket_dir: str):
 # ---------------------------------------------------------------------------
 
 def run_validation(model, val_dataloader, device, pad_token_id, mask_token_id,
-                   magnitude_sentinel, mask_prob):
+                   magnitude_sentinel, vocab_size, magnitude_min, magnitude_max,
+                   mask_prob_min, mask_prob_max):
     """Run validation and return average losses."""
     model.eval()
     totals = {"loss": 0.0, "text": 0.0, "mag": 0.0}
@@ -247,10 +274,14 @@ def run_validation(model, val_dataloader, device, pad_token_id, mask_token_id,
             (dec_input_ids, dec_number_values, dec_is_number_mask,
              labels_text, labels_magnitude) = create_masked_inputs(
                 input_ids, is_number_mask, number_values,
-                mask_prob=mask_prob,
                 mask_token_id=mask_token_id,
                 pad_token_id=pad_token_id,
                 magnitude_sentinel=magnitude_sentinel,
+                vocab_size=vocab_size,
+                magnitude_min=magnitude_min,
+                magnitude_max=magnitude_max,
+                mask_prob_min=mask_prob_min,
+                mask_prob_max=mask_prob_max,
             )
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -359,11 +390,12 @@ def train(args):
     # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
-    print("\nBuilding model...")
+    print(f"\nBuilding model (cross_attn_type={args.cross_attn_type})...")
     model = build_t5_model(
         encoder_checkpoint=args.encoder_checkpoint,
         pretrained_model_id=args.pretrained_model_id,
         num_magnitude_bins=args.num_magnitude_bins,
+        cross_attn_type=args.cross_attn_type,
     )
     model = model.to(device)
 
@@ -376,6 +408,9 @@ def train(args):
     mask_token_id = tokenizer.mask_token_id
     pad_token_id = tokenizer.pad_token_id
     magnitude_sentinel = model.config.magnitude_max + 1.0
+    vocab_size = model.config.vocab_size
+    magnitude_min = model.config.magnitude_min
+    magnitude_max = model.config.magnitude_max
 
     # ------------------------------------------------------------------
     # Optimizer + schedule
@@ -418,7 +453,8 @@ def train(args):
     print(f"\nTraining: {args.epochs} epochs, {steps_per_epoch} steps/epoch, "
           f"{total_steps} total steps")
     print(f"tokens_per_batch: {args.tokens_per_batch}, grad_accum: {args.grad_accum_steps}")
-    print(f"LR: {args.lr}, warmup: {warmup_steps} steps, mask prob: {args.mask_prob}")
+    print(f"LR: {args.lr}, warmup: {warmup_steps} steps, "
+          f"mask prob: U({args.mask_prob_min}, {args.mask_prob_max}), 80/10/10 corruption")
     print()
 
     # ------------------------------------------------------------------
@@ -443,10 +479,14 @@ def train(args):
             (dec_input_ids, dec_number_values, dec_is_number_mask,
              labels_text, labels_magnitude) = create_masked_inputs(
                 input_ids, is_number_mask, number_values,
-                mask_prob=args.mask_prob,
                 mask_token_id=mask_token_id,
                 pad_token_id=pad_token_id,
                 magnitude_sentinel=magnitude_sentinel,
+                vocab_size=vocab_size,
+                magnitude_min=magnitude_min,
+                magnitude_max=magnitude_max,
+                mask_prob_min=args.mask_prob_min,
+                mask_prob_max=args.mask_prob_max,
             )
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -484,9 +524,9 @@ def train(args):
                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
             )
 
-            # Periodic checkpoint
+            # Periodic checkpoint (overwrites previous to save disk)
             if args.checkpoint_minutes > 0 and time.time() - last_ckpt_time >= args.checkpoint_minutes * 60:
-                ckpt_path = os.path.join(args.output_dir, f"checkpoint_step{global_step}")
+                ckpt_path = os.path.join(args.output_dir, "checkpoint_latest")
                 save_checkpoint(ckpt_path, model, optimizer, scheduler,
                                 epoch, global_step, ma=ma)
                 last_ckpt_time = time.time()
@@ -502,7 +542,8 @@ def train(args):
         if val_loader:
             val_metrics = run_validation(
                 model, val_loader, device, pad_token_id, mask_token_id,
-                magnitude_sentinel, args.mask_prob,
+                magnitude_sentinel, vocab_size, magnitude_min, magnitude_max,
+                args.mask_prob_min, args.mask_prob_max,
             )
             val_loss = val_metrics["loss"]
             print(f"  val loss {val_metrics['loss']:.4f} "
@@ -515,6 +556,13 @@ def train(args):
         print()
 
     print("Training complete.")
+
+    # Free VRAM so back-to-back runs (e.g. --compare) don't OOM
+    del model, optimizer, scheduler
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        if hasattr(torch.compiler, "reset"):
+            torch.compiler.reset()
 
 
 def main():
@@ -529,6 +577,12 @@ def main():
     # Model
     parser.add_argument("--pretrained_model_id", default="answerdotai/ModernBERT-base")
     parser.add_argument("--num_magnitude_bins", type=int, default=128)
+    parser.add_argument("--cross_attn_type", default="mlp", choices=["mlp", "expanded_memory"],
+                        help="CLS conditioning module: 'mlp' (CLSSwiGLU) or 'expanded_memory'")
+    parser.add_argument("--compare", action="store_true", default=True,
+                        help="Run both cross_attn_type variants for 1 epoch and compare val loss")
+    parser.add_argument("--no_compare", action="store_false", dest="compare",
+                        help="Disable compare mode, train a single variant")
 
     # Training
     parser.add_argument("--epochs", type=int, default=5)
@@ -541,7 +595,10 @@ def main():
     parser.add_argument("--warmup_ratio", type=float, default=0.06)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
-    parser.add_argument("--mask_prob", type=float, default=0.5)
+    parser.add_argument("--mask_prob_min", type=float, default=0.15,
+                        help="Min masking ratio (sampled uniformly per example)")
+    parser.add_argument("--mask_prob_max", type=float, default=0.85,
+                        help="Max masking ratio (sampled uniformly per example)")
 
     # Output / resuming
     parser.add_argument("--output_dir", default="checkpoints/t5_cls")
@@ -554,7 +611,40 @@ def main():
                         help="Save a checkpoint every N minutes (0 to disable)")
 
     args = parser.parse_args()
-    train(args)
+
+    if args.compare:
+        # Run both variants for 1 epoch, report val loss
+        base_output_dir = args.output_dir
+        original_epochs = args.epochs
+        args.epochs = 1
+        results = {}
+
+        for variant in ("mlp", "expanded_memory"):
+            print(f"\n{'='*60}")
+            print(f"  COMPARE: training with cross_attn_type={variant}")
+            print(f"{'='*60}\n")
+            args.cross_attn_type = variant
+            args.output_dir = os.path.join(base_output_dir, f"compare_{variant}")
+            train(args)
+
+            # Read back val loss from the epoch-1 checkpoint
+            ckpt_path = os.path.join(args.output_dir, "checkpoint_epoch1", "full_model.pt")
+            if os.path.exists(ckpt_path):
+                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                results[variant] = ckpt.get("val_loss", float("nan"))
+            else:
+                results[variant] = float("nan")
+
+        print(f"\n{'='*60}")
+        print("  COMPARISON RESULTS (1 epoch)")
+        print(f"{'='*60}")
+        for variant, val_loss in results.items():
+            print(f"  {variant:20s}  val_loss = {val_loss:.4f}")
+        best = min(results, key=results.get)
+        print(f"\n  Best: {best} (val_loss={results[best]:.4f})")
+        args.epochs = original_epochs
+    else:
+        train(args)
 
 
 if __name__ == "__main__":

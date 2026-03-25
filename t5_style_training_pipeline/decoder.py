@@ -36,6 +36,61 @@ from financial_bert import (
     PredictionHead,
 )
 
+NUM_MEMORY_SLOTS = 16
+
+class ExpandedMemoryCrossAttention(nn.Module):
+    """Multi-head cross-attention to expanded CLS memory.
+
+    CLS (B, D) is projected into N memory slots (B, N, D), then standard
+    multi-head cross-attention lets each decoder position attend to different
+    slots based on content. This gives position-dependent retrieval from CLS,
+    unlike single-vector approaches where every position gets the same info.
+    """
+
+    def __init__(self, config, num_slots=NUM_MEMORY_SLOTS):
+        super().__init__()
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.num_slots = num_slots
+        D = config.hidden_size
+
+        # Expand CLS into N memory slots
+        self.W_expand = nn.Linear(D, num_slots * D, bias=False)
+
+        # Standard cross-attention projections
+        self.Wq = nn.Linear(D, D, bias=False)
+        self.Wk = nn.Linear(D, D, bias=False)
+        self.Wv = nn.Linear(D, D, bias=False)
+        self.Wo = nn.Linear(D, D, bias=False)
+
+        # Zero-init output so cross-attention starts as a no-op
+        nn.init.zeros_(self.Wo.weight)
+
+    def forward(self, hidden_states, cls_hidden):
+        """
+        Args:
+            hidden_states: (B, S, D) decoder hidden states
+            cls_hidden: (B, D) encoder CLS representation
+        Returns:
+            (B, S, D) cross-attention output
+        """
+        B, S, D = hidden_states.shape
+        H, d = self.num_heads, self.head_dim
+        N = self.num_slots
+
+        # Expand CLS into memory slots
+        memory = self.W_expand(cls_hidden).view(B, N, D)  # (B, N, D)
+
+        q = self.Wq(hidden_states).view(B, S, H, d).transpose(1, 2)  # (B, H, S, d)
+        k = self.Wk(memory).view(B, N, H, d).transpose(1, 2)          # (B, H, N, d)
+        v = self.Wv(memory).view(B, N, H, d).transpose(1, 2)          # (B, H, N, d)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v)  # (B, H, S, d)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
+
+        return self.Wo(attn_out)
+    
+
 
 class CLSSwiGLU(nn.Module):
     """2-layer SwiGLU MLP for position-dependent CLS conditioning.
@@ -84,15 +139,21 @@ class CLSSwiGLU(nn.Module):
         return self.l2_down(F.silu(self.l2_gate(x)) * self.l2_up(x))
 
 
+CROSS_ATTN_TYPES = {
+    "mlp": CLSSwiGLU,
+    "expanded_memory": ExpandedMemoryCrossAttention,
+}
+
+
 class CLSBottleneckDecoder(nn.Module):
-    """Bidirectional decoder with SwiGLU CLS conditioning.
+    """Bidirectional decoder with configurable CLS conditioning.
 
     Uses a full ModernBertModel as backbone (reusing its layers, embeddings,
-    rotary embeddings, and attention mask logic). CLS conditioning via SwiGLU
-    is injected before each self-attention layer.
+    rotary embeddings, and attention mask logic). CLS conditioning is injected
+    before each self-attention layer via the chosen cross_attn_type.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, cross_attn_type="mlp"):
         super().__init__()
         self.config = config
 
@@ -105,8 +166,9 @@ class CLSBottleneckDecoder(nn.Module):
             nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
             for _ in range(num_layers)
         ])
+        cls_module = CROSS_ATTN_TYPES[cross_attn_type]
         self.cross_attns = nn.ModuleList([
-            CLSSwiGLU(config) for _ in range(num_layers)
+            cls_module(config) for _ in range(num_layers)
         ])
 
         # Number embedder for decoder input
@@ -188,11 +250,11 @@ class T5StyleModel(nn.Module):
     masked tokens using CLS + unmasked context.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, cross_attn_type="mlp"):
         super().__init__()
         self.config = config
         self.encoder = FinancialModernBert(config)
-        self.decoder = CLSBottleneckDecoder(config)
+        self.decoder = CLSBottleneckDecoder(config, cross_attn_type=cross_attn_type)
 
     def _get_encoder_tok_embeddings(self):
         return self.encoder._get_embedding_layer()
@@ -299,13 +361,14 @@ def build_t5_model(
     encoder_checkpoint: str,
     pretrained_model_id: str = "answerdotai/ModernBERT-base",
     num_magnitude_bins: int = 128,
+    cross_attn_type: str = "mlp",
 ) -> T5StyleModel:
     """Build T5StyleModel with encoder from checkpoint and decoder from pretrained.
 
     Initialization strategy:
     - Encoder: loaded from MLM training checkpoint (full_model.pt)
     - Decoder backbone: loaded from pretrained ModernBERT
-    - Decoder CLSSwiGLU: default init, l2_down zero-initialized (no-op at start)
+    - Decoder cross-attention: default init (zero-init on output projection)
     - Decoder number_embedder: copied from encoder
     - Decoder number_head: copied from encoder
     - Decoder lm_head: from pretrained ModernBERT, weight tied to decoder embeddings
@@ -315,7 +378,7 @@ def build_t5_model(
     config.num_magnitude_bins = num_magnitude_bins
 
     # Build full model
-    model = T5StyleModel(config)
+    model = T5StyleModel(config, cross_attn_type=cross_attn_type)
 
     # --- Load encoder from MLM checkpoint ---
     print(f"Loading encoder from {encoder_checkpoint}...")
