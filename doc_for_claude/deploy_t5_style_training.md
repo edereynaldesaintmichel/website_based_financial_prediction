@@ -35,10 +35,8 @@
 6. **Compute batch size and learning rate** based on available VRAM:
    - Reference point: **8192 tokens_per_batch** uses ~54 GB VRAM on H100, with **lr=5e-5**.
    - VRAM scales linearly with batch size. LR scales linearly with batch size too.
-   - Examples (assuming ~20 GB overhead for model weights):
-     - 80 GB VRAM → tokens_per_batch=10240, lr=6.25e-5
-     - 48 GB VRAM → tokens_per_batch=5632, lr=3.4e-5
-     - 24 GB VRAM → tokens_per_batch=512, lr=3.1e-6
+   - Example (assuming ~8 GB overhead for model weights):
+     - 48 GB VRAM → tokens_per_batch=10240, lr=6.25e-5
 
 7. **Give the user the training command** to run in their remote terminal:
    ```

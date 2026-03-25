@@ -1,14 +1,15 @@
 """
-MLM Decoder with element-wise CLS gating for encoder CLS conditioning.
+MLM Decoder with SwiGLU CLS conditioning for encoder CLS injection.
 
 Architecture per decoder layer:
-    CLSGating(CLS, hidden_states) → SelfAttn + FFN
+    CLSSwiGLU(h, CLS) → SelfAttn + FFN
 
 - Self-attention + FFN: initialized from pretrained ModernBERT
-- CLS conditioning: element-wise gating mechanism where each hidden dimension
-  at each position independently decides how much of each CLS feature to use.
-  affinity = Wq(h) * Wk(CLS), output = sigmoid(affinity) * Wv(CLS).
-  Wv zero-initialized so conditioning starts as a no-op.
+- CLS conditioning: 2-layer SwiGLU MLP over the joint (h, CLS) representation.
+  Projections are split into h-path and CLS-path so CLS is projected once and
+  broadcast across positions, saving FLOPs. Both SwiGLU branches see both inputs,
+  enabling nonlinear h-CLS interactions. Last W_down zero-initialized so
+  conditioning starts as a no-op.
 - Number prediction: same magnitude-bin loss as the encoder's NumberHead
 
 The decoder is bidirectional (MLM, not autoregressive). During training, ~50% of
@@ -36,27 +37,33 @@ from financial_bert import (
 )
 
 
-class CLSGating(nn.Module):
-    """Element-wise CLS gating for position-dependent CLS conditioning.
+class CLSSwiGLU(nn.Module):
+    """2-layer SwiGLU MLP for position-dependent CLS conditioning.
 
-    Each hidden dimension at each position independently gates a CLS feature:
-        affinity = Wq(h) * Wk(CLS)        (B, S, D) element-wise
-        output   = sigmoid(affinity) * Wv(CLS)   (B, S, D)
-
-    This gives D independent gates per position (~768), compared to the 16-slot
-    routing of expanded-memory cross-attention. Cross-dimension mixing is
-    deferred to the self-attention + FFN that follows.
+    Layer 1 takes (h, CLS) with split projections — CLS is projected once
+    and broadcast across positions. A residual from h is added so layer 2
+    retains direct access to decoder states. Last W_down zero-initialized
+    for no-op start.
     """
 
     def __init__(self, config):
         super().__init__()
         D = config.hidden_size
-        self.Wq = nn.Linear(D, D, bias=False)
-        self.Wk = nn.Linear(D, D, bias=False)
-        self.Wv = nn.Linear(D, D, bias=False)
 
-        # Zero-init Wv so gating starts as a no-op
-        nn.init.zeros_(self.Wv.weight)
+        # Layer 1: split h/CLS projections (CLS projected once, broadcast)
+        self.l1_gate_h = nn.Linear(D, D, bias=False)
+        self.l1_gate_cls = nn.Linear(D, D, bias=False)
+        self.l1_up_h = nn.Linear(D, D, bias=False)
+        self.l1_up_cls = nn.Linear(D, D, bias=False)
+        self.l1_down = nn.Linear(D, D, bias=False)
+
+        # Layer 2: standard SwiGLU (input already fuses h and CLS)
+        self.l2_gate = nn.Linear(D, D, bias=False)
+        self.l2_up = nn.Linear(D, D, bias=False)
+        self.l2_down = nn.Linear(D, D, bias=False)
+
+        # Zero-init last projection so conditioning starts as a no-op
+        nn.init.zeros_(self.l2_down.weight)
 
     def forward(self, hidden_states, cls_hidden):
         """
@@ -64,21 +71,25 @@ class CLSGating(nn.Module):
             hidden_states: (B, S, D) decoder hidden states
             cls_hidden: (B, D) encoder CLS representation
         Returns:
-            (B, S, D) gated CLS output
+            (B, S, D) CLS conditioning output
         """
-        q = self.Wq(hidden_states)                        # (B, S, D)
-        k = self.Wk(cls_hidden).unsqueeze(1)              # (B, 1, D)
-        v = self.Wv(cls_hidden).unsqueeze(1)              # (B, 1, D)
-        affinity = q * k                                   # (B, S, D)
-        return torch.sigmoid(affinity) * v                 # (B, S, D)
+        cls = cls_hidden.unsqueeze(1)  # (B, 1, D)
+
+        # Layer 1: CLS projections computed once, broadcast across S
+        gate1 = F.silu(self.l1_gate_h(hidden_states) + self.l1_gate_cls(cls))
+        up1 = self.l1_up_h(hidden_states) + self.l1_up_cls(cls)
+        x = self.l1_down(gate1 * up1) + hidden_states  # residual preserves h
+
+        # Layer 2: standard SwiGLU on fused repr + original h
+        return self.l2_down(F.silu(self.l2_gate(x)) * self.l2_up(x))
 
 
 class CLSBottleneckDecoder(nn.Module):
-    """Bidirectional decoder with cross-attention to encoder CLS.
+    """Bidirectional decoder with SwiGLU CLS conditioning.
 
     Uses a full ModernBertModel as backbone (reusing its layers, embeddings,
-    rotary embeddings, and attention mask logic). Cross-attention is injected
-    before each self-attention layer.
+    rotary embeddings, and attention mask logic). CLS conditioning via SwiGLU
+    is injected before each self-attention layer.
     """
 
     def __init__(self, config):
@@ -95,7 +106,7 @@ class CLSBottleneckDecoder(nn.Module):
             for _ in range(num_layers)
         ])
         self.cross_attns = nn.ModuleList([
-            CLSGating(config) for _ in range(num_layers)
+            CLSSwiGLU(config) for _ in range(num_layers)
         ])
 
         # Number embedder for decoder input
@@ -294,8 +305,7 @@ def build_t5_model(
     Initialization strategy:
     - Encoder: loaded from MLM training checkpoint (full_model.pt)
     - Decoder backbone: loaded from pretrained ModernBERT
-    - Decoder CLS gating Wq/Wk: copied from self-attention Wqkv of each layer
-    - Decoder CLS gating Wv: zero-initialized (no-op at start)
+    - Decoder CLSSwiGLU: default init, l2_down zero-initialized (no-op at start)
     - Decoder number_embedder: copied from encoder
     - Decoder number_head: copied from encoder
     - Decoder lm_head: from pretrained ModernBERT, weight tied to decoder embeddings
@@ -334,15 +344,6 @@ def build_t5_model(
     model.decoder.lm_head.decoder.bias.data = donor.decoder.bias.data.clone()
 
     del donor
-
-    # --- Init CLS gating Q/K from self-attention weights ---
-    # Wv stays zero-initialized (no-op at start)
-    D = config.hidden_size
-    for i in range(config.num_hidden_layers):
-        wqkv = model.decoder.backbone.layers[i].attn.Wqkv.weight.data  # (3D, D)
-        model.decoder.cross_attns[i].Wq.weight.data = wqkv[:D, :].clone()
-        model.decoder.cross_attns[i].Wk.weight.data = wqkv[D:2*D, :].clone()
-        # Wv stays zero-initialized
 
     # --- Copy number embedder + head from encoder to decoder ---
     model.decoder.number_embedder.load_state_dict(
