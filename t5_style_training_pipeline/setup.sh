@@ -3,4 +3,4 @@
 # Assumes pytorch + cuda are already installed.
 set -e
 
-pip install transformers tqdm beautifulsoup4
+python -m pip install transformers tqdm beautifulsoup4
