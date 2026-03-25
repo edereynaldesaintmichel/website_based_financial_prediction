@@ -620,17 +620,39 @@ def main():
         results = {}
 
         for variant in ("mlp", "expanded_memory"):
-            print(f"\n{'='*60}")
-            print(f"  COMPARE: training with cross_attn_type={variant}")
-            print(f"{'='*60}\n")
             args.cross_attn_type = variant
             args.output_dir = os.path.join(base_output_dir, f"compare_{variant}")
+
+            # Check if this variant already finished (has epoch-1 checkpoint with val_loss)
+            finished_ckpt = os.path.join(args.output_dir, "checkpoint_epoch1", "full_model.pt")
+            if os.path.exists(finished_ckpt):
+                ckpt = torch.load(finished_ckpt, map_location="cpu", weights_only=False)
+                val_loss = ckpt.get("val_loss")
+                if val_loss is not None:
+                    print(f"\n{'='*60}")
+                    print(f"  COMPARE: {variant} already finished (val_loss={val_loss:.4f}), skipping")
+                    print(f"{'='*60}\n")
+                    results[variant] = val_loss
+                    continue
+
+            # Check for a partial checkpoint to resume from
+            latest_ckpt = os.path.join(args.output_dir, "checkpoint_latest")
+            if os.path.exists(os.path.join(latest_ckpt, "full_model.pt")):
+                print(f"\n{'='*60}")
+                print(f"  COMPARE: resuming {variant} from {latest_ckpt}")
+                print(f"{'='*60}\n")
+                args.resume_from = latest_ckpt
+            else:
+                print(f"\n{'='*60}")
+                print(f"  COMPARE: training with cross_attn_type={variant}")
+                print(f"{'='*60}\n")
+                args.resume_from = None
+
             train(args)
 
             # Read back val loss from the epoch-1 checkpoint
-            ckpt_path = os.path.join(args.output_dir, "checkpoint_epoch1", "full_model.pt")
-            if os.path.exists(ckpt_path):
-                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            if os.path.exists(finished_ckpt):
+                ckpt = torch.load(finished_ckpt, map_location="cpu", weights_only=False)
                 results[variant] = ckpt.get("val_loss", float("nan"))
             else:
                 results[variant] = float("nan")
