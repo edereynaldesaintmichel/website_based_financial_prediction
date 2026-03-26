@@ -231,22 +231,19 @@ def pad_and_collate(chunks, pad_id):
 
 @torch.no_grad()
 def compute_all_cls(model, enc_chunks, device, token_budget, pad_id):
-    """Compute CLS embeddings for sorted encoder chunks, sharded across ranks.
+    """Compute CLS embeddings for all encoder chunks (replicated on every rank).
 
-    Each rank processes its slice of batches, then results are all-gathered
-    so every rank has the complete doc_cls dict.
+    No sharding — each rank processes all batches independently.  This avoids
+    the massive all_gather_object that OOMs when serializing hundreds of
+    thousands of CLS vectors via pickle.
 
     Returns: dict of doc_idx → Tensor(N, D) on CPU.
     """
     batches = form_batches(enc_chunks, token_budget)
 
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    my_batches = batches[rank::world_size]
-
     all_cls = {}  # (doc_idx, chunk_idx) → (D,)
 
-    pbar = tqdm(my_batches, desc="  CLS embeddings", unit="batch",
+    pbar = tqdm(batches, desc="  CLS embeddings", unit="batch",
                 disable=not is_rank0())
     for batch in pbar:
         ids, num_mask, num_vals, attn_mask = pad_and_collate(batch, pad_id)
@@ -268,14 +265,6 @@ def compute_all_cls(model, enc_chunks, device, token_budget, pad_id):
 
         for i, chunk in enumerate(batch):
             all_cls[(chunk["doc_idx"], chunk["chunk_idx"])] = cls_vecs[i]
-
-    # All-gather CLS vectors across ranks
-    if dist.is_initialized() and world_size > 1:
-        gathered = [None] * world_size
-        dist.all_gather_object(gathered, all_cls)
-        all_cls = {}
-        for rank_cls in gathered:
-            all_cls.update(rank_cls)
 
     # Assemble per-document, ordered by chunk_idx
     doc_n = defaultdict(int)
