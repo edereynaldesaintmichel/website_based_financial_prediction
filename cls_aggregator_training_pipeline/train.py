@@ -671,6 +671,7 @@ def main():
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+    torch.set_float32_matmul_precision("high")
 
     log(f"World size: {dist.get_world_size()}, device: {device}")
 
