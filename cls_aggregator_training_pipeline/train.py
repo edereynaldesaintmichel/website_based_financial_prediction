@@ -231,19 +231,29 @@ def pad_and_collate(chunks, pad_id):
 
 @torch.no_grad()
 def compute_all_cls(model, enc_chunks, device, token_budget, pad_id):
-    """Compute CLS embeddings for all encoder chunks (replicated on every rank).
+    """Compute CLS embeddings for encoder chunks, sharded across ranks.
 
-    No sharding — each rank processes all batches independently.  This avoids
-    the massive all_gather_object that OOMs when serializing hundreds of
-    thousands of CLS vectors via pickle.
+    Each rank processes its slice of batches, then results are all-gathered
+    using tensor-based all_gather (not pickle-based all_gather_object).
 
     Returns: dict of doc_idx → Tensor(N, D) on CPU.
     """
+    # Assign a flat index to each chunk so we can scatter/gather by position
+    for flat_idx, chunk in enumerate(enc_chunks):
+        chunk["_flat_idx"] = flat_idx
+    total_chunks = len(enc_chunks)
+
     batches = form_batches(enc_chunks, token_budget)
 
-    all_cls = {}  # (doc_idx, chunk_idx) → (D,)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    my_batches = batches[rank::world_size]
 
-    pbar = tqdm(batches, desc="  CLS embeddings", unit="batch",
+    # Pre-allocate output tensor; detect hidden_size from first forward pass
+    hidden_size = None
+    local_results = []  # list of (flat_idx, cls_vec)
+
+    pbar = tqdm(my_batches, desc="  CLS embeddings", unit="batch",
                 disable=not is_rank0())
     for batch in pbar:
         ids, num_mask, num_vals, attn_mask = pad_and_collate(batch, pad_id)
@@ -261,20 +271,43 @@ def compute_all_cls(model, enc_chunks, device, token_budget, pad_id):
             out = model.encoder.modernbert(
                 inputs_embeds=embeds, attention_mask=attn_mask,
             )
-        cls_vecs = out.last_hidden_state[:, 0, :].float().cpu()
+        cls_vecs = out.last_hidden_state[:, 0, :].float()
+
+        if hidden_size is None:
+            hidden_size = cls_vecs.shape[1]
 
         for i, chunk in enumerate(batch):
-            all_cls[(chunk["doc_idx"], chunk["chunk_idx"])] = cls_vecs[i]
+            local_results.append((chunk["_flat_idx"], cls_vecs[i]))
+
+    # All-gather via a flat tensor (much cheaper than pickle-based)
+    if hidden_size is None:
+        hidden_size = 768  # fallback
+
+    all_cls_tensor = torch.zeros(total_chunks, hidden_size, device=device)
+    for flat_idx, vec in local_results:
+        all_cls_tensor[flat_idx] = vec
+    del local_results
+
+    if dist.is_initialized() and world_size > 1:
+        dist.all_reduce(all_cls_tensor, op=dist.ReduceOp.SUM)
+
+    all_cls_tensor = all_cls_tensor.cpu()
 
     # Assemble per-document, ordered by chunk_idx
     doc_n = defaultdict(int)
-    for d, c in all_cls:
+    for chunk in enc_chunks:
+        d, c = chunk["doc_idx"], chunk["chunk_idx"]
         doc_n[d] = max(doc_n[d], c + 1)
 
     doc_cls = {}
     for d, n in doc_n.items():
-        doc_cls[d] = torch.stack([all_cls[(d, i)] for i in range(n)])
+        doc_cls[d] = torch.zeros(n, hidden_size)
 
+    for chunk in enc_chunks:
+        d, c, fi = chunk["doc_idx"], chunk["chunk_idx"], chunk["_flat_idx"]
+        doc_cls[d][c] = all_cls_tensor[fi]
+
+    del all_cls_tensor
     return doc_cls
 
 
