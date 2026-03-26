@@ -659,6 +659,8 @@ def main():
     parser.add_argument("--agg_heads", type=int, default=16)
     parser.add_argument("--agg_hidden", type=int, default=768)
     parser.add_argument("--agg_dropout", type=float, default=0.1)
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile for kernel fusion")
     args = parser.parse_args()
 
     # Distributed setup
@@ -676,6 +678,11 @@ def main():
     log(f"\nLoading T5 model from {args.checkpoint}...")
     model, config = load_t5_model(args.checkpoint, device)
 
+    # Compile models before DDP wrapping
+    if args.compile:
+        log("Compiling encoder, decoder, and aggregator with torch.compile...")
+        model.encoder = torch.compile(model.encoder, dynamic=True)
+        model.decoder = torch.compile(model.decoder, dynamic=True)
     # Wrap decoder in DDP. find_unused_parameters=True because
     # number_embedder and tok_embeddings are used in _build_embeds()
     # outside the DDP forward — they get gradients via the embedding
@@ -693,13 +700,15 @@ def main():
     del documents
     log(f"  {len(train_docs)} train, {len(val_docs)} val documents")
 
-    # Build aggregator (wrapped in DDP)
+    # Build aggregator (compile then wrap in DDP)
     aggregator = CLSAggregator(
         hidden_size=args.agg_hidden,
         num_heads=args.agg_heads,
         num_layers=args.agg_layers,
         dropout=args.agg_dropout,
     ).to(device)
+    if args.compile:
+        aggregator = torch.compile(aggregator, dynamic=True)
     aggregator = DDP(aggregator, device_ids=[local_rank])
     n_agg = sum(p.numel() for p in aggregator.parameters()) / 1e6
     log(f"\nAggregator: {n_agg:.1f}M params (DDP)")
