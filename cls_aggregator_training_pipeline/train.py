@@ -425,6 +425,7 @@ def run_epoch(aggregator, model, documents, optimizer, scheduler,
     doc_cls = compute_all_cls(
         model, all_enc_chunks, device, args.encoder_token_budget, pad_id)
     del all_enc_chunks
+    torch.cuda.empty_cache()
 
     # ─── Step 3: Sort decoder chunks, form batches, shard across ranks ──
     all_dec_chunks.sort(key=lambda c: c["seq_length"])
