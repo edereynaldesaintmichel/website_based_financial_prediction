@@ -207,6 +207,28 @@ def form_batches(items, token_budget):
     return batches
 
 
+def form_batches_shuffled(items, token_budget, bucket_width=16):
+    """Bucket items by length, form batches per bucket, shuffle batch order.
+
+    Like form_batches but without systematic short→long ordering.
+    Padding overhead is bounded by bucket_width per sequence.
+    """
+    buckets = defaultdict(list)
+    for item in items:
+        key = (item["seq_length"] + bucket_width - 1) // bucket_width * bucket_width
+        buckets[key].append(item)
+
+    all_batches = []
+    for bucket_len, bucket_items in buckets.items():
+        random.shuffle(bucket_items)
+        batch_size = max(1, token_budget // bucket_len)
+        for i in range(0, len(bucket_items), batch_size):
+            all_batches.append(bucket_items[i:i + batch_size])
+
+    random.shuffle(all_batches)
+    return all_batches
+
+
 def pad_and_collate(chunks, pad_id):
     """Pad and stack chunk dicts into batch tensors."""
     max_len = max(c["seq_length"] for c in chunks)
@@ -427,9 +449,9 @@ def run_epoch(aggregator, model, documents, optimizer, scheduler,
     del all_enc_chunks
     torch.cuda.empty_cache()
 
-    # ─── Step 3: Sort decoder chunks, form batches, shard across ranks ──
-    all_dec_chunks.sort(key=lambda c: c["seq_length"])
-    all_dec_batches = form_batches(all_dec_chunks, args.decoder_token_budget)
+    # ─── Step 3: Bucket decoder chunks, form shuffled batches, shard ────
+    all_dec_batches = form_batches_shuffled(
+        all_dec_chunks, args.decoder_token_budget)
     del all_dec_chunks
 
     rank = dist.get_rank() if dist.is_initialized() else 0
