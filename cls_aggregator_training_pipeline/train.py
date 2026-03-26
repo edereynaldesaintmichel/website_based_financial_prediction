@@ -25,7 +25,6 @@ import random
 import sys
 import time
 from collections import defaultdict, deque
-from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -59,7 +58,7 @@ MIN_TAIL_CHUNK = 16  # absorb trailing chunks shorter than this
 # ─── Model Loading ──────────────────────────────────────────────────────────
 
 def load_t5_model(checkpoint_path, device):
-    """Load T5 model from checkpoint, freeze all parameters."""
+    """Load T5 model from checkpoint. Encoder is frozen, decoder is trainable."""
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = FinancialModernBertConfig.from_pretrained(PRETRAINED_ID)
     config.num_magnitude_bins = ckpt["args"].get("num_magnitude_bins", 128)
@@ -71,13 +70,16 @@ def load_t5_model(checkpoint_path, device):
     model.load_state_dict(state_dict)
     del state_dict
 
-    model.eval()
-    for p in model.parameters():
+    # Freeze encoder, leave decoder trainable
+    model.encoder.eval()
+    for p in model.encoder.parameters():
         p.requires_grad_(False)
     model.to(device)
 
-    n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    log(f"  Loaded T5 model: {n_params:.1f}M params (frozen)")
+    n_enc = sum(p.numel() for p in model.encoder.parameters()) / 1e6
+    n_dec = sum(p.numel() for p in model.decoder.parameters()) / 1e6
+    log(f"  Loaded T5 model: encoder {n_enc:.1f}M (frozen), "
+        f"decoder {n_dec:.1f}M (trainable)")
     return model, config
 
 
@@ -384,14 +386,16 @@ def get_cosine_schedule(optimizer, warmup_steps, total_steps):
 
 # ─── Epoch ──────────────────────────────────────────────────────────────────
 
-def run_epoch(aggregator, model, documents, optimizer, scheduler,
+def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
               device, epoch, args, config, tok_info, training=True):
     """Run one training or validation epoch."""
     prefix = "Train" if training else "Val"
     if training:
         aggregator.train()
+        decoder_ddp.train()
     else:
         aggregator.eval()
+        decoder_ddp.eval()
 
     # Fixed seed per epoch (deterministic for val)
     rng_state = random.getstate()
@@ -519,12 +523,13 @@ def run_epoch(aggregator, model, documents, optimizer, scheduler,
                 )
 
                 # Decoder forward
+                decoder = decoder_ddp.module
                 dec_embeds = model._build_embeds(
                     m_ids, m_nums, m_num_mask,
-                    model.decoder._get_tok_embeddings(),
-                    model.decoder.number_embedder,
+                    decoder._get_tok_embeddings(),
+                    decoder.number_embedder,
                 )
-                text_logits, mag_logits = model.decoder(
+                text_logits, mag_logits = decoder_ddp(
                     dec_embeds, batch_cls, attn_mask)
 
             # Loss in fp32
@@ -536,13 +541,17 @@ def run_epoch(aggregator, model, documents, optimizer, scheduler,
             if training:
                 accum_count += 1
                 is_sync_step = accum_count % args.grad_accum_steps == 0
-                sync_ctx = nullcontext() if is_sync_step else aggregator.no_sync()
-                with sync_ctx:
+                if is_sync_step:
                     (loss / args.grad_accum_steps).backward()
+                else:
+                    with aggregator.no_sync(), decoder_ddp.no_sync():
+                        (loss / args.grad_accum_steps).backward()
 
                 if is_sync_step:
                     torch.nn.utils.clip_grad_norm_(
-                        aggregator.parameters(), args.max_grad_norm)
+                        list(aggregator.parameters()) +
+                        list(decoder_ddp.parameters()),
+                        args.max_grad_norm)
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
@@ -566,19 +575,27 @@ def run_epoch(aggregator, model, documents, optimizer, scheduler,
             if n_batches % 20 == 0:
                 ma_lt = sum(recent_loss_text) / len(recent_loss_text)
                 ma_lm = sum(recent_loss_mag) / len(recent_loss_mag)
-                lr = optimizer.param_groups[0]["lr"] if training else 0
-                pbar.set_postfix(
-                    text=f"{ma_lt:.3f}", mag=f"{ma_lm:.3f}", lr=f"{lr:.2e}")
+                if training:
+                    agg_lr = optimizer.param_groups[0]["lr"]
+                    dec_lr = optimizer.param_groups[1]["lr"]
+                    pbar.set_postfix(
+                        text=f"{ma_lt:.3f}", mag=f"{ma_lm:.3f}",
+                        agg_lr=f"{agg_lr:.2e}", dec_lr=f"{dec_lr:.2e}")
+                else:
+                    pbar.set_postfix(
+                        text=f"{ma_lt:.3f}", mag=f"{ma_lm:.3f}")
 
         # Flush remaining accumulated gradients (all ranks have same count,
         # so either all flush or none)
         if training and accum_count % args.grad_accum_steps != 0:
             # Manual allreduce since we used no_sync for these steps
-            for p in aggregator.parameters():
+            for p in list(aggregator.parameters()) + list(decoder_ddp.parameters()):
                 if p.grad is not None:
                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
             torch.nn.utils.clip_grad_norm_(
-                aggregator.parameters(), args.max_grad_norm)
+                list(aggregator.parameters()) +
+                list(decoder_ddp.parameters()),
+                args.max_grad_norm)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
@@ -622,6 +639,7 @@ def main():
     parser.add_argument("--output_dir", default="checkpoints/cls_aggregator")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--decoder_lr", type=float, default=1e-5)
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -651,9 +669,12 @@ def main():
 
     log(f"World size: {dist.get_world_size()}, device: {device}")
 
-    # Load T5 model (frozen, replicated on each GPU)
+    # Load T5 model (encoder frozen, decoder trainable)
     log(f"\nLoading T5 model from {args.checkpoint}...")
     model, config = load_t5_model(args.checkpoint, device)
+
+    # Wrap decoder in DDP
+    decoder_ddp = DDP(model.decoder, device_ids=[local_rank])
 
     # Token info
     tok_info = get_token_info(PRETRAINED_ID)
@@ -676,9 +697,11 @@ def main():
     n_agg = sum(p.numel() for p in aggregator.parameters()) / 1e6
     log(f"\nAggregator: {n_agg:.1f}M params (DDP)")
 
-    # Optimizer & schedule
-    optimizer = torch.optim.AdamW(
-        aggregator.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Optimizer & schedule (separate LR for decoder)
+    optimizer = torch.optim.AdamW([
+        {"params": aggregator.parameters(), "lr": args.lr},
+        {"params": decoder_ddp.parameters(), "lr": args.decoder_lr},
+    ], weight_decay=args.weight_decay)
 
     world_size = dist.get_world_size()
     total_content = sum(len(d["input_ids"]) - 2 for d in train_docs)
@@ -699,6 +722,8 @@ def main():
         if os.path.exists(latest):
             ckpt = torch.load(latest, map_location="cpu", weights_only=False)
             aggregator.module.load_state_dict(ckpt["aggregator"])
+            if "decoder" in ckpt:
+                decoder_ddp.module.load_state_dict(ckpt["decoder"])
             optimizer.load_state_dict(ckpt["optimizer"])
             scheduler.load_state_dict(ckpt["scheduler"])
             start_epoch = ckpt["epoch"] + 1
@@ -714,7 +739,7 @@ def main():
         # Train
         t0 = time.time()
         train_m = run_epoch(
-            aggregator, model, train_docs, optimizer, scheduler,
+            aggregator, decoder_ddp, model, train_docs, optimizer, scheduler,
             device, epoch, args, config, tok_info, training=True)
         t_train = time.time() - t0
 
@@ -725,7 +750,7 @@ def main():
         # Validate
         t0 = time.time()
         val_m = run_epoch(
-            aggregator, model, val_docs, optimizer, scheduler,
+            aggregator, decoder_ddp, model, val_docs, optimizer, scheduler,
             device, epoch, args, config, tok_info, training=False)
         t_val = time.time() - t0
 
@@ -737,6 +762,7 @@ def main():
         if is_rank0():
             ckpt = {
                 "aggregator": aggregator.module.state_dict(),
+                "decoder": decoder_ddp.module.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "epoch": epoch,
