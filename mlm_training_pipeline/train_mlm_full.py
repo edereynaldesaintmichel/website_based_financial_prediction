@@ -31,6 +31,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from financial_bert import build_model, FinancialBertTokenizer
+from split_utils import is_val_document
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +230,9 @@ def train(args):
     # Three-way split based on source_file extension:
     #   .txt → regularization (Wikipedia etc.)
     #   .md  → financial, further split into train/val by document
+    #
+    # Uses deterministic MD5-hash split (shared with T5 and CLS aggregator
+    # pipelines via split_utils) so the same documents are always in val.
     financial_docs = set()
     reg_docs = set()
     for ds in datasets:
@@ -238,15 +242,11 @@ def train(args):
             else:
                 financial_docs.add(sf)
 
-    # Document-level 90/10 split for financial docs only
-    val_ratio = 0.1
-    financial_docs = sorted(financial_docs)
-    random.shuffle(financial_docs)
-    val_count = max(1, int(len(financial_docs) * val_ratio)) if financial_docs else 0
-    val_docs = set(financial_docs[:val_count])
+    val_docs = {sf for sf in financial_docs if is_val_document(sf)}
+    train_financial = financial_docs - val_docs
 
     print(f"\nDocument split: {len(financial_docs)} financial "
-          f"({len(financial_docs) - val_count} train, {val_count} val), "
+          f"({len(train_financial)} train, {len(val_docs)} val), "
           f"{len(reg_docs)} regularization")
 
     # Assign chunks to train/val/reg based on source document

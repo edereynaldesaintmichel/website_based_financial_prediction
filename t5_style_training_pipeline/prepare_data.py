@@ -16,7 +16,6 @@ import argparse
 import json
 import multiprocessing as mp
 import os
-import random
 import shutil
 import sys
 import tempfile
@@ -36,6 +35,7 @@ from mlm_training_pipeline.bucket_by_length import (
     pad_and_stack,
 )
 from financial_bert import FinancialBertTokenizer
+from split_utils import is_val_document
 
 CHUNK_SIZES = [128, 256, 512, 1024]
 
@@ -71,10 +71,7 @@ def main():
                         help="Manual bucket upper bounds (overrides --num_buckets)")
     parser.add_argument("--val_ratio", type=float, default=0.1,
                         help="Fraction of source files for validation")
-    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-
-    random.seed(args.seed)
 
     # ------------------------------------------------------------------
     # Steps 1+2: Chunk → tokenize one scale at a time, spool to disk
@@ -135,13 +132,12 @@ def main():
         print("Step 3: Train/val split by source file")
         print("=" * 60)
 
-        source_files = sorted(source_file_set)
-        random.shuffle(source_files)
-        val_count = max(1, int(len(source_files) * args.val_ratio))
-        val_files = set(source_files[:val_count])
+        val_files = {sf for sf in source_file_set
+                     if is_val_document(sf, args.val_ratio)}
+        train_count = len(source_file_set) - len(val_files)
 
-        print(f"Source files: {len(source_files)} total, {val_count} val, "
-              f"{len(source_files) - val_count} train")
+        print(f"Source files: {len(source_file_set)} total, {len(val_files)} val, "
+              f"{train_count} train")
 
         # --------------------------------------------------------------
         # Step 4: Bucket — stream from disk, one bucket at a time
