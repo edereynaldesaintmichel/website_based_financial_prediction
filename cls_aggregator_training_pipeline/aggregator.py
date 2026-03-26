@@ -114,7 +114,7 @@ class CLSAggregator(nn.Module):
         self.num_heads = num_heads
         self.num_layers = num_layers
 
-        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
+        self.cls_token = nn.Parameter(torch.randn(1, hidden_size) * 0.02)
         self.alibi = LearnableALiBi(num_heads)
         self.layers = nn.ModuleList([
             AggregatorBlock(hidden_size, num_heads, ffn_mult, dropout)
@@ -133,7 +133,7 @@ class CLSAggregator(nn.Module):
         B, N, D = cls_tokens.shape
 
         # Prepend learnable CLS token
-        cls = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
+        cls = self.cls_token.unsqueeze(0).expand(B, -1, -1)  # (B, 1, D)
         x = torch.cat([cls, cls_tokens], dim=1)  # (B, 1+N, D)
 
         # ALiBi positional bias: (1, H, 1+N, 1+N)
