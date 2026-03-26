@@ -446,11 +446,23 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
     log(f"  Chunks: {n_enc} encoder (avg {avg_enc:.0f}), "
         f"{n_dec} decoder (avg {avg_dec:.0f})")
 
-    # ─── Step 2: Compute CLS embeddings ─────────────────────────────────
-    all_enc_chunks.sort(key=lambda c: c["seq_length"])
-    doc_cls = compute_all_cls(
-        model, all_enc_chunks, device, args.encoder_token_budget, pad_id)
-    del all_enc_chunks
+    # ─── Step 2: Compute CLS embeddings (cached to disk) ────────────────
+    cache_tag = "train" if training else "val"
+    cls_cache_path = os.path.join(
+        args.output_dir, f"cls_cache_{cache_tag}_epoch{epoch}.pt")
+
+    if os.path.exists(cls_cache_path):
+        log(f"  Loading cached CLS embeddings from {cls_cache_path}")
+        doc_cls = torch.load(cls_cache_path, map_location="cpu", weights_only=False)
+        del all_enc_chunks
+    else:
+        all_enc_chunks.sort(key=lambda c: c["seq_length"])
+        doc_cls = compute_all_cls(
+            model, all_enc_chunks, device, args.encoder_token_budget, pad_id)
+        del all_enc_chunks
+        if is_rank0():
+            torch.save(doc_cls, cls_cache_path)
+            log(f"  Cached CLS embeddings to {cls_cache_path}")
     torch.cuda.empty_cache()
 
     # ─── Step 3: Bucket decoder chunks, form shuffled batches, shard ────
