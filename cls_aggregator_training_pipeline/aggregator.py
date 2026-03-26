@@ -63,23 +63,23 @@ class AggregatorBlock(nn.Module):
         self.w_down = nn.Linear(ffn_dim, hidden_size, bias=False)
         self.ffn_drop = nn.Dropout(dropout)
 
-    def forward(self, x, alibi_bias):
+    def forward(self, x, attn_bias):
         """
         Args:
             x: (B, N, D) sequence of CLS tokens
-            alibi_bias: (1, H, N, N) ALiBi attention bias
+            attn_bias: (B, H, N, N) ALiBi bias combined with padding mask
         """
         B, N, D = x.shape
         H, d = self.num_heads, self.head_dim
 
-        # Self-attention (uses memory-efficient / flash attention via SDPA)
+        # Self-attention
         h = self.norm1(x)
         qkv = self.Wqkv(h).view(B, N, 3, H, d).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, N, d)
 
         dropout_p = self.attn_dropout_p if self.training else 0.0
         h = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=alibi_bias, dropout_p=dropout_p,
+            q, k, v, attn_mask=attn_bias, dropout_p=dropout_p,
         ).transpose(1, 2).contiguous().view(B, N, D)
         x = x + self.Wo(h)
 
@@ -122,10 +122,11 @@ class CLSAggregator(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(hidden_size)
 
-    def forward(self, cls_tokens):
+    def forward(self, cls_tokens, attention_mask=None):
         """
         Args:
             cls_tokens: (B, N, D) CLS embeddings from N chunks
+            attention_mask: (B, N) optional padding mask (1=valid, 0=pad)
         Returns:
             (B, D) single document embedding
         """
@@ -135,7 +136,19 @@ class CLSAggregator(nn.Module):
         cls = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
         x = torch.cat([cls, cls_tokens], dim=1)  # (B, 1+N, D)
 
+        # ALiBi positional bias: (1, H, 1+N, 1+N)
         alibi_bias = self.alibi(1 + N, cls_tokens.device)
+
+        # Combine with padding mask if provided
+        if attention_mask is not None:
+            # Prepend 1 for the learnable CLS token (always valid)
+            mask = torch.cat([
+                attention_mask.new_ones(B, 1), attention_mask
+            ], dim=1)  # (B, 1+N)
+            # Key-side mask: set padded key positions to -inf in the bias
+            alibi_bias = alibi_bias.masked_fill(
+                ~mask[:, None, None, :].bool(), float("-inf")
+            )  # (B, H, 1+N, 1+N)
 
         for layer in self.layers:
             x = layer(x, alibi_bias)
