@@ -26,6 +26,9 @@ import os
 import sys
 from pathlib import Path
 
+# Prevent HuggingFace tokenizers (Rust rayon) from spawning hundreds of threads per worker
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import torch
 from tqdm import tqdm
 
@@ -99,7 +102,7 @@ def main():
     print(f"Found {len(all_files)} files across {len(args.input_dirs)} directories")
 
     # Tokenize in parallel
-    num_workers = args.num_workers or max((os.cpu_count() or 4) - 2, 1)
+    num_workers = args.num_workers or min(max((os.cpu_count() or 4) - 2, 1), 32)
     documents = []
     total_tokens = 0
     lengths = []
