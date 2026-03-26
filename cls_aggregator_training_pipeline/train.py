@@ -84,7 +84,7 @@ def load_t5_model(checkpoint_path, device):
 def get_token_info(pretrained_id):
     """Extract special token IDs needed for training."""
     tokenizer = FinancialBertTokenizer(pretrained_id)
-    base = tokenizer.tokenizer
+    base = tokenizer.base_tokenizer
     newline_ids = set(base.encode("\n", add_special_tokens=False))
     info = {
         "cls_id": base.cls_token_id,
