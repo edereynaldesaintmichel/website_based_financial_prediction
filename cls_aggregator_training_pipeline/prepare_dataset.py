@@ -99,7 +99,7 @@ def main():
     print(f"Found {len(all_files)} files across {len(args.input_dirs)} directories")
 
     # Tokenize in parallel
-    num_workers = args.num_workers or min(os.cpu_count() or 4, 8)
+    num_workers = args.num_workers or max((os.cpu_count() or 4) - 2, 1)
     documents = []
     total_tokens = 0
     lengths = []
