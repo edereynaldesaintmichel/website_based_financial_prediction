@@ -13,3 +13,4 @@ training_data
 .DS_Store
 
 t5_training_data
+checkpoints
