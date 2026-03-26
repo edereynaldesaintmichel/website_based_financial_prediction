@@ -673,8 +673,12 @@ def main():
     log(f"\nLoading T5 model from {args.checkpoint}...")
     model, config = load_t5_model(args.checkpoint, device)
 
-    # Wrap decoder in DDP
-    decoder_ddp = DDP(model.decoder, device_ids=[local_rank])
+    # Wrap decoder in DDP. find_unused_parameters=True because
+    # number_embedder and tok_embeddings are used in _build_embeds()
+    # outside the DDP forward — they get gradients via the embedding
+    # tensor, but DDP can't trace that.
+    decoder_ddp = DDP(model.decoder, device_ids=[local_rank],
+                      find_unused_parameters=True)
 
     # Token info
     tok_info = get_token_info(PRETRAINED_ID)
