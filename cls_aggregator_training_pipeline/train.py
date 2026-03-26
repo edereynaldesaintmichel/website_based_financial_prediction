@@ -271,7 +271,7 @@ def compute_all_cls(model, enc_chunks, device, token_budget, pad_id):
             out = model.encoder.modernbert(
                 inputs_embeds=embeds, attention_mask=attn_mask,
             )
-        cls_vecs = out.last_hidden_state[:, 0, :].float()
+        cls_vecs = out.last_hidden_state[:, 0, :].float().cpu()
 
         if hidden_size is None:
             hidden_size = cls_vecs.shape[1]
@@ -279,19 +279,23 @@ def compute_all_cls(model, enc_chunks, device, token_budget, pad_id):
         for i, chunk in enumerate(batch):
             local_results.append((chunk["_flat_idx"], cls_vecs[i]))
 
-    # All-gather via a flat tensor (much cheaper than pickle-based)
+    # Free GPU memory from encoder forward passes
+    torch.cuda.empty_cache()
+
+    # All-gather via a flat CPU tensor, briefly moved to GPU for all_reduce
     if hidden_size is None:
         hidden_size = 768  # fallback
 
-    all_cls_tensor = torch.zeros(total_chunks, hidden_size, device=device)
+    all_cls_tensor = torch.zeros(total_chunks, hidden_size)  # CPU
     for flat_idx, vec in local_results:
         all_cls_tensor[flat_idx] = vec
     del local_results
 
     if dist.is_initialized() and world_size > 1:
+        all_cls_tensor = all_cls_tensor.to(device)
         dist.all_reduce(all_cls_tensor, op=dist.ReduceOp.SUM)
-
-    all_cls_tensor = all_cls_tensor.cpu()
+        all_cls_tensor = all_cls_tensor.cpu()
+        torch.cuda.empty_cache()
 
     # Assemble per-document, ordered by chunk_idx
     doc_n = defaultdict(int)
