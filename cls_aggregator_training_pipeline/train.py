@@ -584,7 +584,7 @@ def main():
     parser.add_argument("--agg_layers", type=int, default=6)
     parser.add_argument("--agg_heads", type=int, default=16)
     parser.add_argument("--agg_hidden", type=int, default=768)
-    parser.add_argument("--agg_dropout", type=float, default=0.0)
+    parser.add_argument("--agg_dropout", type=float, default=0.1)
     args = parser.parse_args()
 
     # Distributed setup
