@@ -69,11 +69,12 @@ def _tokenize_file(args):
     is_number_mask = result["is_number_mask"][0]
     number_values = result["number_values"][0]
 
+    # Return plain lists to avoid torch tensor fd-sharing issues in multiprocessing
     return {
         "source_file": source_file,
-        "input_ids": torch.tensor(input_ids, dtype=torch.long),
-        "is_number_mask": torch.tensor(is_number_mask, dtype=torch.bool),
-        "number_values": torch.tensor(number_values, dtype=torch.float32),
+        "input_ids": input_ids,
+        "is_number_mask": is_number_mask,
+        "number_values": number_values,
         "seq_length": len(input_ids),
     }
 
@@ -122,6 +123,12 @@ def main():
                 documents.append(result)
                 total_tokens += result["seq_length"]
                 lengths.append(result["seq_length"])
+
+    # Convert to tensors in the main process (avoids fd-sharing across workers)
+    for doc in documents:
+        doc["input_ids"] = torch.tensor(doc["input_ids"], dtype=torch.long)
+        doc["is_number_mask"] = torch.tensor(doc["is_number_mask"], dtype=torch.bool)
+        doc["number_values"] = torch.tensor(doc["number_values"], dtype=torch.float32)
 
     # Sort by source_file for reproducibility
     documents.sort(key=lambda d: d["source_file"])
