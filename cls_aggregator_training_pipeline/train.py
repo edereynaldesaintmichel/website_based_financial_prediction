@@ -24,7 +24,7 @@ import os
 import random
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import nullcontext
 import torch
 import torch.distributed as dist
@@ -448,6 +448,8 @@ def run_epoch(aggregator, model, documents, optimizer, scheduler,
     total_masked = 0
     n_batches = 0
     accum_count = 0
+    recent_loss_text = deque(maxlen=100)
+    recent_loss_mag = deque(maxlen=100)
 
     prev_grad = torch.is_grad_enabled()
     if not training:
@@ -527,6 +529,8 @@ def run_epoch(aggregator, model, documents, optimizer, scheduler,
             total_loss += loss.item()
             total_loss_text += lt.item()
             total_loss_mag += lm.item()
+            recent_loss_text.append(lt.item())
+            recent_loss_mag.append(lm.item())
 
             text_masked = labels_t.view(-1) != -100
             if text_masked.any():
@@ -538,11 +542,11 @@ def run_epoch(aggregator, model, documents, optimizer, scheduler,
             n_batches += 1
 
             if n_batches % 20 == 0:
-                avg_l = total_loss / n_batches
-                acc = total_correct / max(total_masked, 1)
+                ma_lt = sum(recent_loss_text) / len(recent_loss_text)
+                ma_lm = sum(recent_loss_mag) / len(recent_loss_mag)
                 lr = optimizer.param_groups[0]["lr"] if training else 0
                 pbar.set_postfix(
-                    loss=f"{avg_l:.3f}", acc=f"{acc:.1%}", lr=f"{lr:.2e}")
+                    text=f"{ma_lt:.3f}", mag=f"{ma_lm:.3f}", lr=f"{lr:.2e}")
 
         # Flush remaining accumulated gradients (all ranks have same count,
         # so either all flush or none)
