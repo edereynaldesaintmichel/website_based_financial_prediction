@@ -488,18 +488,21 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
         pbar = tqdm(dec_batches, desc=f"  {prefix}", unit="batch",
                     disable=not is_rank0())
         for batch_idx, batch_chunks in enumerate(pbar):
-            # Aggregator: one forward per unique document in this batch
-            doc_indices = set(c["doc_idx"] for c in batch_chunks)
-            enriched_cache = {}
+            # Aggregator: batched forward over unique documents
+            doc_indices = list(set(c["doc_idx"] for c in batch_chunks))
+            cls_seqs = [doc_cls[d] for d in doc_indices]
+            max_n = max(s.shape[0] for s in cls_seqs)
+            padded = torch.zeros(len(doc_indices), max_n, cls_seqs[0].shape[1])
+            agg_mask = torch.zeros(len(doc_indices), max_n)
+            for i, s in enumerate(cls_seqs):
+                padded[i, :s.shape[0]] = s
+                agg_mask[i, :s.shape[0]] = 1
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                for d in doc_indices:
-                    raw = doc_cls[d].to(device)  # (N, D)
-                    enriched_cache[d] = aggregator(raw.unsqueeze(0)).squeeze(0)  # (D,)
-
-                # Stack single CLS for each decoder chunk in batch
+                enriched = aggregator(padded.to(device), agg_mask.to(device))
+                doc_to_cls = {d: enriched[i] for i, d in enumerate(doc_indices)}
                 batch_cls = torch.stack(
-                    [enriched_cache[c["doc_idx"]] for c in batch_chunks])  # (B, D)
+                    [doc_to_cls[c["doc_idx"]] for c in batch_chunks])
 
                 # Pad decoder batch
                 ids, num_mask, num_vals, attn_mask = pad_and_collate(
