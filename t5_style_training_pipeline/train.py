@@ -307,7 +307,7 @@ def run_validation(model, val_dataloader, device, pad_token_id, mask_token_id,
     return {k: v / n for k, v in totals.items()}
 
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, global_step,
+def  save_checkpoint(path, model, optimizer, scheduler, epoch, global_step,
                     ma=None, val_loss=None, args=None, weights_only=False):
     """Save checkpoint. If weights_only, save just model state dict; otherwise
     include optimizer/scheduler state for resuming."""
