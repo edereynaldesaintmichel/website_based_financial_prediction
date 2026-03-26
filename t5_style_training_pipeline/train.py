@@ -308,16 +308,18 @@ def run_validation(model, val_dataloader, device, pad_token_id, mask_token_id,
 
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, global_step,
-                    ma=None, val_loss=None, args=None):
-    """Save full checkpoint with optimizer/scheduler state for resuming."""
+                    ma=None, val_loss=None, args=None, weights_only=False):
+    """Save checkpoint. If weights_only, save just model state dict; otherwise
+    include optimizer/scheduler state for resuming."""
     os.makedirs(path, exist_ok=True)
     state = {
         "epoch": epoch,
         "global_step": global_step,
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
     }
+    if not weights_only:
+        state["optimizer_state_dict"] = optimizer.state_dict()
+        state["scheduler_state_dict"] = scheduler.state_dict()
     if ma:
         state["train_loss"] = sum(ma["loss"]) / len(ma["loss"]) if ma["loss"] else float("nan")
     if val_loss is not None:
@@ -559,10 +561,11 @@ def train(args):
             print(f"  val loss {val_metrics['loss']:.4f} "
                   f"(text {val_metrics['text']:.4f}, mag {val_metrics['mag']:.4f})")
 
-        # End-of-epoch checkpoint
+        # End-of-epoch checkpoint (weights only — no optimizer/scheduler state)
         ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch + 1}")
         save_checkpoint(ckpt_path, model, optimizer, scheduler,
-                        epoch + 1, global_step, ma=ma, val_loss=val_loss, args=args)
+                        epoch + 1, global_step, ma=ma, val_loss=val_loss, args=args,
+                        weights_only=True)
         print()
 
     print("Training complete.")
