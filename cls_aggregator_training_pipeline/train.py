@@ -707,8 +707,6 @@ def main():
         num_layers=args.agg_layers,
         dropout=args.agg_dropout,
     ).to(device)
-    if args.compile:
-        aggregator = torch.compile(aggregator, dynamic=True)
     aggregator = DDP(aggregator, device_ids=[local_rank])
     n_agg = sum(p.numel() for p in aggregator.parameters()) / 1e6
     log(f"\nAggregator: {n_agg:.1f}M params (DDP)")
