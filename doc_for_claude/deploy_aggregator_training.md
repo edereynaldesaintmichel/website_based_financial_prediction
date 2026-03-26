@@ -55,8 +55,8 @@
    - The aggregator (~56M params) adds ~0.5 GB.
    - That leaves ~29 GB per GPU for activations and batch data.
    - Recommended starting point for 32 GB GPUs:
-     - `--encoder_token_budget 32768` (for CLS computation, no gradients)
-     - `--decoder_token_budget 16384` (for training, holds gradients)
+     - `--encoder_token_budget 16384` (for CLS computation, no gradients)
+     - `--decoder_token_budget 8192` (for training, holds gradients)
    - If OOM, halve `decoder_token_budget` first and double `grad_accum_steps` to compensate.
 
 8. **Give the user the training command** to run in their remote terminal:
@@ -66,10 +66,10 @@
        --data /workspace/data/cls_aggregator/documents.pt \
        --checkpoint /workspace/data/t5_checkpoint/model_only.pt \
        --output_dir /workspace/checkpoints/cls_aggregator \
-       --encoder_token_budget 32768 \
-       --decoder_token_budget 16384 \
+       --encoder_token_budget 16384 \
+       --decoder_token_budget 8192 \
        --grad_accum_steps 1 \
-       --lr 1e-4 \
+       --lr 7e-5 \
        --epochs 3
    ```
    Do NOT run this command yourself. The user runs it directly in their SSH session.
@@ -86,15 +86,15 @@
 If training is interrupted, re-run the same command with `--resume`:
 ```
 torchrun --nproc_per_node=4 -m cls_aggregator_training_pipeline.train \
-    --data /workspace/data/cls_aggregator/documents.pt \
-    --checkpoint /workspace/data/t5_checkpoint/model_only.pt \
-    --output_dir /workspace/checkpoints/cls_aggregator \
-    --resume \
-    --encoder_token_budget 32768 \
-    --decoder_token_budget 16384 \
-    --grad_accum_steps 1 \
-    --lr 1e-4 \
-    --epochs 10
+   --data /workspace/data/cls_aggregator/documents.pt \
+   --checkpoint /workspace/data/t5_checkpoint/model_only.pt \
+   --output_dir /workspace/checkpoints/cls_aggregator \
+   --resume \
+   --encoder_token_budget 16384 \
+   --decoder_token_budget 8192 \
+   --grad_accum_steps 1 \
+   --lr 7e-5 \
+   --epochs 3
 ```
 
 ## Notes
