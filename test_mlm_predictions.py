@@ -1,13 +1,14 @@
 """
-Test FinancialModernBert MLM predictions on a single SEC filing.
+Test FinancialModernBert MLM predictions on a pre-tokenized document.
 
-Chunks the file, tokenizes, masks 15% of tokens, runs inference with the
-trained model, then reconstructs each chunk showing predictions inline.
+Loads a document from mlm_data/documents.pt, splits its token sequence into
+chunks, masks 15% of tokens, runs inference with the trained model, then
+reconstructs each chunk showing predictions inline.
 
 Usage:
     python test_mlm_predictions.py \
-        --file training_data/processed/SEC_10k_markdown_tagged/1750_2018-07-11.md \
-        --checkpoint checkpoints/mlm_full_baseline/checkpoint_epoch2 \
+        --doc_index 0 \
+        --checkpoint checkpoints/mlm_full_baseline/checkpoint_epoch3/ \
         --max_chunks 5
 """
 import argparse
@@ -19,7 +20,6 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from financial_bert import build_model, FinancialBertTokenizer
-from mlm_training_pipeline.chunk_markdown import chunk_file
 
 
 def mask_sequence(input_ids, is_number_mask, number_values, mask_prob=0.15,
@@ -142,8 +142,13 @@ def reconstruct_chunk(tokenizer, input_ids, is_number_mask, number_values,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test MLM predictions on a single file")
-    parser.add_argument("--file", required=True, help="Markdown file to test")
+    parser = argparse.ArgumentParser(description="Test MLM predictions on a pre-tokenized document")
+    parser.add_argument("--documents", default="mlm_data/documents.pt",
+                        help="Path to documents.pt")
+    parser.add_argument("--doc_index", type=int, default=None,
+                        help="Document index in documents.pt (default: random)")
+    parser.add_argument("--source_file", type=str, default=None,
+                        help="Select document by source_file name (e.g. '1750_2018-07-11.md')")
     parser.add_argument("--checkpoint", default="checkpoints/mlm_full_baseline/checkpoint_epoch2",
                         help="Path to checkpoint directory (contains full_model.pt)")
     parser.add_argument("--model_name", default="answerdotai/ModernBERT-base")
@@ -154,7 +159,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output", type=str, default=None,
-                        help="Output .md file (default: <input_stem>_predictions.md)")
+                        help="Output .md file (default: <source_file>_predictions.md)")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -169,35 +174,49 @@ def main():
                               else "cpu")
     print(f"Device: {device}")
 
-    # 1. Chunk the file
-    print(f"\n### Chunking {args.file}...")
-    chunks = chunk_file(args.file, args.max_tokens)
-    print(f"  {len(chunks)} chunks")
+    # 1. Load documents and select one
+    print(f"\n### Loading {args.documents}...")
+    documents = torch.load(args.documents, weights_only=False)
+    print(f"  {len(documents)} documents")
 
-    if args.max_chunks > 0:
-        chunks = chunks[:args.max_chunks]
+    if args.source_file:
+        doc = next((d for d in documents if d["source_file"] == args.source_file), None)
+        if doc is None:
+            print(f"Error: source_file '{args.source_file}' not found")
+            sys.exit(1)
+    elif args.doc_index is not None:
+        doc = documents[args.doc_index]
+    else:
+        doc = random.choice(documents)
 
-    # 2. Tokenize
-    print("### Loading tokenizer...")
-    tokenizer = FinancialBertTokenizer(args.model_name)
+    source_name = doc["source_file"]
+    print(f"  Selected: {source_name} ({doc['seq_length']} tokens)")
+
+    # 2. Chunk the pre-tokenized sequence
+    input_ids = doc["input_ids"].tolist()
+    is_number_mask = doc["is_number_mask"].tolist()
+    number_values = doc["number_values"].tolist()
+    seq_len = doc["seq_length"]
+    chunk_size = args.max_tokens
 
     tokenized_chunks = []
-    for chunk in chunks:
-        result = tokenizer(
-            chunk["text"],
-            padding=False,
-            truncation=True,
-            max_length=4192,
-            return_tensors=None,
-            add_special_tokens=True,
-        )
+    for i in range(0, seq_len, chunk_size):
+        end = min(i + chunk_size, seq_len)
         tokenized_chunks.append({
-            "input_ids": result["input_ids"][0],
-            "is_number_mask": result["is_number_mask"][0],
-            "number_values": result["number_values"][0],
-            "text": chunk["text"],
-            "chunk_index": chunk["chunk_index"],
+            "input_ids": input_ids[i:end],
+            "is_number_mask": is_number_mask[i:end],
+            "number_values": number_values[i:end],
+            "chunk_index": len(tokenized_chunks),
         })
+
+    print(f"  {len(tokenized_chunks)} chunks of up to {chunk_size} tokens")
+
+    if args.max_chunks > 0:
+        tokenized_chunks = tokenized_chunks[:args.max_chunks]
+
+    # 3. Load tokenizer
+    print("### Loading tokenizer...")
+    tokenizer = FinancialBertTokenizer(args.model_name)
 
     # 3. Build model and load full checkpoint
     print("### Building model...")
@@ -220,7 +239,7 @@ def main():
     if args.output:
         output_path = args.output
     else:
-        stem = os.path.splitext(os.path.basename(args.file))[0]
+        stem = os.path.splitext(source_name)[0]
         output_path = f"{stem}_predictions.md"
 
     # 4. Process each chunk
@@ -232,14 +251,13 @@ def main():
     total_num_close = 0
 
     md_lines = []
-    source_name = os.path.basename(args.file)
     md_lines.append(f"# MLM Predictions: `{source_name}`\n")
     md_lines.append(f"| Setting | Value |")
     md_lines.append(f"|---|---|")
     md_lines.append(f"| Checkpoint | `{args.checkpoint}` |")
     md_lines.append(f"| Mask probability | {args.mask_prob} |")
     md_lines.append(f"| Seed | {args.seed} |")
-    md_lines.append(f"| Chunks processed | {len(tokenized_chunks)}/{len(chunks)} |")
+    md_lines.append(f"| Chunks processed | {len(tokenized_chunks)} |")
     md_lines.append(f"| Device | {device} |")
     md_lines.append("")
     md_lines.append("> **Legend:** "

@@ -19,7 +19,7 @@ Usage:
     python -m mlm_training_pipeline.prepare_dataset \
         --input_dirs training_data/processed/SEC_10k_markdown_tagged \
                      training_data/processed/companies_house_markdown_tagged \
-                     training_data/processed/wikipedia_tagged \
+                     training_data/processed/wikipedia \
         --output mlm_data/documents.pt
 """
 import argparse

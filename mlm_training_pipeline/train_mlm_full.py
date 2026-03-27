@@ -25,6 +25,7 @@ import os
 import random
 import sys
 import time
+import threading
 from collections import defaultdict, deque
 
 import torch
@@ -248,6 +249,50 @@ def pad_and_collate(chunks, pad_id):
     return input_ids, is_number_mask, number_values, attention_mask
 
 
+def _prefetch_iter(batches, prepare_fn):
+    """Yield prepared batches, prefetching the next one on a background thread."""
+    result = [None]
+    error = [None]
+
+    def _worker(batch):
+        try:
+            result[0] = prepare_fn(batch)
+        except Exception as e:
+            error[0] = e
+
+    it = iter(batches)
+    # Prepare the first batch on the main thread
+    first = next(it, None)
+    if first is None:
+        return
+    current = prepare_fn(first)
+
+    # Kick off prefetch for the second batch
+    nxt = next(it, None)
+    thread = None
+    if nxt is not None:
+        thread = threading.Thread(target=_worker, args=(nxt,))
+        thread.start()
+
+    while True:
+        yield current
+        if thread is not None:
+            thread.join()
+            if error[0] is not None:
+                raise error[0]
+            current = result[0]
+            result[0] = None
+            error[0] = None
+            nxt = next(it, None)
+            if nxt is not None:
+                thread = threading.Thread(target=_worker, args=(nxt,))
+                thread.start()
+            else:
+                thread = None
+        else:
+            break
+
+
 # ─── Training ────────────────────────────────────────────────────────────────
 
 def run_epoch(model, documents, reg_documents, optimizer, scheduler, scaler,
@@ -326,28 +371,31 @@ def run_epoch(model, documents, reg_documents, optimizer, scheduler, scaler,
     magnitude_sentinel = model.config.magnitude_max + 1.0 if hasattr(model, 'config') else 13.0
     create_masked_inputs = _get_create_masked_inputs()
 
-    try:
-        pbar = tqdm(fin_batches, desc=f"  {prefix}", unit="batch")
-        for batch_chunks in pbar:
-            # Pad and collate
-            ids, num_mask, num_vals, attn_mask = pad_and_collate(batch_chunks, pad_id)
-            ids = ids.to(device)
-            num_mask = num_mask.to(device)
-            num_vals = num_vals.to(device)
-            attn_mask = attn_mask.to(device)
+    def _prepare_batch(batch_chunks):
+        """Collate, transfer to device, and apply MLM masking."""
+        ids, num_mask, num_vals, attn_mask = pad_and_collate(batch_chunks, pad_id)
+        ids = ids.to(device, non_blocking=True)
+        num_mask = num_mask.to(device, non_blocking=True)
+        num_vals = num_vals.to(device, non_blocking=True)
+        attn_mask = attn_mask.to(device, non_blocking=True)
+        m_ids, m_nums, m_num_mask, labels_t, labels_m = create_masked_inputs(
+            ids, num_mask, num_vals,
+            mask_token_id=mask_id, pad_token_id=pad_id,
+            magnitude_sentinel=magnitude_sentinel,
+            vocab_size=model.config.vocab_size,
+            magnitude_min=model.config.magnitude_min,
+            magnitude_max=model.config.magnitude_max,
+            mask_prob_min=args.mask_prob_min,
+            mask_prob_max=args.mask_prob_max,
+        )
+        return m_ids, m_nums, m_num_mask, labels_t, labels_m, attn_mask
 
-            # Apply MLM masking
-            (m_ids, m_nums, m_num_mask,
-             labels_t, labels_m) = create_masked_inputs(
-                ids, num_mask, num_vals,
-                mask_token_id=mask_id, pad_token_id=pad_id,
-                magnitude_sentinel=magnitude_sentinel,
-                vocab_size=model.config.vocab_size,
-                magnitude_min=model.config.magnitude_min,
-                magnitude_max=model.config.magnitude_max,
-                mask_prob_min=args.mask_prob_min,
-                mask_prob_max=args.mask_prob_max,
-            )
+    try:
+        pbar = tqdm(
+            _prefetch_iter(fin_batches, _prepare_batch),
+            total=len(fin_batches), desc=f"  {prefix}", unit="batch",
+        )
+        for m_ids, m_nums, m_num_mask, labels_t, labels_m, attn_mask in pbar:
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 outputs = model(
@@ -372,23 +420,7 @@ def run_epoch(model, documents, reg_documents, optimizer, scheduler, scaler,
                         reg_iter = iter(reg_batches)
                         reg_batch = next(reg_iter)
 
-                    r_ids, r_nm, r_nv, r_am = pad_and_collate(reg_batch, pad_id)
-                    r_ids = r_ids.to(device)
-                    r_nm = r_nm.to(device)
-                    r_nv = r_nv.to(device)
-                    r_am = r_am.to(device)
-
-                    (rm_ids, rm_nums, rm_nm,
-                     rl_t, rl_m) = create_masked_inputs(
-                        r_ids, r_nm, r_nv,
-                        mask_token_id=mask_id, pad_token_id=pad_id,
-                        magnitude_sentinel=magnitude_sentinel,
-                        vocab_size=model.config.vocab_size,
-                        magnitude_min=model.config.magnitude_min,
-                        magnitude_max=model.config.magnitude_max,
-                        mask_prob_min=args.mask_prob_min,
-                        mask_prob_max=args.mask_prob_max,
-                    )
+                    rm_ids, rm_nums, rm_nm, rl_t, rl_m, r_am = _prepare_batch(reg_batch)
 
                     with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                         reg_outputs = model(
