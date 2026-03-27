@@ -55,6 +55,24 @@ CHUNK_MAX = 1024
 MIN_TAIL_CHUNK = 16  # absorb trailing chunks shorter than this
 
 
+class DecoderWithEmbeds(torch.nn.Module):
+    """Wraps the decoder so _build_embeds runs inside forward (DDP-visible)."""
+
+    def __init__(self, decoder, build_embeds_fn):
+        super().__init__()
+        self.decoder = decoder
+        self.build_embeds_fn = build_embeds_fn
+
+    def forward(self, input_ids, number_values, is_number_mask,
+                cls_embedding, attention_mask):
+        dec_embeds = self.build_embeds_fn(
+            input_ids, number_values, is_number_mask,
+            self.decoder._get_tok_embeddings(),
+            self.decoder.number_embedder,
+        )
+        return self.decoder(dec_embeds, cls_embedding, attention_mask)
+
+
 # ─── Model Loading ──────────────────────────────────────────────────────────
 
 def load_t5_model(checkpoint_path, device):
@@ -537,15 +555,9 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
                     mask_prob_max=args.mask_prob_max,
                 )
 
-                # Decoder forward
-                decoder = decoder_ddp.module
-                dec_embeds = model._build_embeds(
-                    m_ids, m_nums, m_num_mask,
-                    decoder._get_tok_embeddings(),
-                    decoder.number_embedder,
-                )
+                # Decoder forward (embed building inside DDP forward)
                 text_logits, mag_logits = decoder_ddp(
-                    dec_embeds, batch_cls, attn_mask)
+                    m_ids, m_nums, m_num_mask, batch_cls, attn_mask)
 
             # Loss in fp32
             text_logits = text_logits.float()
@@ -691,12 +703,13 @@ def main():
     log(f"\nLoading T5 model from {args.checkpoint}...")
     model, config = load_t5_model(args.checkpoint, device)
 
-    # Compile models before DDP wrapping
+    # Wrap decoder so embedding params are inside DDP's forward scope
+    decoder_wrapper = DecoderWithEmbeds(model.decoder, model._build_embeds)
     if args.compile:
-        log("Compiling encoder, decoder, and aggregator with torch.compile...")
+        log("Compiling encoder and decoder with torch.compile...")
         model.encoder = torch.compile(model.encoder, dynamic=True)
-        model.decoder = torch.compile(model.decoder, dynamic=True)
-    decoder_ddp = DDP(model.decoder, device_ids=[local_rank])
+        decoder_wrapper = torch.compile(decoder_wrapper, dynamic=True)
+    decoder_ddp = DDP(decoder_wrapper, device_ids=[local_rank])
 
     # Token info
     tok_info = get_token_info(PRETRAINED_ID)
@@ -745,7 +758,7 @@ def main():
             ckpt = torch.load(latest, map_location="cpu", weights_only=False)
             aggregator.module.load_state_dict(ckpt["aggregator"])
             if "decoder" in ckpt:
-                decoder_ddp.module.load_state_dict(ckpt["decoder"])
+                model.decoder.load_state_dict(ckpt["decoder"])
             optimizer.load_state_dict(ckpt["optimizer"])
             scheduler.load_state_dict(ckpt["scheduler"])
             start_epoch = ckpt["epoch"] + 1
@@ -784,7 +797,7 @@ def main():
         if is_rank0():
             ckpt = {
                 "aggregator": aggregator.module.state_dict(),
-                "decoder": decoder_ddp.module.state_dict(),
+                "decoder": model.decoder.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "epoch": epoch,
