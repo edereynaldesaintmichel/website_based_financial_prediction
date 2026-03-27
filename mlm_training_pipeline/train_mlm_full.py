@@ -42,8 +42,9 @@ def _get_create_masked_inputs():
     return create_masked_inputs
 
 
-CHUNK_MIN = 64
-CHUNK_MAX = 512
+CHUNK_MIN = 128
+CHUNK_MAX = 4096
+CHUNK_HARD_MAX = 8192  # absolute upper bound – no chunk may exceed this
 
 # Flash Attention is O(n) in memory but with a constant that grows with
 # sequence length.  We apply a mild quadratic penalty so that batches
@@ -81,22 +82,19 @@ def get_boundaries(input_ids, newline_ids):
     Returns sorted list of boundary positions.
     """
     content = input_ids[1:-1]  # strip CLS at 0 and SEP at -1
-    n = len(content)
 
-    # Build mask of positions inside tables
-    in_table = torch.zeros(n, dtype=torch.bool)
-    inside = False
-    for i in range(n):
-        tok = content[i].item()
-        if tok == TABLE_START_ID:
-            inside = True
-        if inside:
-            in_table[i] = True
-        if tok == TABLE_END_ID:
-            inside = False
+    # Build mask of positions inside tables using cumsum
+    starts = (content == TABLE_START_ID)
+    ends = (content == TABLE_END_ID)
+    # depth = cumsum(starts) - cumsum(ends shifted right by 1)
+    # A position is inside a table if depth > 0.
+    # TABLE_START itself is inside; TABLE_END itself is inside (cleared after).
+    depth = starts.long().cumsum(0) - ends.long().cumsum(0).roll(1, 0)
+    depth[0] = starts[0].long()  # fix rolled position
+    in_table = depth > 0
 
     # Newline mask (excluding inside-table positions)
-    nl_mask = torch.zeros(n, dtype=torch.bool)
+    nl_mask = torch.zeros_like(content, dtype=torch.bool)
     for nl_id in newline_ids:
         nl_mask |= (content == nl_id)
     nl_mask &= ~in_table
@@ -151,6 +149,11 @@ def chunk_document(doc, cls_id, sep_id, newline_ids):
                 end = content_len
         else:
             end = content_len
+
+        # Hard cap: no chunk may exceed CHUNK_HARD_MAX content tokens
+        # (+2 for CLS/SEP added later)
+        if end - pos > CHUNK_HARD_MAX - 2:
+            end = pos + CHUNK_HARD_MAX - 2
 
         spans.append((pos, end))
         pos = end
