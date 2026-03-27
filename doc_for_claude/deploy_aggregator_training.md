@@ -1,4 +1,4 @@
-# Remote Deployment Instructions — CLS Aggregator Training (4× RTX 5090)
+# Remote Deployment Instructions — CLS Aggregator Training (single B200)
 
 ## Prerequisites
 
@@ -21,7 +21,7 @@
    ```
    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
    ```
-   Expect 4× RTX 5090 with 32 GB each.
+   Expect 1× B200 with 192 GB.
 
 4. **Upload raw markdown documents** to the remote:
    ```
@@ -51,23 +51,23 @@
    Wait for this to complete before starting training.
 
 7. **Compute token budgets** based on available VRAM:
-   - The T5 model (~300M params) is replicated on each GPU, using ~2 GB in bf16.
+   - The T5 model (~300M params) uses ~2 GB in bf16.
    - The aggregator (~56M params) adds ~0.5 GB.
-   - That leaves ~29 GB per GPU for activations and batch data.
-   - Recommended starting point for 32 GB GPUs:
-     - `--encoder_token_budget 16384` (for CLS computation, no gradients)
-     - `--decoder_token_budget 8192` (for training, holds gradients)
+   - That leaves ~189 GB for activations and batch data.
+   - Recommended starting point for 192 GB B200:
+     - `--encoder_token_budget 65536` (for CLS computation, no gradients)
+     - `--decoder_token_budget 32768` (for training, holds gradients)
    - If OOM, halve `decoder_token_budget` first and double `grad_accum_steps` to compensate.
 
 8. **Give the user the training command** to run in their remote terminal:
    ```
-   cd /workspace/website_based_financial_prediction && torchrun --nproc_per_node=4 \
+   cd /workspace/website_based_financial_prediction && python \
        -m cls_aggregator_training_pipeline.train \
        --data /workspace/data/cls_aggregator/documents.pt \
        --checkpoint /workspace/data/t5_checkpoint/model_only.pt \
        --output_dir /workspace/checkpoints/cls_aggregator \
-       --encoder_token_budget 16384 \
-       --decoder_token_budget 8192 \
+       --encoder_token_budget 65536 \
+       --decoder_token_budget 32768 \
        --grad_accum_steps 1 \
        --lr 7e-5 \
        --epochs 3
@@ -85,13 +85,14 @@
 
 If training is interrupted, re-run the same command with `--resume`:
 ```
-torchrun --nproc_per_node=4 -m cls_aggregator_training_pipeline.train \
+cd /workspace/website_based_financial_prediction && python \
+   -m cls_aggregator_training_pipeline.train \
    --data /workspace/data/cls_aggregator/documents.pt \
    --checkpoint /workspace/data/t5_checkpoint/model_only.pt \
    --output_dir /workspace/checkpoints/cls_aggregator \
    --resume \
-   --encoder_token_budget 16384 \
-   --decoder_token_budget 8192 \
+   --encoder_token_budget 65536 \
+   --decoder_token_budget 32768 \
    --grad_accum_steps 1 \
    --lr 7e-5 \
    --epochs 3
@@ -101,6 +102,4 @@ torchrun --nproc_per_node=4 -m cls_aggregator_training_pipeline.train \
 
 - SSH connection details change daily — always provided by the user at the start of each session.
 - The remote instance is typically a vast.ai GPU instance with PyTorch + CUDA pre-installed.
-- Only rank 0 saves checkpoints and prints logs. Other ranks are silent.
 - The tokenization step (step 6) only needs to run once; the `.pt` file persists.
-- If the instance has fewer/more GPUs, adjust `--nproc_per_node` accordingly.

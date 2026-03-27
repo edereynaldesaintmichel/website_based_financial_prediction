@@ -702,7 +702,7 @@ def main():
                         help="Use torch.compile for kernel fusion")
     args = parser.parse_args()
 
-    device = torch.device("cuda")
+    device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
 
     random.seed(args.seed)
