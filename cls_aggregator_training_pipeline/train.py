@@ -12,8 +12,8 @@ Per epoch:
 
 Encoder and decoder are frozen. Only the aggregator is trained.
 
-Usage (multi-GPU):
-    torchrun --nproc_per_node=4 -m cls_aggregator_training_pipeline.train \
+Usage (single GPU):
+    python -m cls_aggregator_training_pipeline.train \
         --data cls_aggregator_data/documents.pt \
         --checkpoint checkpoints/t5_expanded_memory/model_only.pt
 """
@@ -26,9 +26,7 @@ import sys
 import time
 from collections import defaultdict, deque
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -41,36 +39,9 @@ from t5_style_training_pipeline.train import create_masked_inputs
 PRETRAINED_ID = "answerdotai/ModernBERT-base"
 
 
-def is_rank0():
-    return not dist.is_initialized() or dist.get_rank() == 0
-
-
-def log(msg):
-    if is_rank0():
-        print(msg)
-
-
 CHUNK_MIN = 128
 CHUNK_MAX = 1024
 MIN_TAIL_CHUNK = 16  # absorb trailing chunks shorter than this
-
-
-class DecoderWithEmbeds(torch.nn.Module):
-    """Wraps the decoder so _build_embeds runs inside forward (DDP-visible)."""
-
-    def __init__(self, decoder, build_embeds_fn):
-        super().__init__()
-        self.decoder = decoder
-        self.build_embeds_fn = build_embeds_fn
-
-    def forward(self, input_ids, number_values, is_number_mask,
-                cls_embedding, attention_mask):
-        dec_embeds = self.build_embeds_fn(
-            input_ids, number_values, is_number_mask,
-            self.decoder._get_tok_embeddings(),
-            self.decoder.number_embedder,
-        )
-        return self.decoder(dec_embeds, cls_embedding, attention_mask)
 
 
 # ─── Model Loading ──────────────────────────────────────────────────────────
@@ -96,8 +67,8 @@ def load_t5_model(checkpoint_path, device):
 
     n_enc = sum(p.numel() for p in model.encoder.parameters()) / 1e6
     n_dec = sum(p.numel() for p in model.decoder.parameters()) / 1e6
-    log(f"  Loaded T5 model: encoder {n_enc:.1f}M (frozen), "
-        f"decoder {n_dec:.1f}M (trainable)")
+    print(f"  Loaded T5 model: encoder {n_enc:.1f}M (frozen), "
+          f"decoder {n_dec:.1f}M (trainable)")
     return model, config
 
 
@@ -335,30 +306,16 @@ def pad_and_collate(chunks, pad_id):
 
 @torch.no_grad()
 def compute_all_cls(model, enc_chunks, device, token_budget, pad_id):
-    """Compute CLS embeddings for encoder chunks, sharded across ranks.
-
-    Each rank processes its slice of batches, then results are all-gathered
-    using tensor-based all_gather (not pickle-based all_gather_object).
+    """Compute CLS embeddings for all encoder chunks.
 
     Returns: dict of doc_idx → Tensor(N, D) on CPU.
     """
-    # Assign a flat index to each chunk so we can scatter/gather by position
-    for flat_idx, chunk in enumerate(enc_chunks):
-        chunk["_flat_idx"] = flat_idx
-    total_chunks = len(enc_chunks)
-
     batches = form_batches(enc_chunks, token_budget)
 
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    my_batches = batches[rank::world_size]
-
-    # Pre-allocate output tensor; detect hidden_size from first forward pass
     hidden_size = None
-    local_results = []  # list of (flat_idx, cls_vec)
+    results = {}  # flat_idx → cls_vec
 
-    pbar = tqdm(my_batches, desc="  CLS embeddings", unit="batch",
-                disable=not is_rank0())
+    pbar = tqdm(batches, desc="  CLS embeddings", unit="batch")
     for batch in pbar:
         ids, num_mask, num_vals, attn_mask = pad_and_collate(batch, pad_id)
         ids = ids.to(device)
@@ -381,41 +338,27 @@ def compute_all_cls(model, enc_chunks, device, token_budget, pad_id):
             hidden_size = cls_vecs.shape[1]
 
         for i, chunk in enumerate(batch):
-            local_results.append((chunk["_flat_idx"], cls_vecs[i]))
+            doc_idx = chunk["doc_idx"]
+            chunk_idx = chunk["chunk_idx"]
+            if doc_idx not in results:
+                results[doc_idx] = {}
+            results[doc_idx][chunk_idx] = cls_vecs[i]
 
     # Free GPU memory from encoder forward passes
     torch.cuda.empty_cache()
 
-    # All-gather via a flat CPU tensor, briefly moved to GPU for all_reduce
     if hidden_size is None:
         hidden_size = 768  # fallback
 
-    all_cls_tensor = torch.zeros(total_chunks, hidden_size)  # CPU
-    for flat_idx, vec in local_results:
-        all_cls_tensor[flat_idx] = vec
-    del local_results
-
-    if dist.is_initialized() and world_size > 1:
-        all_cls_tensor = all_cls_tensor.to(device)
-        dist.all_reduce(all_cls_tensor, op=dist.ReduceOp.SUM)
-        all_cls_tensor = all_cls_tensor.cpu()
-        torch.cuda.empty_cache()
-
-    # Assemble per-document, ordered by chunk_idx
-    doc_n = defaultdict(int)
-    for chunk in enc_chunks:
-        d, c = chunk["doc_idx"], chunk["chunk_idx"]
-        doc_n[d] = max(doc_n[d], c + 1)
-
+    # Assemble per-document tensors ordered by chunk_idx
     doc_cls = {}
-    for d, n in doc_n.items():
-        doc_cls[d] = torch.zeros(n, hidden_size)
+    for doc_idx, chunks_dict in results.items():
+        n = max(chunks_dict.keys()) + 1
+        tensor = torch.zeros(n, hidden_size)
+        for ci, vec in chunks_dict.items():
+            tensor[ci] = vec
+        doc_cls[doc_idx] = tensor
 
-    for chunk in enc_chunks:
-        d, c, fi = chunk["doc_idx"], chunk["chunk_idx"], chunk["_flat_idx"]
-        doc_cls[d][c] = all_cls_tensor[fi]
-
-    del all_cls_tensor
     return doc_cls
 
 
@@ -448,7 +391,7 @@ def compute_loss(text_logits, mag_logits, labels_text, labels_magnitude, config)
             + w_hi * log_p.gather(1, hi.unsqueeze(1)).squeeze(1)
         ).mean()
     else:
-        loss_mag = 0.0 * mag_logits.sum()  # keep in graph for DDP
+        loss_mag = 0.0 * mag_logits.sum()  # keep in graph
 
     return loss_text + loss_mag, loss_text, loss_mag
 
@@ -466,16 +409,16 @@ def get_cosine_schedule(optimizer, warmup_steps, total_steps):
 
 # ─── Epoch ──────────────────────────────────────────────────────────────────
 
-def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
+def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
               device, epoch, args, config, tok_info, training=True):
     """Run one training or validation epoch."""
     prefix = "Train" if training else "Val"
     if training:
         aggregator.train()
-        decoder_ddp.train()
+        decoder.train()
     else:
         aggregator.eval()
-        decoder_ddp.eval()
+        decoder.eval()
 
     # Fixed seed per epoch (deterministic for val)
     rng_state = random.getstate()
@@ -525,8 +468,8 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
     n_dec = len(all_dec_chunks)
     avg_enc = sum(c["seq_length"] for c in all_enc_chunks) / max(n_enc, 1)
     avg_dec = sum(c["seq_length"] for c in all_dec_chunks) / max(n_dec, 1)
-    log(f"  Chunks: {n_enc} encoder (avg {avg_enc:.0f}), "
-        f"{n_dec} decoder (avg {avg_dec:.0f})")
+    print(f"  Chunks: {n_enc} encoder (avg {avg_enc:.0f}), "
+          f"{n_dec} decoder (avg {avg_dec:.0f})")
 
     # ─── Step 2: Compute CLS embeddings (cached to disk) ────────────────
     cache_tag = "train" if training else "val"
@@ -534,7 +477,7 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
         args.output_dir, f"cls_cache_{cache_tag}_epoch{epoch}.pt")
 
     if os.path.exists(cls_cache_path):
-        log(f"  Loading cached CLS embeddings from {cls_cache_path}")
+        print(f"  Loading cached CLS embeddings from {cls_cache_path}")
         doc_cls = torch.load(cls_cache_path, map_location="cpu", weights_only=False)
         del all_enc_chunks
     else:
@@ -542,18 +485,17 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
         doc_cls = compute_all_cls(
             model, all_enc_chunks, device, args.encoder_token_budget, pad_id)
         del all_enc_chunks
-        if is_rank0():
-            torch.save(doc_cls, cls_cache_path)
-            log(f"  Cached CLS embeddings to {cls_cache_path}")
+        torch.save(doc_cls, cls_cache_path)
+        print(f"  Cached CLS embeddings to {cls_cache_path}")
     torch.cuda.empty_cache()
 
-    # ─── Step 3: 2D bucketing (dec_len × n_cls), form batches, shard ────
+    # ─── Step 3: 2D bucketing (dec_len × n_cls), form batches ───────────
     avg_cls_per_doc = n_enc / max(len(doc_enc_spans), 1)
     batch_budget = (DEC_COST_WEIGHT * args.decoder_token_budget
                     + AGG_COST_WEIGHT * avg_cls_per_doc)
-    log(f"  Batch budget: {batch_budget:.0f} "
-        f"(avg {avg_cls_per_doc:.1f} CLS/doc)")
-    all_dec_batches = form_batches_2d(all_dec_chunks, batch_budget)
+    print(f"  Batch budget: {batch_budget:.0f} "
+          f"(avg {avg_cls_per_doc:.1f} CLS/doc)")
+    dec_batches = form_batches_2d(all_dec_chunks, batch_budget)
     del all_dec_chunks
 
     # Padding waste estimation
@@ -561,7 +503,7 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
     total_dec_padded = 0
     total_agg_useful = 0
     total_agg_padded = 0
-    for batch in all_dec_batches:
+    for batch in dec_batches:
         # Decoder: each chunk padded to max length in batch
         max_dec = max(c["seq_length"] for c in batch)
         total_dec_useful += sum(c["seq_length"] for c in batch)
@@ -581,17 +523,10 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
         / max(DEC_COST_WEIGHT * total_dec_padded
               + AGG_COST_WEIGHT * total_agg_padded, 1)
     )
-    log(f"  Padding waste: decoder {dec_waste:.1%}, "
-        f"aggregator {agg_waste:.1%}, "
-        f"weighted {weighted_waste:.1%}")
-
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    # Equalize batch counts across ranks (drop at most 1 batch)
-    n_per_rank = len(all_dec_batches) // world_size
-    dec_batches = all_dec_batches[rank::world_size][:n_per_rank]
-    log(f"  {len(all_dec_batches)} decoder batches total, "
-        f"{n_per_rank} per rank")
+    print(f"  Padding waste: decoder {dec_waste:.1%}, "
+          f"aggregator {agg_waste:.1%}, "
+          f"weighted {weighted_waste:.1%}")
+    print(f"  {len(dec_batches)} decoder batches")
 
     # ─── Step 4: Train/eval on decoder batches ──────────────────────────
     total_loss = 0.0
@@ -612,8 +547,7 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
         optimizer.zero_grad()
 
     try:
-        pbar = tqdm(dec_batches, desc=f"  {prefix}", unit="batch",
-                    disable=not is_rank0())
+        pbar = tqdm(dec_batches, desc=f"  {prefix}", unit="batch")
         for batch_idx, batch_chunks in enumerate(pbar):
             # Aggregator: batched forward over unique documents
             doc_indices = list(set(c["doc_idx"] for c in batch_chunks))
@@ -652,9 +586,14 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
                     mask_prob_max=args.mask_prob_max,
                 )
 
-                # Decoder forward (embed building inside DDP forward)
-                text_logits, mag_logits = decoder_ddp(
-                    m_ids, m_nums, m_num_mask, batch_cls, attn_mask)
+                # Build decoder embeddings and forward
+                dec_embeds = model._build_embeds(
+                    m_ids, m_nums, m_num_mask,
+                    decoder._get_tok_embeddings(),
+                    decoder.number_embedder,
+                )
+                text_logits, mag_logits = decoder(
+                    dec_embeds, batch_cls, attn_mask)
 
             # Loss in fp32
             text_logits = text_logits.float()
@@ -664,17 +603,12 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
 
             if training:
                 accum_count += 1
-                is_sync_step = accum_count % args.grad_accum_steps == 0
-                if is_sync_step:
-                    (loss / args.grad_accum_steps).backward()
-                else:
-                    with aggregator.no_sync(), decoder_ddp.no_sync():
-                        (loss / args.grad_accum_steps).backward()
+                (loss / args.grad_accum_steps).backward()
 
-                if is_sync_step:
+                if accum_count % args.grad_accum_steps == 0:
                     torch.nn.utils.clip_grad_norm_(
                         list(aggregator.parameters()) +
-                        list(decoder_ddp.parameters()),
+                        list(decoder.parameters()),
                         args.max_grad_norm)
                     optimizer.step()
                     scheduler.step()
@@ -709,16 +643,11 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
                     pbar.set_postfix(
                         text=f"{ma_lt:.3f}", mag=f"{ma_lm:.3f}")
 
-        # Flush remaining accumulated gradients (all ranks have same count,
-        # so either all flush or none)
+        # Flush remaining accumulated gradients
         if training and accum_count % args.grad_accum_steps != 0:
-            # Manual allreduce since we used no_sync for these steps
-            for p in list(aggregator.parameters()) + list(decoder_ddp.parameters()):
-                if p.grad is not None:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
             torch.nn.utils.clip_grad_norm_(
                 list(aggregator.parameters()) +
-                list(decoder_ddp.parameters()),
+                list(decoder.parameters()),
                 args.max_grad_norm)
             optimizer.step()
             scheduler.step()
@@ -727,17 +656,6 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
     finally:
         torch.set_grad_enabled(prev_grad)
         random.setstate(rng_state)
-
-    # Reduce metrics across ranks
-    if dist.is_initialized() and dist.get_world_size() > 1:
-        stats = torch.tensor(
-            [total_loss, total_loss_text, total_loss_mag,
-             total_correct, total_masked, n_batches],
-            dtype=torch.float64, device=device)
-        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-        total_loss, total_loss_text, total_loss_mag, \
-            total_correct, total_masked, n_batches = stats.tolist()
-        n_batches = int(n_batches)
 
     avg_loss = total_loss / max(n_batches, 1)
     avg_lt = total_loss_text / max(n_batches, 1)
@@ -784,66 +702,57 @@ def main():
                         help="Use torch.compile for kernel fusion")
     args = parser.parse_args()
 
-    # Distributed setup
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    device = torch.device(f"cuda:{local_rank}")
+    device = torch.device("cuda")
     torch.cuda.set_device(device)
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.set_float32_matmul_precision("high")
 
-    log(f"World size: {dist.get_world_size()}, device: {device}")
+    print(f"Device: {device}")
 
     # Load T5 model (encoder frozen, decoder trainable)
-    log(f"\nLoading T5 model from {args.checkpoint}...")
+    print(f"\nLoading T5 model from {args.checkpoint}...")
     model, config = load_t5_model(args.checkpoint, device)
 
-    # Wrap decoder so embedding params are inside DDP's forward scope
-    decoder_wrapper = DecoderWithEmbeds(model.decoder, model._build_embeds)
+    decoder = model.decoder
     if args.compile:
-        log("Compiling encoder and decoder with torch.compile...")
+        print("Compiling encoder and decoder with torch.compile...")
         model.encoder = torch.compile(model.encoder, dynamic=True)
-        decoder_wrapper = torch.compile(decoder_wrapper, dynamic=True)
-    decoder_ddp = DDP(decoder_wrapper, device_ids=[local_rank])
+        decoder = torch.compile(decoder, dynamic=True)
 
     # Token info
     tok_info = get_token_info(PRETRAINED_ID)
 
     # Load documents
-    log(f"\nLoading documents from {args.data}...")
+    print(f"\nLoading documents from {args.data}...")
     documents = torch.load(args.data, map_location="cpu", weights_only=False)
     train_docs, val_docs = split_documents(documents, args.val_ratio)
     del documents
-    log(f"  {len(train_docs)} train, {len(val_docs)} val documents")
+    print(f"  {len(train_docs)} train, {len(val_docs)} val documents")
 
-    # Build aggregator (compile then wrap in DDP)
+    # Build aggregator
     aggregator = CLSAggregator(
         hidden_size=args.agg_hidden,
         num_heads=args.agg_heads,
         num_layers=args.agg_layers,
         dropout=args.agg_dropout,
     ).to(device)
-    aggregator = DDP(aggregator, device_ids=[local_rank])
     n_agg = sum(p.numel() for p in aggregator.parameters()) / 1e6
-    log(f"\nAggregator: {n_agg:.1f}M params (DDP)")
+    print(f"\nAggregator: {n_agg:.1f}M params")
 
     # Optimizer & schedule (separate LR for decoder)
     optimizer = torch.optim.AdamW([
         {"params": aggregator.parameters(), "lr": args.lr},
-        {"params": decoder_ddp.parameters(), "lr": args.decoder_lr},
+        {"params": decoder.parameters(), "lr": args.decoder_lr},
     ], weight_decay=args.weight_decay)
 
-    world_size = dist.get_world_size()
     total_content = sum(len(d["input_ids"]) - 2 for d in train_docs)
     est_batches = total_content / args.decoder_token_budget
-    est_batches_per_rank = est_batches / world_size
-    total_steps = int(est_batches_per_rank * args.epochs / args.grad_accum_steps)
+    total_steps = int(est_batches * args.epochs / args.grad_accum_steps)
 
     scheduler = get_cosine_schedule(optimizer, args.warmup_steps, total_steps)
-    log(f"Estimated ~{est_batches:.0f} batches/epoch "
-        f"({est_batches_per_rank:.0f}/rank), {total_steps} total steps")
+    print(f"Estimated ~{est_batches:.0f} batches/epoch, {total_steps} total steps")
 
     # Resume
     start_epoch = 0
@@ -853,64 +762,58 @@ def main():
         latest = os.path.join(args.output_dir, "latest.pt")
         if os.path.exists(latest):
             ckpt = torch.load(latest, map_location="cpu", weights_only=False)
-            aggregator.module.load_state_dict(ckpt["aggregator"])
+            aggregator.load_state_dict(ckpt["aggregator"])
             if "decoder" in ckpt:
                 model.decoder.load_state_dict(ckpt["decoder"])
             optimizer.load_state_dict(ckpt["optimizer"])
             scheduler.load_state_dict(ckpt["scheduler"])
             start_epoch = ckpt["epoch"] + 1
-            log(f"Resumed from epoch {start_epoch}")
+            print(f"Resumed from epoch {start_epoch}")
             del ckpt
 
     # Training loop
     for epoch in range(start_epoch, args.epochs):
-        log(f"\n{'='*70}")
-        log(f"Epoch {epoch + 1}/{args.epochs}")
-        log(f"{'='*70}")
+        print(f"\n{'='*70}")
+        print(f"Epoch {epoch + 1}/{args.epochs}")
+        print(f"{'='*70}")
 
         # Train
         t0 = time.time()
         train_m = run_epoch(
-            aggregator, decoder_ddp, model, train_docs, optimizer, scheduler,
+            aggregator, decoder, model, train_docs, optimizer, scheduler,
             device, epoch, args, config, tok_info, training=True)
         t_train = time.time() - t0
 
-        log(f"\n  Train: loss={train_m['loss']:.4f} "
-            f"(text={train_m['loss_text']:.4f}, mag={train_m['loss_mag']:.4f}) "
-            f"acc={train_m['text_acc']:.1%} [{t_train:.0f}s]")
+        print(f"\n  Train: loss={train_m['loss']:.4f} "
+              f"(text={train_m['loss_text']:.4f}, mag={train_m['loss_mag']:.4f}) "
+              f"acc={train_m['text_acc']:.1%} [{t_train:.0f}s]")
 
         # Validate
         t0 = time.time()
         val_m = run_epoch(
-            aggregator, decoder_ddp, model, val_docs, optimizer, scheduler,
+            aggregator, decoder, model, val_docs, optimizer, scheduler,
             device, epoch, args, config, tok_info, training=False)
         t_val = time.time() - t0
 
-        log(f"  Val:   loss={val_m['loss']:.4f} "
-            f"(text={val_m['loss_text']:.4f}, mag={val_m['loss_mag']:.4f}) "
-            f"acc={val_m['text_acc']:.1%} [{t_val:.0f}s]")
+        print(f"  Val:   loss={val_m['loss']:.4f} "
+              f"(text={val_m['loss_text']:.4f}, mag={val_m['loss_mag']:.4f}) "
+              f"acc={val_m['text_acc']:.1%} [{t_val:.0f}s]")
 
-        # Save checkpoint (rank 0 only, unwrapped state dict)
-        if is_rank0():
-            ckpt = {
-                "aggregator": aggregator.module.state_dict(),
-                "decoder": model.decoder.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "epoch": epoch,
-                "train_metrics": train_m,
-                "val_metrics": val_m,
-                "args": vars(args),
-            }
-            torch.save(ckpt, os.path.join(args.output_dir, "latest.pt"))
-            torch.save(ckpt, os.path.join(
-                args.output_dir, f"epoch_{epoch + 1}.pt"))
-            log(f"  Saved checkpoint: epoch_{epoch + 1}.pt")
-
-        # Barrier so all ranks wait for checkpoint save before next epoch
-        dist.barrier()
-
-    dist.destroy_process_group()
+        # Save checkpoint
+        ckpt = {
+            "aggregator": aggregator.state_dict(),
+            "decoder": model.decoder.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": epoch,
+            "train_metrics": train_m,
+            "val_metrics": val_m,
+            "args": vars(args),
+        }
+        torch.save(ckpt, os.path.join(args.output_dir, "latest.pt"))
+        torch.save(ckpt, os.path.join(
+            args.output_dir, f"epoch_{epoch + 1}.pt"))
+        print(f"  Saved checkpoint: epoch_{epoch + 1}.pt")
 
 
 if __name__ == "__main__":
