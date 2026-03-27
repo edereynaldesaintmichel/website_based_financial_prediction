@@ -72,17 +72,12 @@ def get_boundaries_table_aware(input_ids, newline_ids):
     content = input_ids[1:-1]  # strip CLS at 0 and SEP at -1
     n = len(content)
 
-    # Build a mask of positions that are inside a table
-    in_table = torch.zeros(n, dtype=torch.bool)
-    inside = False
-    for i in range(n):
-        tid = content[i].item()
-        if tid == TABLE_START_ID:
-            inside = True
-        if inside:
-            in_table[i] = True
-        if tid == TABLE_END_ID:
-            inside = False
+    # Build mask of positions inside tables using cumsum
+    starts = (content == TABLE_START_ID)
+    ends = (content == TABLE_END_ID)
+    depth = starts.long().cumsum(0) - ends.long().cumsum(0).roll(1, 0)
+    depth[0] = starts[0].long()
+    in_table = depth > 0
 
     # Find newline positions that are NOT inside a table
     nl_mask = torch.zeros(n, dtype=torch.bool)
