@@ -575,8 +575,11 @@ def train(args):
         ckpt_file = os.path.join(args.resume_from, "full_model.pt")
         print(f"Resuming from {ckpt_file}...")
         ckpt = torch.load(ckpt_file, map_location=device, weights_only=False)
-        state_dict = {k.replace("_orig_mod.", ""): v
-                      for k, v in ckpt["model_state_dict"].items()}
+        state_dict = ckpt["model_state_dict"]
+        # Strip _orig_mod. prefix only if model is not compiled
+        if not args.compile:
+            state_dict = {k.replace("_orig_mod.", ""): v
+                          for k, v in state_dict.items()}
         model.load_state_dict(state_dict)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
