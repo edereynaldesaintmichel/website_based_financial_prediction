@@ -24,7 +24,7 @@
 4. **Upload `documents.pt`** to the remote:
    ```
    rsync -avz --progress -e "ssh -p <PORT>" \
-       cls_aggregator_data/documents.pt \
+       mlm_data/documents.pt \
        root@<HOST>:/workspace/data/cls_aggregator/documents.pt
    ```
 

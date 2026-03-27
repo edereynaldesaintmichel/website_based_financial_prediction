@@ -122,15 +122,14 @@ def main():
             unit="doc",
         ):
             if result is not None:
+                # Convert to tensors immediately to avoid keeping Python lists
+                # (a Python list of ints uses ~28 bytes/element vs 4 bytes for int32)
+                result["input_ids"] = torch.tensor(result["input_ids"], dtype=torch.int32)
+                result["is_number_mask"] = torch.tensor(result["is_number_mask"], dtype=torch.bool)
+                result["number_values"] = torch.tensor(result["number_values"], dtype=torch.float32)
                 documents.append(result)
                 total_tokens += result["seq_length"]
                 lengths.append(result["seq_length"])
-
-    # Convert to tensors in the main process (avoids fd-sharing across workers)
-    for doc in documents:
-        doc["input_ids"] = torch.tensor(doc["input_ids"], dtype=torch.long)
-        doc["is_number_mask"] = torch.tensor(doc["is_number_mask"], dtype=torch.bool)
-        doc["number_values"] = torch.tensor(doc["number_values"], dtype=torch.float32)
 
     # Sort by source_file for reproducibility
     documents.sort(key=lambda d: d["source_file"])

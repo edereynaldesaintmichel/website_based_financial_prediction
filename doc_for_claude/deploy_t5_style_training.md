@@ -23,7 +23,7 @@
 4. **Upload `documents.pt`** (only if not already present on the remote):
    ```
    ssh -p <PORT> root@<HOST> "ls /workspace/data/documents.pt" 2>/dev/null || \
-     rsync -avz --progress -e "ssh -p <PORT>" cls_aggregator_data/documents.pt root@<HOST>:/workspace/data/documents.pt
+     rsync -avz --progress -e "ssh -p <PORT>" mlm_data/documents.pt root@<HOST>:/workspace/data/documents.pt
    ```
 
 5. **Upload encoder checkpoint** to remote `/workspace/data/encoder_checkpoint/`:
