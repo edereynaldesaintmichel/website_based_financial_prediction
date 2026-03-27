@@ -386,7 +386,7 @@ def compute_loss(text_logits, mag_logits, labels_text, labels_magnitude, config)
             + w_hi * log_p.gather(1, hi.unsqueeze(1)).squeeze(1)
         ).mean()
     else:
-        loss_mag = torch.tensor(0.0, device=text_logits.device)
+        loss_mag = 0.0 * mag_logits.sum()  # keep in graph for DDP
 
     return loss_text + loss_mag, loss_text, loss_mag
 
