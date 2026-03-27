@@ -249,6 +249,68 @@ def form_batches_shuffled(items, token_budget, bucket_width=16):
     return all_batches
 
 
+AGG_COST_WEIGHT = 6    # relative memory cost per aggregator token
+DEC_COST_WEIGHT = 30   # relative memory cost per decoder token
+
+
+def form_batches_2d(items, budget, bucket_width=16):
+    """Batch decoder chunks using 2D bucketing (dec_len × n_cls).
+
+    Groups chunks from the same document together and accounts for
+    aggregator memory cost (per unique document) separately from
+    decoder memory cost (per chunk).
+
+    Budget constraint per batch:
+        AGG_COST_WEIGHT * n_unique_docs * max_n_cls
+        + DEC_COST_WEIGHT * n_chunks * max_dec_len ≤ budget
+
+    Each item must have 'seq_length', 'n_cls', and 'doc_idx' fields.
+    """
+    # Bucket by decoder length (rows)
+    buckets = defaultdict(list)
+    for item in items:
+        key = (item["seq_length"] + bucket_width - 1) // bucket_width * bucket_width
+        buckets[key].append(item)
+
+    all_batches = []
+    for bucket_dec_len, bucket_items in buckets.items():
+        # Sort by (n_cls, doc_idx) — groups same-doc chunks, orders by agg cost
+        bucket_items.sort(key=lambda c: (c["n_cls"], c["doc_idx"]))
+
+        # Greedily form batches
+        current_batch = []
+        current_docs = set()
+        current_max_n_cls = 0
+
+        for chunk in bucket_items:
+            doc_idx = chunk["doc_idx"]
+            n_cls = chunk["n_cls"]
+
+            # Cost if we add this chunk
+            new_unique = len(current_docs | {doc_idx})
+            new_max_n_cls = max(current_max_n_cls, n_cls)
+            new_n_chunks = len(current_batch) + 1
+
+            cost = (AGG_COST_WEIGHT * new_unique * new_max_n_cls
+                    + DEC_COST_WEIGHT * new_n_chunks * bucket_dec_len)
+
+            if current_batch and cost > budget:
+                all_batches.append(current_batch)
+                current_batch = [chunk]
+                current_docs = {doc_idx}
+                current_max_n_cls = n_cls
+            else:
+                current_batch.append(chunk)
+                current_docs.add(doc_idx)
+                current_max_n_cls = new_max_n_cls
+
+        if current_batch:
+            all_batches.append(current_batch)
+
+    random.shuffle(all_batches)
+    return all_batches
+
+
 def pad_and_collate(chunks, pad_id):
     """Pad and stack chunk dicts into batch tensors."""
     max_len = max(c["seq_length"] for c in chunks)
@@ -452,9 +514,11 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
         # Decoder: random target per chunk
         dec_spans = chunk_spans(
             content_len, boundaries, lambda: random.randint(CHUNK_MIN, CHUNK_MAX))
+        n_cls = len(enc_spans)
         for ci, (s, e) in enumerate(dec_spans):
             chunk = extract_chunk(doc, s, e, cls_id, sep_id)
             chunk["doc_idx"] = doc_idx
+            chunk["n_cls"] = n_cls
             all_dec_chunks.append(chunk)
 
     n_enc = len(all_enc_chunks)
@@ -483,10 +547,43 @@ def run_epoch(aggregator, decoder_ddp, model, documents, optimizer, scheduler,
             log(f"  Cached CLS embeddings to {cls_cache_path}")
     torch.cuda.empty_cache()
 
-    # ─── Step 3: Bucket decoder chunks, form shuffled batches, shard ────
-    all_dec_batches = form_batches_shuffled(
-        all_dec_chunks, args.decoder_token_budget)
+    # ─── Step 3: 2D bucketing (dec_len × n_cls), form batches, shard ────
+    avg_cls_per_doc = n_enc / max(len(doc_enc_spans), 1)
+    batch_budget = (DEC_COST_WEIGHT * args.decoder_token_budget
+                    + AGG_COST_WEIGHT * avg_cls_per_doc)
+    log(f"  Batch budget: {batch_budget:.0f} "
+        f"(avg {avg_cls_per_doc:.1f} CLS/doc)")
+    all_dec_batches = form_batches_2d(all_dec_chunks, batch_budget)
     del all_dec_chunks
+
+    # Padding waste estimation
+    total_dec_useful = 0
+    total_dec_padded = 0
+    total_agg_useful = 0
+    total_agg_padded = 0
+    for batch in all_dec_batches:
+        # Decoder: each chunk padded to max length in batch
+        max_dec = max(c["seq_length"] for c in batch)
+        total_dec_useful += sum(c["seq_length"] for c in batch)
+        total_dec_padded += max_dec * len(batch)
+        # Aggregator: unique docs padded to max n_cls in batch
+        docs = {}
+        for c in batch:
+            docs[c["doc_idx"]] = c["n_cls"]
+        max_cls = max(docs.values())
+        total_agg_useful += sum(docs.values())
+        total_agg_padded += max_cls * len(docs)
+    dec_waste = 1.0 - total_dec_useful / max(total_dec_padded, 1)
+    agg_waste = 1.0 - total_agg_useful / max(total_agg_padded, 1)
+    weighted_waste = (
+        (DEC_COST_WEIGHT * (total_dec_padded - total_dec_useful)
+         + AGG_COST_WEIGHT * (total_agg_padded - total_agg_useful))
+        / max(DEC_COST_WEIGHT * total_dec_padded
+              + AGG_COST_WEIGHT * total_agg_padded, 1)
+    )
+    log(f"  Padding waste: decoder {dec_waste:.1%}, "
+        f"aggregator {agg_waste:.1%}, "
+        f"weighted {weighted_waste:.1%}")
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
