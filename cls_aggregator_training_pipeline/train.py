@@ -689,7 +689,7 @@ def main():
     parser.add_argument("--decoder_token_budget", type=int, default=16384)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--mask_prob_min", type=float, default=0.15)
-    parser.add_argument("--mask_prob_max", type=float, default=0.50)
+    parser.add_argument("--mask_prob_max", type=float, default=0.85)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
