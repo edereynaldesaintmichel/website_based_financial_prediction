@@ -4,163 +4,445 @@ Full-parameter MLM training for FinancialModernBert (no LoRA).
 Trains ALL parameters of the ModernBERT backbone, number embedder, and
 number head.
 
-To mitigate catastrophic forgetting, regularization data (.txt source files)
-is interleaved with financial data (.md source files) at a configurable ratio.
-Both go through the same chunk → tokenize → bucket pipeline.
+Data preparation produces whole-document tokenizations (documents.pt).
+At the start of each epoch, documents are chunked with random boundaries
+and variable lengths, then sorted by length and batched by token budget.
+
+Wikipedia regularization documents (.txt source files) are interleaved
+with financial data (.md source files) at a configurable ratio.
 
 Usage:
-    python -m training_pipeline.train_mlm_full \
-        --data_dir training_data/bucketed \
-        --tokens_per_batch 4096 \
+    python -m mlm_training_pipeline.train_mlm_full \
+        --data mlm_data/documents.pt \
+        --tokens_per_batch 8192 \
         --epochs 3 \
-        --lr 5e-5 \
-        --regularization_ratio 0.3
+        --lr 5e-5
 """
 import argparse
+import bisect
 import math
 import os
 import random
 import sys
 import time
-from collections import deque
-from pathlib import Path
+from collections import defaultdict, deque
 
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler, ConcatDataset
+import torch.nn.functional as F
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from financial_bert import build_model, FinancialBertTokenizer
-from split_utils import is_val_document
+from financial_bert import build_model, FinancialBertTokenizer, TABLE_START_ID, TABLE_END_ID
+from split_utils import split_documents, is_val_document
 
 
-# ---------------------------------------------------------------------------
-# Dataset — bucketed MLM
-# ---------------------------------------------------------------------------
+def _get_create_masked_inputs():
+    """Lazy import to avoid circular import chain."""
+    from t5_style_training_pipeline.train import create_masked_inputs
+    return create_masked_inputs
 
-class BucketedMLMDataset(Dataset):
-    """Loads pre-padded tensors from a single bucket .pt file.
 
-    Expects the format produced by bucket_by_length.py:
-        input_ids:      (N, pad_to)    int32
-        is_number_mask: (N, pad_to)    int8
-        number_values:  (N, pad_to)    float32
-        source_files:   [str, ...]
-        pad_to:         int
+CHUNK_MIN = 64
+CHUNK_MAX = 512
+
+# Flash Attention is O(n) in memory but with a constant that grows with
+# sequence length.  We apply a mild quadratic penalty so that batches
+# with longer sequences get a slightly smaller token budget, preventing
+# OOM on the longest-chunk batches.
+# Effective budget = base_budget / (1 + LENGTH_PENALTY * (max_len / CHUNK_MAX))
+LENGTH_PENALTY = 0.15
+
+
+# ─── Token info ──────────────────────────────────────────────────────────────
+
+def get_token_info(pretrained_id):
+    """Extract special token IDs needed for training."""
+    tokenizer = FinancialBertTokenizer(pretrained_id)
+    base = tokenizer.base_tokenizer
+    newline_ids = set(base.encode("\n", add_special_tokens=False))
+    info = {
+        "cls_id": base.cls_token_id,
+        "sep_id": base.sep_token_id,
+        "pad_id": base.pad_token_id,
+        "mask_id": tokenizer.mask_token_id,
+        "newline_ids": newline_ids,
+    }
+    del tokenizer
+    return info
+
+
+# ─── Chunking ────────────────────────────────────────────────────────────────
+
+def get_boundaries(input_ids, newline_ids):
+    """Find chunk boundary candidates: positions after newline tokens,
+    excluding newlines that fall inside TABLE_START..TABLE_END regions.
+
+    Works in content space (CLS/SEP stripped: position 0 = first content token).
+    Returns sorted list of boundary positions.
     """
+    content = input_ids[1:-1]  # strip CLS at 0 and SEP at -1
+    n = len(content)
 
-    def __init__(self, pt_path: str, mask_prob: float = 0.15,
-                 pad_token_id: int = 0, mask_token_id: int = 50264,
-                 magnitude_min: float = -12.0, magnitude_max: float = 12.0):
-        data = torch.load(pt_path, map_location="cpu", weights_only=False)
-        self.input_ids = data["input_ids"]            # (N, pad_to) int32
-        self.is_number_mask = data["is_number_mask"]   # (N, pad_to) int8
-        self.number_values = data["number_values"]     # (N, pad_to) float32
-        self.source_files = data["source_files"]       # list[str]
-        self.pad_to = data["pad_to"]
-        self.mask_prob = mask_prob
-        self.pad_token_id = pad_token_id
-        self.mask_token_id = mask_token_id
-        self.magnitude_min = magnitude_min
-        self.magnitude_max = magnitude_max
+    # Build mask of positions inside tables
+    in_table = torch.zeros(n, dtype=torch.bool)
+    inside = False
+    for i in range(n):
+        tok = content[i].item()
+        if tok == TABLE_START_ID:
+            inside = True
+        if inside:
+            in_table[i] = True
+        if tok == TABLE_END_ID:
+            inside = False
 
-    def __len__(self):
-        return self.input_ids.shape[0]
+    # Newline mask (excluding inside-table positions)
+    nl_mask = torch.zeros(n, dtype=torch.bool)
+    for nl_id in newline_ids:
+        nl_mask |= (content == nl_id)
+    nl_mask &= ~in_table
 
-    def __getitem__(self, idx):
-        input_ids = self.input_ids[idx].to(torch.long).clone()
-        is_number_mask = self.is_number_mask[idx].float()
-        number_values = self.number_values[idx].clone()
-        attention_mask = (input_ids != self.pad_token_id).long()
-        seq_len = attention_mask.sum().item()
-
-        # Create MLM labels and masked input
-        labels_text = torch.full((self.pad_to,), -100, dtype=torch.long)
-        labels_magnitude = torch.full((self.pad_to,), -100.0, dtype=torch.float)
-        masked_input_ids = input_ids.clone()
-
-        for i in range(seq_len):
-            if is_number_mask[i] == 1:
-                labels_magnitude[i] = number_values[i].item()
-                if random.random() < self.mask_prob:
-                    r = random.random()
-                    if r < 0.8:
-                        number_values[i] = self.magnitude_max + 1
-                    elif r < 0.9:
-                        number_values[i] = random.uniform(self.magnitude_min, self.magnitude_max)
-            elif attention_mask[i] == 1:
-                if random.random() < self.mask_prob:
-                    labels_text[i] = input_ids[i]
-                    r = random.random()
-                    if r < 0.8:
-                        masked_input_ids[i] = self.mask_token_id
-                    elif r < 0.9:
-                        masked_input_ids[i] = random.randint(0, 50263)
-
-        return {
-            "input_ids": masked_input_ids,
-            "attention_mask": attention_mask,
-            "is_number_mask": is_number_mask,
-            "number_values": number_values,
-            "labels_text": labels_text,
-            "labels_magnitude": labels_magnitude,
-        }
+    # Boundary = position AFTER the newline (start of next chunk)
+    return (nl_mask.nonzero(as_tuple=False).squeeze(-1) + 1).tolist()
 
 
-# ---------------------------------------------------------------------------
-# Multi-bucket sampler (same as train_mlm_full.py)
-# ---------------------------------------------------------------------------
-
-def compute_batch_size(bucket_len: int, tokens_per_batch: int, min_batch: int = 1) -> int:
-    return max(min_batch, tokens_per_batch // bucket_len)
-
-
-class MultiBucketBatchSampler(Sampler):
-    """Yields batches from the same bucket with dynamic batch sizes."""
-
-    def __init__(self, bucket_info: dict, tokens_per_batch: int, min_batch: int = 1):
-        self.bucket_info = bucket_info
-        self.tokens_per_batch = tokens_per_batch
-        self.min_batch = min_batch
-        self._total_batches = 0
-        self._batch_sizes = {}
-        for name, (indices, pad_to) in bucket_info.items():
-            bs = compute_batch_size(pad_to, tokens_per_batch, min_batch)
-            self._batch_sizes[name] = bs
-            self._total_batches += (len(indices) + bs - 1) // bs
-
-    def __iter__(self):
-        all_batches = []
-        for name, (indices, _pad_to) in self.bucket_info.items():
-            bs = self._batch_sizes[name]
-            shuffled = list(indices)
-            random.shuffle(shuffled)
-            for i in range(0, len(shuffled), bs):
-                all_batches.append(shuffled[i:i + bs])
-        random.shuffle(all_batches)
-        yield from all_batches
-
-    def __len__(self):
-        return self._total_batches
-
-    def summary(self) -> str:
-        lines = []
-        for name, (indices, pad_to) in self.bucket_info.items():
-            bs = self._batch_sizes[name]
-            count = len(indices)
-            n_batches = (count + bs - 1) // bs
-            lines.append(f"  {name}: pad_to={pad_to}, batch_size={bs}, "
-                         f"~{bs * pad_to} tokens/batch, {n_batches} batches")
-        return "\n".join(lines)
+def snap_to_boundary(target, boundaries, min_pos):
+    """Snap a target position to the nearest boundary candidate."""
+    if not boundaries:
+        return target
+    idx = bisect.bisect_left(boundaries, target)
+    candidates = []
+    if idx > 0 and boundaries[idx - 1] > min_pos:
+        candidates.append(boundaries[idx - 1])
+    if idx < len(boundaries):
+        candidates.append(boundaries[idx])
+    if not candidates:
+        return target
+    return min(candidates, key=lambda b: abs(b - target))
 
 
-def variable_length_collate(batch):
-    return {key: torch.stack([item[key] for item in batch]) for key in batch[0]}
+MIN_TAIL_CHUNK = 16  # absorb trailing chunks shorter than this
 
 
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
+def chunk_document(doc, cls_id, sep_id, newline_ids):
+    """Chunk a single document into variable-length pieces.
+
+    Each chunk gets CLS prepended and SEP appended.
+    Chunk target sizes are random per chunk.
+    """
+    content_len = len(doc["input_ids"]) - 2  # strip CLS/SEP
+    if content_len < 1:
+        return []
+
+    boundaries = get_boundaries(doc["input_ids"], newline_ids)
+
+    # Generate chunk spans with random target per chunk
+    spans = []
+    pos = 0
+    while pos < content_len:
+        target = random.randint(CHUNK_MIN, CHUNK_MAX)
+        raw_end = min(pos + target, content_len)
+
+        if raw_end < content_len:
+            end = snap_to_boundary(raw_end, boundaries, pos)
+            if end <= pos:
+                end = min(pos + target, content_len)
+            # Absorb tiny tail
+            if content_len - end < MIN_TAIL_CHUNK:
+                end = content_len
+        else:
+            end = content_len
+
+        spans.append((pos, end))
+        pos = end
+
+    # Extract chunks with CLS/SEP wrapping
+    chunks = []
+    for start, end in spans:
+        offset = 1 + start  # +1 to skip document CLS
+        length = end - start
+
+        c_ids = doc["input_ids"][offset:offset + length]
+        c_mask = doc["is_number_mask"][offset:offset + length]
+        c_vals = doc["number_values"][offset:offset + length]
+
+        chunk_ids = torch.cat([
+            torch.tensor([cls_id], dtype=c_ids.dtype), c_ids,
+            torch.tensor([sep_id], dtype=c_ids.dtype),
+        ])
+        chunk_mask = torch.cat([
+            torch.tensor([False]), c_mask.bool(),
+            torch.tensor([False]),
+        ])
+        chunk_vals = torch.cat([
+            torch.tensor([0.0]), c_vals.float(),
+            torch.tensor([0.0]),
+        ])
+
+        chunks.append({
+            "input_ids": chunk_ids,
+            "is_number_mask": chunk_mask,
+            "number_values": chunk_vals,
+            "seq_length": len(chunk_ids),
+            "source_file": doc["source_file"],
+        })
+
+    return chunks
+
+
+def chunk_all_documents(documents, cls_id, sep_id, newline_ids):
+    """Chunk all documents, return list of chunk dicts."""
+    all_chunks = []
+    for doc in documents:
+        all_chunks.extend(chunk_document(doc, cls_id, sep_id, newline_ids))
+    return all_chunks
+
+
+# ─── Batching ────────────────────────────────────────────────────────────────
+
+def form_batches_1d(chunks, token_budget, bucket_width=16):
+    """Bucket chunks by length, form batches per bucket, shuffle batch order.
+
+    Applies a mild length penalty: longer sequences get a reduced effective
+    budget to account for Flash Attention's per-sequence memory overhead.
+
+    Returns list of batches (each batch is a list of chunk dicts).
+    """
+    buckets = defaultdict(list)
+    for chunk in chunks:
+        key = (chunk["seq_length"] + bucket_width - 1) // bucket_width * bucket_width
+        buckets[key].append(chunk)
+
+    all_batches = []
+    for bucket_len, bucket_items in buckets.items():
+        random.shuffle(bucket_items)
+        # Reduce budget for longer sequences
+        effective_budget = token_budget / (1 + LENGTH_PENALTY * (bucket_len / CHUNK_MAX))
+        batch_size = max(1, int(effective_budget / bucket_len))
+        for i in range(0, len(bucket_items), batch_size):
+            all_batches.append(bucket_items[i:i + batch_size])
+
+    random.shuffle(all_batches)
+    return all_batches
+
+
+def pad_and_collate(chunks, pad_id):
+    """Pad and stack chunk dicts into batch tensors."""
+    max_len = max(c["seq_length"] for c in chunks)
+    B = len(chunks)
+
+    input_ids = torch.full((B, max_len), pad_id, dtype=torch.long)
+    is_number_mask = torch.zeros(B, max_len, dtype=torch.long)
+    number_values = torch.zeros(B, max_len, dtype=torch.float32)
+    attention_mask = torch.zeros(B, max_len, dtype=torch.long)
+
+    for i, c in enumerate(chunks):
+        l = c["seq_length"]
+        input_ids[i, :l] = c["input_ids"]
+        is_number_mask[i, :l] = c["is_number_mask"].long()
+        number_values[i, :l] = c["number_values"].float()
+        attention_mask[i, :l] = 1
+
+    return input_ids, is_number_mask, number_values, attention_mask
+
+
+# ─── Training ────────────────────────────────────────────────────────────────
+
+def run_epoch(model, documents, reg_documents, optimizer, scheduler, scaler,
+              device, epoch, args, tok_info, use_amp, amp_dtype, training=True):
+    """Run one training or validation epoch."""
+    prefix = "Train" if training else "Val"
+    if training:
+        model.train()
+    else:
+        model.eval()
+
+    # Deterministic chunking per epoch
+    rng_state = random.getstate()
+    random.seed(args.seed + epoch + (0 if training else 10000))
+
+    cls_id = tok_info["cls_id"]
+    sep_id = tok_info["sep_id"]
+    pad_id = tok_info["pad_id"]
+    mask_id = tok_info["mask_id"]
+    nl_ids = tok_info["newline_ids"]
+
+    # ─── Step 1: Chunk all documents ────────────────────────────────────
+    print(f"  Chunking documents...")
+    fin_chunks = chunk_all_documents(documents, cls_id, sep_id, nl_ids)
+    n_fin = len(fin_chunks)
+    avg_fin = sum(c["seq_length"] for c in fin_chunks) / max(n_fin, 1)
+
+    reg_chunks = []
+    if reg_documents:
+        reg_chunks = chunk_all_documents(reg_documents, cls_id, sep_id, nl_ids)
+    n_reg = len(reg_chunks)
+    avg_reg = sum(c["seq_length"] for c in reg_chunks) / max(n_reg, 1)
+
+    print(f"  Chunks: {n_fin} financial (avg {avg_fin:.0f}), "
+          f"{n_reg} regularization (avg {avg_reg:.0f})")
+
+    # ─── Step 2: Form batches ───────────────────────────────────────────
+    fin_batches = form_batches_1d(fin_chunks, args.tokens_per_batch)
+    del fin_chunks
+
+    reg_batches = []
+    if reg_chunks:
+        reg_batches = form_batches_1d(reg_chunks, args.tokens_per_batch)
+    del reg_chunks
+
+    # Estimate padding waste
+    total_useful = 0
+    total_padded = 0
+    for batch in fin_batches + reg_batches:
+        max_len = max(c["seq_length"] for c in batch)
+        total_useful += sum(c["seq_length"] for c in batch)
+        total_padded += max_len * len(batch)
+    waste = 1.0 - total_useful / max(total_padded, 1)
+    print(f"  {len(fin_batches)} financial batches, "
+          f"{len(reg_batches)} regularization batches, "
+          f"padding waste: {waste:.1%}")
+
+    random.setstate(rng_state)
+
+    # ─── Step 3: Train/eval ─────────────────────────────────────────────
+    total_loss = 0.0
+    total_loss_text = 0.0
+    total_loss_mag = 0.0
+    n_batches = 0
+    MA_WINDOW = 100
+    ma = {k: deque(maxlen=MA_WINDOW) for k in ("loss", "text", "mag", "reg")}
+
+    # Build interleaved batch iterator: financial batches with probabilistic
+    # regularization insertion
+    reg_iter = iter(reg_batches) if reg_batches else None
+
+    prev_grad = torch.is_grad_enabled()
+    if not training:
+        torch.set_grad_enabled(False)
+
+    magnitude_sentinel = model.config.magnitude_max + 1.0 if hasattr(model, 'config') else 13.0
+    create_masked_inputs = _get_create_masked_inputs()
+
+    try:
+        pbar = tqdm(fin_batches, desc=f"  {prefix}", unit="batch")
+        for batch_chunks in pbar:
+            # Pad and collate
+            ids, num_mask, num_vals, attn_mask = pad_and_collate(batch_chunks, pad_id)
+            ids = ids.to(device)
+            num_mask = num_mask.to(device)
+            num_vals = num_vals.to(device)
+            attn_mask = attn_mask.to(device)
+
+            # Apply MLM masking
+            (m_ids, m_nums, m_num_mask,
+             labels_t, labels_m) = create_masked_inputs(
+                ids, num_mask, num_vals,
+                mask_token_id=mask_id, pad_token_id=pad_id,
+                magnitude_sentinel=magnitude_sentinel,
+                vocab_size=model.config.vocab_size,
+                magnitude_min=model.config.magnitude_min,
+                magnitude_max=model.config.magnitude_max,
+                mask_prob_min=args.mask_prob_min,
+                mask_prob_max=args.mask_prob_max,
+            )
+
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                outputs = model(
+                    input_ids=m_ids,
+                    attention_mask=attn_mask,
+                    is_number_mask=m_num_mask,
+                    number_values=m_nums,
+                    labels_text=labels_t,
+                    labels_magnitude=labels_m,
+                )
+
+            loss = outputs["loss"]
+
+            if training:
+                scaler.scale(loss).backward()
+
+                # Regularization batch (interleaved)
+                if reg_iter and random.random() < args.regularization_ratio:
+                    try:
+                        reg_batch = next(reg_iter)
+                    except StopIteration:
+                        reg_iter = iter(reg_batches)
+                        reg_batch = next(reg_iter)
+
+                    r_ids, r_nm, r_nv, r_am = pad_and_collate(reg_batch, pad_id)
+                    r_ids = r_ids.to(device)
+                    r_nm = r_nm.to(device)
+                    r_nv = r_nv.to(device)
+                    r_am = r_am.to(device)
+
+                    (rm_ids, rm_nums, rm_nm,
+                     rl_t, rl_m) = create_masked_inputs(
+                        r_ids, r_nm, r_nv,
+                        mask_token_id=mask_id, pad_token_id=pad_id,
+                        magnitude_sentinel=magnitude_sentinel,
+                        vocab_size=model.config.vocab_size,
+                        magnitude_min=model.config.magnitude_min,
+                        magnitude_max=model.config.magnitude_max,
+                        mask_prob_min=args.mask_prob_min,
+                        mask_prob_max=args.mask_prob_max,
+                    )
+
+                    with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                        reg_outputs = model(
+                            input_ids=rm_ids,
+                            attention_mask=r_am,
+                            is_number_mask=rm_nm,
+                            number_values=rm_nums,
+                            labels_text=rl_t,
+                            labels_magnitude=rl_m,
+                        )
+                    reg_loss = reg_outputs["loss"]
+                    scaler.scale(reg_loss).backward()
+                    ma["reg"].append(reg_loss.item())
+
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step()
+
+            total_loss += loss.item()
+            total_loss_text += outputs["loss_text"].item()
+            total_loss_mag += outputs["loss_mag"].item()
+            ma["loss"].append(loss.item())
+            ma["text"].append(outputs["loss_text"].item())
+            ma["mag"].append(outputs["loss_mag"].item())
+            n_batches += 1
+
+            if n_batches % 20 == 0:
+                postfix = {
+                    "loss": f"{sum(ma['loss'])/len(ma['loss']):.4f}",
+                    "txt": f"{sum(ma['text'])/len(ma['text']):.4f}",
+                    "mag": f"{sum(ma['mag'])/len(ma['mag']):.4f}",
+                }
+                if training:
+                    postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
+                if ma["reg"]:
+                    postfix["reg"] = f"{sum(ma['reg'])/len(ma['reg']):.4f}"
+                pbar.set_postfix(**postfix)
+
+    finally:
+        torch.set_grad_enabled(prev_grad)
+
+    avg_loss = total_loss / max(n_batches, 1)
+    avg_lt = total_loss_text / max(n_batches, 1)
+    avg_lm = total_loss_mag / max(n_batches, 1)
+
+    return {
+        "loss": avg_loss,
+        "loss_text": avg_lt,
+        "loss_mag": avg_lm,
+        "n_batches": n_batches,
+    }
+
+
+# ─── Main ──────────────────────────────────────────────────────────────────
 
 def train(args):
     if args.device:
@@ -182,7 +464,7 @@ def train(args):
         use_scaler = False
     print(f"Device: {device}, dtype: {args.dtype}" + (" (AMP)" if use_amp else ""))
 
-    # Build model — full parameter training, no LoRA
+    # Build model
     print("Building model (full fine-tuning, no LoRA)...")
     model = build_model(args.model_name)
     model = model.to(device)
@@ -191,154 +473,20 @@ def train(args):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total params: {total_params:,}, trainable: {trainable_params:,}")
 
-    if args.compile:
-        print("Compiling model with torch.compile...")
-        model = torch.compile(model)
-
-    # Load tokenizer
-    tokenizer = FinancialBertTokenizer(args.model_name)
-
     # ------------------------------------------------------------------
-    # Load bucketed data
-    # ------------------------------------------------------------------
-    bucket_dir = Path(args.data_dir)
-    bucket_files = sorted(bucket_dir.glob("bucket_*.pt"))
-
-    if not bucket_files:
-        print(f"No bucket .pt files found in {args.data_dir}")
-        return
-
-    datasets = []
-    bucket_info = {}
-    offset = 0
-
-    for bf in bucket_files:
-        ds = BucketedMLMDataset(
-            str(bf),
-            mask_prob=args.mask_prob,
-            pad_token_id=tokenizer.pad_token_id or 0,
-            mask_token_id=tokenizer.mask_token_id,
-        )
-        if len(ds) == 0:
-            continue
-        datasets.append(ds)
-        bucket_info[bf.stem] = (offset, len(ds), ds.pad_to)
-        offset += len(ds)
-
-    combined = ConcatDataset(datasets)
-
-    # Three-way split based on source_file extension:
-    #   .txt → regularization (Wikipedia etc.)
-    #   .md  → financial, further split into train/val by document
-    #
-    # Uses deterministic MD5-hash split (shared with T5 and CLS aggregator
-    # pipelines via split_utils) so the same documents are always in val.
-    financial_docs = set()
-    reg_docs = set()
-    for ds in datasets:
-        for sf in ds.source_files:
-            if sf.endswith(".txt"):
-                reg_docs.add(sf)
-            else:
-                financial_docs.add(sf)
-
-    val_docs = {sf for sf in financial_docs if is_val_document(sf)}
-    train_financial = financial_docs - val_docs
-
-    print(f"\nDocument split: {len(financial_docs)} financial "
-          f"({len(train_financial)} train, {len(val_docs)} val), "
-          f"{len(reg_docs)} regularization")
-
-    # Assign chunks to train/val/reg based on source document
-    train_bucket_info = {}
-    val_bucket_info = {}
-    reg_bucket_info = {}
-    for ds_idx, (name, (boffset, count, pad_to)) in enumerate(bucket_info.items()):
-        ds = datasets[ds_idx]
-        train_indices = []
-        val_indices = []
-        reg_indices = []
-        for local_idx in range(count):
-            abs_idx = boffset + local_idx
-            sf = ds.source_files[local_idx]
-            if sf.endswith(".txt"):
-                reg_indices.append(abs_idx)
-            elif sf in val_docs:
-                val_indices.append(abs_idx)
-            else:
-                train_indices.append(abs_idx)
-        train_bucket_info[name] = (train_indices, pad_to)
-        val_bucket_info[name] = (val_indices, pad_to)
-        reg_bucket_info[name] = (reg_indices, pad_to)
-
-    batch_sampler = MultiBucketBatchSampler(
-        train_bucket_info, args.tokens_per_batch, min_batch=args.min_batch_size,
-    )
-    val_batch_sampler = MultiBucketBatchSampler(
-        val_bucket_info, args.tokens_per_batch, min_batch=args.min_batch_size,
-    )
-
-    # Regularization sampler (may be empty if no .txt data present)
-    reg_bucket_info_nonempty = {k: v for k, v in reg_bucket_info.items() if len(v[0]) > 0}
-    has_reg = len(reg_bucket_info_nonempty) > 0 and args.regularization_ratio > 0
-    if has_reg:
-        reg_batch_sampler = MultiBucketBatchSampler(
-            reg_bucket_info_nonempty, args.tokens_per_batch, min_batch=args.min_batch_size,
-        )
-
-    print(f"\nFinancial train batch plan (tokens_per_batch={args.tokens_per_batch}):")
-    print(batch_sampler.summary())
-    print(f"Total financial train batches per epoch: {len(batch_sampler)}")
-    print(f"\nVal batch plan:")
-    print(val_batch_sampler.summary())
-    print(f"Total val batches per epoch: {len(val_batch_sampler)}")
-    if has_reg:
-        print(f"\nRegularization batch plan (ratio={args.regularization_ratio:.0%}):")
-        print(reg_batch_sampler.summary())
-        print(f"Total reg batches per epoch: {len(reg_batch_sampler)}")
-    print()
-
-    dataloader = DataLoader(
-        combined,
-        batch_sampler=batch_sampler,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=args.num_workers > 0,
-        collate_fn=variable_length_collate,
-    )
-    val_dataloader = DataLoader(
-        combined,
-        batch_sampler=val_batch_sampler,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=args.num_workers > 0,
-        collate_fn=variable_length_collate,
-    )
-    reg_dataloader = None
-    if has_reg:
-        reg_dataloader = DataLoader(
-            combined,
-            batch_sampler=reg_batch_sampler,
-            num_workers=args.num_workers,
-            pin_memory=device.type == "cuda",
-            persistent_workers=args.num_workers > 0,
-            collate_fn=variable_length_collate,
-        )
-
-    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
-
-    # ------------------------------------------------------------------
-    # Optimizer — separate param groups for backbone vs number modules
+    # Optimizer (set up before torch.compile to access submodules directly)
     # ------------------------------------------------------------------
     number_params = set()
     for m in (model.number_embedder, model.number_head):
         for p in m.parameters():
             number_params.add(id(p))
 
-    backbone_group = [p for p in model.parameters() if p.requires_grad and id(p) not in number_params]
-    number_group = [p for p in model.parameters() if p.requires_grad and id(p) in number_params]
+    backbone_group = [p for p in model.parameters()
+                      if p.requires_grad and id(p) not in number_params]
+    number_group = [p for p in model.parameters()
+                    if p.requires_grad and id(p) in number_params]
 
-    print(f"Param groups — backbone: {sum(p.numel() for p in backbone_group):,} params @ lr={args.lr}, "
+    print(f"\nParam groups -- backbone: {sum(p.numel() for p in backbone_group):,} params @ lr={args.lr}, "
           f"number: {sum(p.numel() for p in number_group):,} params @ lr={args.number_lr}")
 
     optimizer = torch.optim.AdamW([
@@ -346,8 +494,34 @@ def train(args):
         {"params": number_group, "lr": args.number_lr},
     ], weight_decay=args.weight_decay)
 
-    # Linear warmup + cosine decay schedule (applied uniformly to both groups)
-    total_steps = len(batch_sampler) * args.epochs
+    # Token info
+    tok_info = get_token_info(args.model_name)
+
+    # ------------------------------------------------------------------
+    # Load documents
+    # ------------------------------------------------------------------
+    print(f"\nLoading documents from {args.data}...")
+    documents = torch.load(args.data, map_location="cpu", weights_only=False)
+
+    # Split into financial (.md) vs regularization (.txt) by source_file extension
+    financial_docs = [d for d in documents if not d["source_file"].endswith(".txt")]
+    reg_docs = [d for d in documents if d["source_file"].endswith(".txt")]
+    del documents
+
+    # Split financial docs into train/val using deterministic hash
+    train_docs, val_docs = split_documents(financial_docs)
+    del financial_docs
+
+    print(f"  {len(train_docs)} train, {len(val_docs)} val financial documents")
+    print(f"  {len(reg_docs)} regularization documents")
+
+    total_train_tokens = sum(d["seq_length"] for d in train_docs)
+    total_reg_tokens = sum(d["seq_length"] for d in reg_docs)
+    print(f"  Train tokens: {total_train_tokens:,}, regularization tokens: {total_reg_tokens:,}")
+
+    # Estimate total steps (rough: total_tokens / budget * epochs)
+    est_batches_per_epoch = total_train_tokens / args.tokens_per_batch
+    total_steps = int(est_batches_per_epoch * args.epochs)
     lr_warmup_steps = min(args.warmup_steps, total_steps // 5)
 
     def lr_lambda(step):
@@ -357,11 +531,18 @@ def train(args):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda, lr_lambda])
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+
+    print(f"Estimated ~{est_batches_per_epoch:.0f} batches/epoch, {total_steps} total steps")
+
+    if args.compile:
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
 
     # ------------------------------------------------------------------
-    # Checkpointing helper
+    # Checkpointing
     # ------------------------------------------------------------------
-    def save_checkpoint(tag, epoch, global_step, ma=None, val_loss=None):
+    def save_checkpoint(tag, epoch, global_step, train_m=None, val_m=None):
         if not args.save_dir:
             return
         save_path = os.path.join(args.save_dir, f"checkpoint_{tag}")
@@ -374,15 +555,15 @@ def train(args):
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
         }
-        if ma:
-            state["train_loss"] = sum(ma["loss"]) / len(ma["loss"]) if ma["loss"] else float("nan")
-        if val_loss is not None:
-            state["val_loss"] = val_loss
+        if train_m:
+            state["train_loss"] = train_m["loss"]
+        if val_m:
+            state["val_loss"] = val_m["loss"]
         torch.save(state, os.path.join(save_path, "full_model.pt"))
         print(f"  Saved checkpoint to {save_path} (epoch={epoch}, step={global_step})")
 
     # ------------------------------------------------------------------
-    # Resume from checkpoint
+    # Resume
     # ------------------------------------------------------------------
     start_epoch = 0
     global_step = 0
@@ -391,8 +572,8 @@ def train(args):
         ckpt_file = os.path.join(args.resume_from, "full_model.pt")
         print(f"Resuming from {ckpt_file}...")
         ckpt = torch.load(ckpt_file, map_location=device, weights_only=False)
-        # Strip _orig_mod. prefix from torch.compile'd checkpoints
-        state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model_state_dict"].items()}
+        state_dict = {k.replace("_orig_mod.", ""): v
+                      for k, v in ckpt["model_state_dict"].items()}
         model.load_state_dict(state_dict)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
@@ -405,163 +586,83 @@ def train(args):
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
-    model.train()
-
-    MA_WINDOW = 100
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     for epoch in range(start_epoch, args.epochs):
-        ma = {k: deque(maxlen=MA_WINDOW) for k in ("loss", "text", "mag", "reg")}
+        print(f"\n{'='*70}")
+        print(f"Epoch {epoch + 1}/{args.epochs}")
+        print(f"{'='*70}")
 
-        # Fresh regularization iterator each epoch
-        reg_iter = iter(reg_dataloader) if reg_dataloader else None
-        last_ckpt_time = time.time()
+        # Train
+        t0 = time.time()
+        train_m = run_epoch(
+            model, train_docs, reg_docs, optimizer, scheduler, scaler,
+            device, epoch, args, tok_info, use_amp, amp_dtype, training=True)
+        t_train = time.time() - t0
+        global_step += train_m["n_batches"]
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}", unit="batch")
-        for batch in pbar:
-            batch = {k: v.to(device) for k, v in batch.items()}
+        print(f"\n  Train: loss={train_m['loss']:.4f} "
+              f"(text={train_m['loss_text']:.4f}, mag={train_m['loss_mag']:.4f}) "
+              f"[{t_train:.0f}s]")
 
-            # --- Financial batch ---
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    is_number_mask=batch["is_number_mask"],
-                    number_values=batch["number_values"],
-                    labels_text=batch["labels_text"],
-                    labels_magnitude=batch["labels_magnitude"],
-                )
+        # Validate
+        t0 = time.time()
+        val_m = run_epoch(
+            model, val_docs, None, optimizer, scheduler, scaler,
+            device, epoch, args, tok_info, use_amp, amp_dtype, training=False)
+        t_val = time.time() - t0
 
-            loss = outputs["loss"]
-            scaler.scale(loss).backward()
+        print(f"  Val:   loss={val_m['loss']:.4f} "
+              f"(text={val_m['loss_text']:.4f}, mag={val_m['loss_mag']:.4f}) "
+              f"[{t_val:.0f}s]")
 
-            # --- Regularization batch (interleaved) ---
-            if reg_iter and random.random() < args.regularization_ratio:
-                try:
-                    reg_batch = next(reg_iter)
-                except StopIteration:
-                    reg_iter = iter(reg_dataloader)
-                    reg_batch = next(reg_iter)
-
-                reg_batch = {k: v.to(device) for k, v in reg_batch.items()}
-                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                    reg_outputs = model(
-                        input_ids=reg_batch["input_ids"],
-                        attention_mask=reg_batch["attention_mask"],
-                        is_number_mask=reg_batch["is_number_mask"],
-                        number_values=reg_batch["number_values"],
-                        labels_text=reg_batch["labels_text"],
-                        labels_magnitude=reg_batch["labels_magnitude"],
-                    )
-                reg_loss = reg_outputs["loss"]
-                scaler.scale(reg_loss).backward()
-                ma["reg"].append(reg_loss.item())
-
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            scheduler.step()
-
-            global_step += 1
-            ma["loss"].append(loss.item())
-            ma["text"].append(outputs["loss_text"].item())
-            ma["mag"].append(outputs["loss_mag"].item())
-
-            pbar.set_postfix(
-                loss=f"{sum(ma['loss'])/len(ma['loss']):.4f}",
-                txt=f"{sum(ma['text'])/len(ma['text']):.4f}",
-                mag=f"{sum(ma['mag'])/len(ma['mag']):.4f}",
-                lr=f"{scheduler.get_last_lr()[0]:.2e}",
-                reg=f"{sum(ma['reg'])/len(ma['reg']):.4f}" if ma["reg"] else "n/a",
-            )
-
-            # Periodic checkpoint every --checkpoint_minutes minutes
-            if args.checkpoint_minutes > 0 and time.time() - last_ckpt_time >= args.checkpoint_minutes * 60:
-                save_checkpoint(f"step{global_step}", epoch, global_step, ma=ma)
-                last_ckpt_time = time.time()
-
-        def _ma_avg(d): return sum(d) / len(d) if d else float('nan')
-        print(f"Epoch {epoch+1}/{args.epochs} (last {MA_WINDOW} batches) — "
-              f"loss: {_ma_avg(ma['loss']):.4f}  "
-              f"text: {_ma_avg(ma['text']):.4f}  "
-              f"mag: {_ma_avg(ma['mag']):.4f}"
-              + (f"  reg: {_ma_avg(ma['reg']):.4f}" if ma["reg"] else ""))
-
-        # Validation
-        model.eval()
-        val_totals = {"loss": 0.0, "text": 0.0, "mag": 0.0}
-        val_batches = 0
-        with torch.no_grad():
-            for batch in tqdm(val_dataloader, desc="  Validation", unit="batch"):
-                batch = {k: v.to(device) for k, v in batch.items()}
-                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                    outputs = model(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        is_number_mask=batch["is_number_mask"],
-                        number_values=batch["number_values"],
-                        labels_text=batch["labels_text"],
-                        labels_magnitude=batch["labels_magnitude"],
-                    )
-                val_batches += 1
-                val_totals["loss"] += outputs["loss"].item()
-                val_totals["text"] += outputs["loss_text"].item()
-                val_totals["mag"] += outputs["loss_mag"].item()
-
-        vn = max(val_batches, 1)
-        print(f"Epoch {epoch+1}/{args.epochs} — "
-              f"val loss: {val_totals['loss']/vn:.4f}  "
-              f"text: {val_totals['text']/vn:.4f}  "
-              f"mag: {val_totals['mag']/vn:.4f}")
-        model.train()
-
-        # Save end-of-epoch checkpoint
+        # Save checkpoint
         save_checkpoint(
-            f"epoch{epoch+1}", epoch + 1, global_step,
-            ma=ma, val_loss=val_totals["loss"] / vn,
-        )
+            f"epoch{epoch + 1}", epoch + 1, global_step,
+            train_m=train_m, val_m=val_m)
 
-    print("Training complete.")
+    print("\nTraining complete.")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Full-parameter MLM training for FinancialModernBert")
-    parser.add_argument("--data_dir", required=True, help="Directory with bucketed .pt files")
+    parser.add_argument("--data", default="mlm_data/documents.pt",
+                        help="Path to documents.pt (from prepare_dataset.py)")
     parser.add_argument("--save_dir", default="checkpoints/mlm_full",
                         help="Checkpoint save directory")
-    parser.add_argument("--model_name", default="answerdotai/ModernBERT-base", help="Base model")
-    parser.add_argument("--tokens_per_batch", type=int, default=4096,
+    parser.add_argument("--model_name", default="answerdotai/ModernBERT-base",
+                        help="Base model")
+    parser.add_argument("--tokens_per_batch", type=int, default=8192,
                         help="Target total tokens per batch")
-    parser.add_argument("--min_batch_size", type=int, default=1,
-                        help="Minimum batch size for any bucket")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=5e-5,
                         help="Backbone learning rate")
     parser.add_argument("--number_lr", type=float, default=2e-4,
                         help="Learning rate for number_embedder + number_head")
-    parser.add_argument("--mask_prob", type=float, default=0.15)
+    parser.add_argument("--mask_prob_min", type=float, default=0.15,
+                        help="Minimum mask probability per sequence")
+    parser.add_argument("--mask_prob_max", type=float, default=0.15,
+                        help="Maximum mask probability per sequence "
+                             "(set > min for variable masking)")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_steps", type=int, default=500,
                         help="Linear warmup steps before cosine decay")
+    parser.add_argument("--regularization_ratio", type=float, default=0.3,
+                        help="Probability of inserting a regularization batch "
+                             "after each financial batch (0.3 = ~30%%)")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bf16",
                         choices=["fp32", "fp16", "bf16"])
-    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile for kernel fusion")
-    parser.add_argument("--regularization_ratio", type=float, default=0.3,
-                        help="Probability of inserting a regularization batch (.txt data) "
-                             "after each financial batch (0.3 = ~30%% of steps)")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Path to checkpoint directory to resume from")
-    parser.add_argument("--checkpoint_minutes", type=int, default=30,
-                        help="Save a checkpoint every N minutes (0 to disable periodic checkpoints)")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     train(args)
 
 
 if __name__ == "__main__":
     main()
-"""python -m training_pipeline.train_mlm_full   --data_dir /workspace/data/bucketed   --num_workers 4   --tokens_per_batch 8192   --lr 2.5e-5   --number_lr 1e-4   --dtype bf16   --device cuda   --compile"""

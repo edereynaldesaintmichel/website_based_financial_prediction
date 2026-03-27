@@ -6,7 +6,7 @@ regardless of which pipeline is running or what order the data is loaded.
 
 All three training pipelines import from here to guarantee consistent splits:
   - mlm_training_pipeline/train_mlm_full.py
-  - t5_style_training_pipeline/prepare_data.py
+  - t5_style_training_pipeline/train.py
   - cls_aggregator_training_pipeline/train.py
 """
 import hashlib

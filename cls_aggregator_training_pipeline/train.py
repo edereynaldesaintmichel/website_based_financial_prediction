@@ -9,6 +9,8 @@ Per epoch:
 3. Gather CLS embeddings per document → aggregator input
 4. Sort decoder chunks by length, batch by token budget
 5. Train: aggregator(doc_CLS) → single enriched CLS → decoder denoises chunk → loss
+6. Contrastive loss: same document with 2 dropout masks → positive pair,
+   different documents → negatives (InfoNCE)
 
 Encoder and decoder are frozen. Only the aggregator is trained.
 
@@ -18,7 +20,6 @@ Usage (single GPU):
         --checkpoint checkpoints/t5_expanded_memory/model_only.pt
 """
 import argparse
-import bisect
 import math
 import os
 import random
@@ -31,6 +32,14 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cls_aggregator_training_pipeline.aggregator import CLSAggregator
+from chunk_utils import (
+    get_token_info,
+    get_boundaries,
+    snap_to_boundary,
+    chunk_spans,
+    extract_chunk,
+    pad_and_collate,
+)
 from financial_bert import FinancialBertTokenizer, FinancialModernBertConfig
 from split_utils import split_documents
 from t5_style_training_pipeline.decoder import T5StyleModel
@@ -41,8 +50,6 @@ PRETRAINED_ID = "answerdotai/ModernBERT-base"
 
 CHUNK_MIN = 128
 CHUNK_MAX = 1024
-MIN_TAIL_CHUNK = 16  # absorb trailing chunks shorter than this
-
 
 # ─── Model Loading ──────────────────────────────────────────────────────────
 
@@ -70,108 +77,6 @@ def load_t5_model(checkpoint_path, device):
     print(f"  Loaded T5 model: encoder {n_enc:.1f}M (frozen), "
           f"decoder {n_dec:.1f}M (trainable)")
     return model, config
-
-
-def get_token_info(pretrained_id):
-    """Extract special token IDs needed for training."""
-    tokenizer = FinancialBertTokenizer(pretrained_id)
-    base = tokenizer.base_tokenizer
-    newline_ids = set(base.encode("\n", add_special_tokens=False))
-    info = {
-        "cls_id": base.cls_token_id,
-        "sep_id": base.sep_token_id,
-        "pad_id": base.pad_token_id,
-        "mask_id": tokenizer.mask_token_id,
-        "newline_ids": newline_ids,
-    }
-    del tokenizer
-    return info
-
-
-# ─── Chunking ───────────────────────────────────────────────────────────────
-
-def get_boundaries(input_ids, newline_ids):
-    """Find chunk boundary candidates (positions after newline tokens).
-
-    Works in content space (CLS/SEP stripped: position 0 = first content token).
-    Returns sorted list of boundary positions.
-    """
-    content = input_ids[1:-1]  # strip CLS at 0 and SEP at -1
-    mask = torch.zeros(len(content), dtype=torch.bool)
-    for nl_id in newline_ids:
-        mask |= (content == nl_id)
-    # Boundary = position AFTER the newline (i.e. start of next chunk)
-    return (mask.nonzero(as_tuple=False).squeeze(-1) + 1).tolist()
-
-
-def snap_to_boundary(target, boundaries, min_pos):
-    """Snap a target position to the nearest boundary candidate."""
-    if not boundaries:
-        return target
-    idx = bisect.bisect_left(boundaries, target)
-    candidates = []
-    if idx > 0 and boundaries[idx - 1] > min_pos:
-        candidates.append(boundaries[idx - 1])
-    if idx < len(boundaries):
-        candidates.append(boundaries[idx])
-    if not candidates:
-        return target
-    return min(candidates, key=lambda b: abs(b - target))
-
-
-def chunk_spans(content_len, boundaries, size_fn):
-    """Generate (start, end) chunk spans for a document's content."""
-    spans = []
-    pos = 0
-    while pos < content_len:
-        target = size_fn()
-        raw_end = min(pos + target, content_len)
-
-        if raw_end < content_len:
-            end = snap_to_boundary(raw_end, boundaries, pos)
-            if end <= pos:
-                end = min(pos + target, content_len)
-            # Absorb tiny tail
-            if content_len - end < MIN_TAIL_CHUNK:
-                end = content_len
-        else:
-            end = content_len
-
-        spans.append((pos, end))
-        pos = end
-    return spans
-
-
-def extract_chunk(doc, start, end, cls_id, sep_id):
-    """Extract a chunk from document content (content space), wrap with CLS/SEP."""
-    offset = 1 + start  # +1 to skip document CLS
-    length = end - start
-
-    c_ids = doc["input_ids"][offset:offset + length]
-    c_mask = doc["is_number_mask"][offset:offset + length]
-    c_vals = doc["number_values"][offset:offset + length]
-
-    chunk_ids = torch.cat([
-        torch.tensor([cls_id], dtype=c_ids.dtype), c_ids,
-        torch.tensor([sep_id], dtype=c_ids.dtype),
-    ])
-    chunk_mask = torch.cat([
-        torch.tensor([False]), c_mask.bool(),
-        torch.tensor([False]),
-    ])
-    chunk_vals = torch.cat([
-        torch.tensor([0.0]), c_vals.float(),
-        torch.tensor([0.0]),
-    ])
-
-    return {
-        "input_ids": chunk_ids,
-        "is_number_mask": chunk_mask,
-        "number_values": chunk_vals,
-        "seq_length": len(chunk_ids),
-        "doc_start": start,
-        "doc_end": end,
-    }
 
 
 # ─── Batching ───────────────────────────────────────────────────────────────
@@ -282,26 +187,6 @@ def form_batches_2d(items, budget, bucket_width=16):
     return all_batches
 
 
-def pad_and_collate(chunks, pad_id):
-    """Pad and stack chunk dicts into batch tensors."""
-    max_len = max(c["seq_length"] for c in chunks)
-    B = len(chunks)
-
-    input_ids = torch.full((B, max_len), pad_id, dtype=torch.long)
-    is_number_mask = torch.zeros(B, max_len, dtype=torch.long)
-    number_values = torch.zeros(B, max_len, dtype=torch.float32)
-    attention_mask = torch.zeros(B, max_len, dtype=torch.long)
-
-    for i, c in enumerate(chunks):
-        l = c["seq_length"]
-        input_ids[i, :l] = c["input_ids"]
-        is_number_mask[i, :l] = c["is_number_mask"].long()
-        number_values[i, :l] = c["number_values"].float()
-        attention_mask[i, :l] = 1
-
-    return input_ids, is_number_mask, number_values, attention_mask
-
-
 # ─── CLS Computation ───────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -396,6 +281,64 @@ def compute_loss(text_logits, mag_logits, labels_text, labels_magnitude, config)
     return loss_text + loss_mag, loss_text, loss_mag
 
 
+def compute_contrastive_loss(z1, z2, temperature=0.05):
+    """InfoNCE contrastive loss between two views of the same documents.
+
+    Args:
+        z1, z2: (N, D) L2-normalized embeddings from two dropout-augmented
+                forward passes of the aggregator on the same documents.
+        temperature: softmax temperature.
+    Returns:
+        Scalar InfoNCE loss.
+    """
+    # (N, N) similarity matrix
+    logits = z1 @ z2.T / temperature  # (N, N)
+    labels = torch.arange(z1.shape[0], device=z1.device)
+    # Symmetric: average both directions
+    loss = (F.cross_entropy(logits, labels)
+            + F.cross_entropy(logits.T, labels)) * 0.5
+    return loss
+
+
+# ─── Same-source pair evaluation ────────────────────────────────────────────
+
+def evaluate_same_source_pairs(dec_batches, documents, doc_idx_to_source):
+    """Evaluate how many same-source-document pairs exist per batch.
+
+    The 2D bucketing sorts by (n_cls, doc_idx) within length buckets,
+    which may naturally group documents from the same source company.
+
+    Args:
+        dec_batches: list of batches, each a list of chunk dicts with 'doc_idx'
+        documents: list of document dicts (unused, kept for API clarity)
+        doc_idx_to_source: dict mapping doc_idx → source identifier string
+
+    Returns:
+        Average number of same-source document pairs per batch.
+    """
+    total_pairs = 0
+    n_batches_with_multiple_docs = 0
+
+    for batch in dec_batches:
+        # Unique doc indices in this batch
+        doc_indices = list(set(c["doc_idx"] for c in batch))
+        if len(doc_indices) < 2:
+            continue
+        n_batches_with_multiple_docs += 1
+
+        # Count same-source pairs among unique docs
+        sources = [doc_idx_to_source.get(d, d) for d in doc_indices]
+        n_same = 0
+        for i in range(len(sources)):
+            for j in range(i + 1, len(sources)):
+                if sources[i] == sources[j]:
+                    n_same += 1
+        total_pairs += n_same
+
+    avg = total_pairs / max(n_batches_with_multiple_docs, 1)
+    return avg, total_pairs, n_batches_with_multiple_docs
+
+
 # ─── LR Schedule ────────────────────────────────────────────────────────────
 
 def get_cosine_schedule(optimizer, warmup_steps, total_steps):
@@ -413,6 +356,8 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
               device, epoch, args, config, tok_info, training=True):
     """Run one training or validation epoch."""
     prefix = "Train" if training else "Val"
+    contrastive_lambda = getattr(args, "contrastive_lambda", 0.0)
+    contrastive_temp = getattr(args, "contrastive_temp", 0.05)
     if training:
         aggregator.train()
         decoder.train()
@@ -528,16 +473,33 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
           f"weighted {weighted_waste:.1%}")
     print(f"  {len(dec_batches)} decoder batches")
 
+    # ─── Step 3b: Evaluate same-source pairs in batches ──────────────────
+    if training:
+        doc_idx_to_source = {}
+        for doc_idx, doc in enumerate(documents):
+            sf = doc.get("source_file", "")
+            # Strip filing-specific suffixes to get the company/source identifier.
+            # e.g. "CompanyX_2023.md" and "CompanyX_2024.md" share source "CompanyX"
+            base = sf.rsplit("_", 1)[0] if "_" in sf else sf
+            doc_idx_to_source[doc_idx] = base
+
+        avg_pairs, total_pairs, n_multi = evaluate_same_source_pairs(
+            dec_batches, documents, doc_idx_to_source)
+        print(f"  Same-source pairs: {avg_pairs:.2f} avg/batch "
+              f"({total_pairs} total across {n_multi} multi-doc batches)")
+
     # ─── Step 4: Train/eval on decoder batches ──────────────────────────
     total_loss = 0.0
     total_loss_text = 0.0
     total_loss_mag = 0.0
+    total_loss_contrastive = 0.0
     total_correct = 0
     total_masked = 0
     n_batches = 0
     accum_count = 0
     recent_loss_text = deque(maxlen=100)
     recent_loss_mag = deque(maxlen=100)
+    recent_loss_contrastive = deque(maxlen=100)
 
     prev_grad = torch.is_grad_enabled()
     if not training:
@@ -559,11 +521,23 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
                 padded[i, :s.shape[0]] = s
                 agg_mask[i, :s.shape[0]] = 1
 
+            padded_dev = padded.to(device)
+            agg_mask_dev = agg_mask.to(device)
+
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                enriched = aggregator(padded.to(device), agg_mask.to(device))
+                enriched = aggregator(padded_dev, agg_mask_dev)
                 doc_to_cls = {d: enriched[i] for i, d in enumerate(doc_indices)}
                 batch_cls = torch.stack(
                     [doc_to_cls[c["doc_idx"]] for c in batch_chunks])
+
+                # Contrastive loss: second forward with different dropout mask
+                loss_cl = torch.tensor(0.0, device=device)
+                if training and contrastive_lambda > 0 and len(doc_indices) > 1:
+                    enriched2 = aggregator(padded_dev, agg_mask_dev)
+                    z1 = F.normalize(enriched.float(), dim=-1)
+                    z2 = F.normalize(enriched2.float(), dim=-1)
+                    loss_cl = compute_contrastive_loss(
+                        z1, z2, temperature=contrastive_temp)
 
                 # Pad decoder batch
                 ids, num_mask, num_vals, attn_mask = pad_and_collate(
@@ -598,8 +572,9 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
             # Loss in fp32
             text_logits = text_logits.float()
             mag_logits = mag_logits.float()
-            loss, lt, lm = compute_loss(
+            loss_recon, lt, lm = compute_loss(
                 text_logits, mag_logits, labels_t, labels_m, config)
+            loss = loss_recon + contrastive_lambda * loss_cl
 
             if training:
                 accum_count += 1
@@ -618,8 +593,11 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
             total_loss += loss.item()
             total_loss_text += lt.item()
             total_loss_mag += lm.item()
+            cl_val = loss_cl.item() if torch.is_tensor(loss_cl) else 0.0
+            total_loss_contrastive += cl_val
             recent_loss_text.append(lt.item())
             recent_loss_mag.append(lm.item())
+            recent_loss_contrastive.append(cl_val)
 
             text_masked = labels_t.view(-1) != -100
             if text_masked.any():
@@ -633,12 +611,16 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
             if n_batches % 20 == 0:
                 ma_lt = sum(recent_loss_text) / len(recent_loss_text)
                 ma_lm = sum(recent_loss_mag) / len(recent_loss_mag)
+                ma_cl = sum(recent_loss_contrastive) / len(recent_loss_contrastive)
                 if training:
                     agg_lr = optimizer.param_groups[0]["lr"]
                     dec_lr = optimizer.param_groups[1]["lr"]
-                    pbar.set_postfix(
+                    postfix = dict(
                         text=f"{ma_lt:.3f}", mag=f"{ma_lm:.3f}",
                         agg_lr=f"{agg_lr:.2e}", dec_lr=f"{dec_lr:.2e}")
+                    if contrastive_lambda > 0:
+                        postfix["cl"] = f"{ma_cl:.3f}"
+                    pbar.set_postfix(**postfix)
                 else:
                     pbar.set_postfix(
                         text=f"{ma_lt:.3f}", mag=f"{ma_lm:.3f}")
@@ -660,12 +642,14 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
     avg_loss = total_loss / max(n_batches, 1)
     avg_lt = total_loss_text / max(n_batches, 1)
     avg_lm = total_loss_mag / max(n_batches, 1)
+    avg_cl = total_loss_contrastive / max(n_batches, 1)
     acc = total_correct / max(total_masked, 1)
 
     return {
         "loss": avg_loss,
         "loss_text": avg_lt,
         "loss_mag": avg_lm,
+        "loss_contrastive": avg_cl,
         "text_acc": acc,
         "n_batches": n_batches,
     }
@@ -698,6 +682,10 @@ def main():
     parser.add_argument("--agg_heads", type=int, default=16)
     parser.add_argument("--agg_hidden", type=int, default=768)
     parser.add_argument("--agg_dropout", type=float, default=0.1)
+    parser.add_argument("--contrastive_lambda", type=float, default=0.01,
+                        help="Weight for contrastive loss (0 to disable)")
+    parser.add_argument("--contrastive_temp", type=float, default=0.05,
+                        help="InfoNCE temperature")
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile for kernel fusion")
     args = parser.parse_args()
@@ -784,8 +772,11 @@ def main():
             device, epoch, args, config, tok_info, training=True)
         t_train = time.time() - t0
 
+        cl_str = (f", cl={train_m['loss_contrastive']:.4f}"
+                  if args.contrastive_lambda > 0 else "")
         print(f"\n  Train: loss={train_m['loss']:.4f} "
-              f"(text={train_m['loss_text']:.4f}, mag={train_m['loss_mag']:.4f}) "
+              f"(text={train_m['loss_text']:.4f}, mag={train_m['loss_mag']:.4f}"
+              f"{cl_str}) "
               f"acc={train_m['text_acc']:.1%} [{t_train:.0f}s]")
 
         # Validate

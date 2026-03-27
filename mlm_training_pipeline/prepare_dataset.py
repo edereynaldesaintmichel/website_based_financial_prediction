@@ -1,24 +1,26 @@
 """
-Tokenize whole documents for CLS aggregator training.
+Tokenize whole documents for MLM training.
 
 Each document is tokenized as a single long sequence (no chunking, no truncation).
-Chunking strategy is decided at training time, making the aggregator resilient
-to different chunk sizes.
+Chunking happens at the start of each training epoch, not here.
+
+Includes both financial documents (.md) and Wikipedia regularization documents (.txt).
 
 Output: a single .pt file containing a list of dicts, one per document:
     {
-        "source_file":   str,
-        "input_ids":     LongTensor  (S,),
-        "is_number_mask": BoolTensor (S,),
-        "number_values": FloatTensor (S,),
-        "seq_length":    int,
+        "source_file":    str,
+        "input_ids":      LongTensor  (S,),
+        "is_number_mask": BoolTensor  (S,),
+        "number_values":  FloatTensor (S,),
+        "seq_length":     int,
     }
 
 Usage:
-    python -m cls_aggregator_training_pipeline.prepare_dataset \
+    python -m mlm_training_pipeline.prepare_dataset \
         --input_dirs training_data/processed/SEC_10k_markdown_tagged \
                      training_data/processed/companies_house_markdown_tagged \
-        --output cls_aggregator_data/documents.pt
+                     training_data/processed/wikipedia_tagged \
+        --output mlm_data/documents.pt
 """
 import argparse
 import multiprocessing as mp
@@ -80,10 +82,10 @@ def _tokenize_file(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Tokenize whole documents for CLS aggregator")
+    parser = argparse.ArgumentParser(description="Tokenize whole documents for MLM training")
     parser.add_argument("--input_dirs", nargs="+", required=True,
                         help="Directories containing .md/.txt files")
-    parser.add_argument("--output", default="cls_aggregator_data/documents.pt",
+    parser.add_argument("--output", default="mlm_data/documents.pt",
                         help="Output .pt file")
     parser.add_argument("--max_length", type=int, default=MAX_LENGTH,
                         help="Max token length (safety ceiling)")
@@ -134,8 +136,12 @@ def main():
     documents.sort(key=lambda d: d["source_file"])
 
     # Stats
+    n_financial = sum(1 for d in documents if d["source_file"].endswith(".md"))
+    n_regularization = sum(1 for d in documents if d["source_file"].endswith(".txt"))
     lengths.sort()
     print(f"\nTokenized {len(documents)} documents ({len(all_files) - len(documents)} empty/skipped)")
+    print(f"  Financial (.md): {n_financial}")
+    print(f"  Regularization (.txt): {n_regularization}")
     print(f"Total tokens: {total_tokens:,}")
     print(f"Lengths: min={lengths[0]}, median={lengths[len(lengths)//2]}, "
           f"max={lengths[-1]}, mean={total_tokens/len(documents):.0f}")

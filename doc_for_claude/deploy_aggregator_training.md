@@ -3,9 +3,7 @@
 ## Prerequisites
 
 - A trained T5 checkpoint must exist locally at `checkpoints/t5_expanded_memory/model_only.pt`.
-- Raw markdown documents must exist locally in:
-  - `training_data/processed/SEC_10k_markdown_tagged/`
-  - `training_data/processed/companies_house_markdown_tagged/`
+- A pre-tokenized `documents.pt` file must exist (produced by the MLM training pipeline's `prepare_data.py`).
 
 ## Steps
 
@@ -23,15 +21,11 @@
    ```
    Expect 1× B200 with 192 GB.
 
-4. **Upload raw markdown documents** to the remote:
+4. **Upload `documents.pt`** to the remote:
    ```
    rsync -avz --progress -e "ssh -p <PORT>" \
-       training_data/processed/SEC_10k_markdown_tagged/ \
-       root@<HOST>:/workspace/data/SEC_10k_markdown_tagged/
-
-   rsync -avz --progress -e "ssh -p <PORT>" \
-       training_data/processed/companies_house_markdown_tagged/ \
-       root@<HOST>:/workspace/data/companies_house_markdown_tagged/
+       cls_aggregator_data/documents.pt \
+       root@<HOST>:/workspace/data/cls_aggregator/documents.pt
    ```
 
 5. **Upload T5 checkpoint** to the remote:
@@ -41,16 +35,7 @@
        root@<HOST>:/workspace/data/t5_checkpoint/model_only.pt
    ```
 
-6. **Tokenize documents on the remote** (runs in parallel, ~minutes):
-   ```
-   cd /workspace/website_based_financial_prediction && python -m cls_aggregator_training_pipeline.prepare_dataset \
-       --input_dirs /workspace/data/SEC_10k_markdown_tagged \
-                    /workspace/data/companies_house_markdown_tagged \
-       --output /workspace/data/cls_aggregator/documents.pt
-   ```
-   Wait for this to complete before starting training.
-
-7. **Compute token budgets** based on available VRAM:
+6. **Compute token budgets** based on available VRAM:
    - The T5 model (~300M params) uses ~2 GB in bf16.
    - The aggregator (~56M params) adds ~0.5 GB.
    - That leaves ~189 GB for activations and batch data.
@@ -59,7 +44,7 @@
      - `--decoder_token_budget 32768` (for training, holds gradients)
    - If OOM, halve `decoder_token_budget` first and double `grad_accum_steps` to compensate.
 
-8. **Give the user the training command** to run in their remote terminal:
+7. **Give the user the training command** to run in their remote terminal:
    ```
    cd /workspace/website_based_financial_prediction && python \
        -m cls_aggregator_training_pipeline.train \
@@ -74,7 +59,7 @@
    ```
    Do NOT run this command yourself. The user runs it directly in their SSH session.
 
-9. **Download checkpoints** after training (from local machine):
+8. **Download checkpoints** after training (from local machine):
    ```
    rsync -avz --progress -e "ssh -p <PORT>" \
        root@<HOST>:/workspace/checkpoints/cls_aggregator/ \
@@ -102,4 +87,4 @@ cd /workspace/website_based_financial_prediction && python \
 
 - SSH connection details change daily — always provided by the user at the start of each session.
 - The remote instance is typically a vast.ai GPU instance with PyTorch + CUDA pre-installed.
-- The tokenization step (step 6) only needs to run once; the `.pt` file persists.
+- The `documents.pt` file is produced once by the MLM pipeline and shared across all training pipelines.
