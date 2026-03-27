@@ -232,7 +232,7 @@ def form_batches_1d(chunks, token_budget, bucket_width=16):
 def pad_and_collate(chunks, pad_id):
     """Pad and stack chunk dicts into batch tensors (vectorized)."""
     input_ids = torch.nn.utils.rnn.pad_sequence(
-        [c["input_ids"] for c in chunks], batch_first=True, padding_value=pad_id,
+        [c["input_ids"].long() for c in chunks], batch_first=True, padding_value=pad_id,
     )
     is_number_mask = torch.nn.utils.rnn.pad_sequence(
         [c["is_number_mask"].long() for c in chunks], batch_first=True, padding_value=0,
