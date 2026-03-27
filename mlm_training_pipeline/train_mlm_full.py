@@ -230,22 +230,20 @@ def form_batches_1d(chunks, token_budget, bucket_width=16):
 
 
 def pad_and_collate(chunks, pad_id):
-    """Pad and stack chunk dicts into batch tensors."""
-    max_len = max(c["seq_length"] for c in chunks)
-    B = len(chunks)
-
-    input_ids = torch.full((B, max_len), pad_id, dtype=torch.long)
-    is_number_mask = torch.zeros(B, max_len, dtype=torch.long)
-    number_values = torch.zeros(B, max_len, dtype=torch.float32)
-    attention_mask = torch.zeros(B, max_len, dtype=torch.long)
-
-    for i, c in enumerate(chunks):
-        l = c["seq_length"]
-        input_ids[i, :l] = c["input_ids"]
-        is_number_mask[i, :l] = c["is_number_mask"].long()
-        number_values[i, :l] = c["number_values"].float()
-        attention_mask[i, :l] = 1
-
+    """Pad and stack chunk dicts into batch tensors (vectorized)."""
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        [c["input_ids"] for c in chunks], batch_first=True, padding_value=pad_id,
+    )
+    is_number_mask = torch.nn.utils.rnn.pad_sequence(
+        [c["is_number_mask"].long() for c in chunks], batch_first=True, padding_value=0,
+    )
+    number_values = torch.nn.utils.rnn.pad_sequence(
+        [c["number_values"].float() for c in chunks], batch_first=True, padding_value=0.0,
+    )
+    attention_mask = torch.nn.utils.rnn.pad_sequence(
+        [torch.ones(c["seq_length"], dtype=torch.long) for c in chunks],
+        batch_first=True, padding_value=0,
+    )
     return input_ids, is_number_mask, number_values, attention_mask
 
 
@@ -372,12 +370,12 @@ def run_epoch(model, documents, reg_documents, optimizer, scheduler, scaler,
     create_masked_inputs = _get_create_masked_inputs()
 
     def _prepare_batch(batch_chunks):
-        """Collate, transfer to device, and apply MLM masking."""
+        """Collate, pin memory, transfer to device, and apply MLM masking."""
         ids, num_mask, num_vals, attn_mask = pad_and_collate(batch_chunks, pad_id)
-        ids = ids.to(device, non_blocking=True)
-        num_mask = num_mask.to(device, non_blocking=True)
-        num_vals = num_vals.to(device, non_blocking=True)
-        attn_mask = attn_mask.to(device, non_blocking=True)
+        ids = ids.pin_memory().to(device, non_blocking=True)
+        num_mask = num_mask.pin_memory().to(device, non_blocking=True)
+        num_vals = num_vals.pin_memory().to(device, non_blocking=True)
+        attn_mask = attn_mask.pin_memory().to(device, non_blocking=True)
         m_ids, m_nums, m_num_mask, labels_t, labels_m = create_masked_inputs(
             ids, num_mask, num_vals,
             mask_token_id=mask_id, pad_token_id=pad_id,
