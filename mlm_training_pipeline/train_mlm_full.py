@@ -575,7 +575,7 @@ def train(args):
 
     if args.compile:
         print("Compiling model with torch.compile...")
-        model = torch.compile(model)
+        model = torch.compile(model, dynamic=True)
 
     # ------------------------------------------------------------------
     # Checkpointing
