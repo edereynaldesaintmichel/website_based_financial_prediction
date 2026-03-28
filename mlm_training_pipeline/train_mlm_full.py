@@ -20,7 +20,7 @@ Usage:
 """
 import argparse
 import bisect
-
+import math
 import os
 import random
 import sys
@@ -562,19 +562,24 @@ def train(args):
     total_reg_tokens = sum(d["seq_length"] for d in reg_docs)
     print(f"  Train tokens: {total_train_tokens:,}, regularization tokens: {total_reg_tokens:,}")
 
-    # Estimate batches per epoch for logging only
+    # Estimate batches per epoch for scheduler
     est_batches_per_epoch = total_train_tokens / args.tokens_per_batch
+    total_steps = int(est_batches_per_epoch * args.epochs)
     lr_warmup_steps = args.warmup_steps
 
     def lr_lambda(step):
         if step < lr_warmup_steps:
             return step / max(1, lr_warmup_steps)
+        if args.lr_schedule == "cosine":
+            progress = (step - lr_warmup_steps) / max(1, total_steps - lr_warmup_steps)
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
         return 1.0
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda, lr_lambda])
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
-    print(f"Estimated ~{est_batches_per_epoch:.0f} batches/epoch, warmup: {lr_warmup_steps} steps")
+    print(f"Estimated ~{est_batches_per_epoch:.0f} batches/epoch ({total_steps} total steps), "
+          f"warmup: {lr_warmup_steps} steps, schedule: {args.lr_schedule}")
 
     if args.compile:
         print("Compiling model with torch.compile...")
@@ -693,6 +698,9 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_steps", type=int, default=500,
                         help="Linear warmup steps before cosine decay")
+    parser.add_argument("--lr_schedule", type=str, default="constant",
+                        choices=["constant", "cosine"],
+                        help="LR schedule after warmup: constant or cosine decay to 0")
     parser.add_argument("--regularization_ratio", type=float, default=0.3,
                         help="Probability of inserting a regularization batch "
                              "after each financial batch (0.3 = ~30%%)")
