@@ -195,9 +195,16 @@ def chunk_document(doc, cls_id, sep_id, newline_ids):
 
 def chunk_all_documents(documents, cls_id, sep_id, newline_ids):
     """Chunk all documents, return list of chunk dicts."""
-    all_chunks = []
-    for doc in documents:
-        all_chunks.extend(chunk_document(doc, cls_id, sep_id, newline_ids))
+    # Use single thread – the per-document tensor ops are tiny and the
+    # thread-pool spawn overhead dominates otherwise (460x slower).
+    prev_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        all_chunks = []
+        for doc in documents:
+            all_chunks.extend(chunk_document(doc, cls_id, sep_id, newline_ids))
+    finally:
+        torch.set_num_threads(prev_threads)
     return all_chunks
 
 
