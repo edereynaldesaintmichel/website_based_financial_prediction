@@ -722,7 +722,7 @@ def main():
                         help="Min masking ratio (sampled uniformly per example)")
     parser.add_argument("--mask_prob_max", type=float, default=0.85,
                         help="Max masking ratio (sampled uniformly per example)")
-    parser.add_argument("--contrastive_lambda", type=float, default=0.02,
+    parser.add_argument("--contrastive_lambda", type=float, default=0.15,
                         help="Weight for contrastive loss (target: <10%% of gradient magnitude)")
     parser.add_argument("--seed", type=int, default=42)
 
