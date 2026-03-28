@@ -20,7 +20,7 @@ Usage:
 """
 import argparse
 import bisect
-import math
+
 import os
 import random
 import sys
@@ -559,21 +559,19 @@ def train(args):
     total_reg_tokens = sum(d["seq_length"] for d in reg_docs)
     print(f"  Train tokens: {total_train_tokens:,}, regularization tokens: {total_reg_tokens:,}")
 
-    # Estimate total steps (rough: total_tokens / budget * epochs)
+    # Estimate batches per epoch for logging only
     est_batches_per_epoch = total_train_tokens / args.tokens_per_batch
-    total_steps = int(est_batches_per_epoch * args.epochs)
-    lr_warmup_steps = min(args.warmup_steps, total_steps // 5)
+    lr_warmup_steps = args.warmup_steps
 
     def lr_lambda(step):
         if step < lr_warmup_steps:
             return step / max(1, lr_warmup_steps)
-        progress = (step - lr_warmup_steps) / max(1, total_steps - lr_warmup_steps)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 1.0
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda, lr_lambda])
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
-    print(f"Estimated ~{est_batches_per_epoch:.0f} batches/epoch, {total_steps} total steps")
+    print(f"Estimated ~{est_batches_per_epoch:.0f} batches/epoch, warmup: {lr_warmup_steps} steps")
 
     if args.compile:
         print("Compiling model with torch.compile...")
