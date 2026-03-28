@@ -493,6 +493,9 @@ def train(args):
                               else "cpu")
     if device.type == "cuda":
         torch.set_float32_matmul_precision('medium')
+        # Disable cuDNN SDPA backend — its per-shape plan selection adds ~1s
+        # CPU overhead per batch when sequence lengths vary between batches.
+        torch.backends.cuda.enable_cudnn_sdp(False)
 
     if device.type == "cuda" and args.dtype in ("fp16", "bf16"):
         use_amp = True
