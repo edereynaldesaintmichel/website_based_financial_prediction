@@ -1,8 +1,9 @@
 """
 Training script for T5-style CLS embedding learning.
 
-Encoder sees clean input -> CLS. Decoder sees masked input (random ratio
-per example, 80/10/10 corruption) and reconstructs using CLS + context.
+Encoder sees clean input -> CLS. Decoder (with expanded-memory cross-attention)
+sees masked input (random ratio per example, 80/10/10 corruption) and
+reconstructs using CLS + context.
 
 Data: loads documents.pt (shared with MLM and CLS aggregator pipelines).
 Chunking happens at the start of each epoch with random target sizes and
@@ -567,12 +568,11 @@ def train(args):
     # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
-    print(f"\nBuilding model (cross_attn_type={args.cross_attn_type})...")
+    print("\nBuilding model...")
     model = build_t5_model(
         encoder_checkpoint=args.encoder_checkpoint,
         pretrained_model_id=args.pretrained_model_id,
         num_magnitude_bins=args.num_magnitude_bins,
-        cross_attn_type=args.cross_attn_type,
     )
     model = model.to(device)
 
@@ -706,14 +706,8 @@ def main():
     # Model
     parser.add_argument("--pretrained_model_id", default="answerdotai/ModernBERT-base")
     parser.add_argument("--num_magnitude_bins", type=int, default=128)
-    parser.add_argument("--cross_attn_type", default="mlp", choices=["mlp", "expanded_memory"],
-                        help="CLS conditioning module: 'mlp' (CLSSwiGLU) or 'expanded_memory'")
     parser.add_argument("--encoder_dropout", type=float, default=0.1,
                         help="Dropout probability for encoder (augmentation for contrastive loss)")
-    parser.add_argument("--compare", action="store_true", default=True,
-                        help="Run both cross_attn_type variants for 1 epoch and compare val loss")
-    parser.add_argument("--no_compare", action="store_false", dest="compare",
-                        help="Disable compare mode, train a single variant")
 
     # Training
     parser.add_argument("--epochs", type=int, default=5)
@@ -743,61 +737,7 @@ def main():
 
     args = parser.parse_args()
 
-    if args.compare:
-        # Run both variants for 1 epoch, report val loss
-        base_output_dir = args.output_dir
-        original_epochs = args.epochs
-        args.epochs = 1
-        results = {}
-
-        for variant in ("mlp", "expanded_memory"):
-            args.cross_attn_type = variant
-            args.output_dir = os.path.join(base_output_dir, f"compare_{variant}")
-
-            # Check if this variant already finished
-            finished_ckpt = os.path.join(args.output_dir, "checkpoint_epoch1", "full_model.pt")
-            if os.path.exists(finished_ckpt):
-                ckpt = torch.load(finished_ckpt, map_location="cpu", weights_only=False)
-                val_loss = ckpt.get("val_loss")
-                if val_loss is not None:
-                    print(f"\n{'='*60}")
-                    print(f"  COMPARE: {variant} already finished (val_loss={val_loss:.4f}), skipping")
-                    print(f"{'='*60}\n")
-                    results[variant] = val_loss
-                    continue
-
-            # Check for a partial checkpoint to resume from
-            latest_ckpt = os.path.join(args.output_dir, "checkpoint_latest")
-            if os.path.exists(os.path.join(latest_ckpt, "full_model.pt")):
-                print(f"\n{'='*60}")
-                print(f"  COMPARE: resuming {variant} from {latest_ckpt}")
-                print(f"{'='*60}\n")
-                args.resume_from = latest_ckpt
-            else:
-                print(f"\n{'='*60}")
-                print(f"  COMPARE: training with cross_attn_type={variant}")
-                print(f"{'='*60}\n")
-                args.resume_from = None
-
-            train(args)
-
-            # Read back val loss
-            if os.path.exists(finished_ckpt):
-                ckpt = torch.load(finished_ckpt, map_location="cpu", weights_only=False)
-                results[variant] = ckpt.get("val_loss", float("nan"))
-            else:
-                results[variant] = float("nan")
-
-        print(f"\n{'='*60}")
-        print("  COMPARISON RESULTS (1 epoch)")
-        print(f"{'='*60}")
-        for variant, val_loss in results.items():
-            print(f"  {variant:20s}  val_loss = {val_loss:.4f}")
-        best = min(results, key=results.get)
-        print(f"\n  Best: {best} (val_loss={results[best]:.4f})")
-        args.epochs = original_epochs
-    else:
-        train(args)
+    train(args)
 
 
 if __name__ == "__main__":
