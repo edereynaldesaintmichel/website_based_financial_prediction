@@ -564,22 +564,9 @@ def train(args):
 
     # Estimate batches per epoch for scheduler
     est_batches_per_epoch = total_train_tokens / args.tokens_per_batch
-    total_steps = int(est_batches_per_epoch * args.epochs)
     lr_warmup_steps = args.warmup_steps
 
-    def lr_lambda(step):
-        if step < lr_warmup_steps:
-            return step / max(1, lr_warmup_steps)
-        if args.lr_schedule == "cosine":
-            progress = (step - lr_warmup_steps) / max(1, total_steps - lr_warmup_steps)
-            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-        return 1.0
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda, lr_lambda])
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
-
-    print(f"Estimated ~{est_batches_per_epoch:.0f} batches/epoch ({total_steps} total steps), "
-          f"warmup: {lr_warmup_steps} steps, schedule: {args.lr_schedule}")
 
     if args.compile:
         print("Compiling model with torch.compile...")
@@ -625,12 +612,30 @@ def train(args):
                           for k, v in state_dict.items()}
         model.load_state_dict(state_dict)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         if "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_epoch = ckpt["epoch"]
         global_step = ckpt["global_step"]
         print(f"  Resumed at epoch={start_epoch}, global_step={global_step}")
+
+    # ------------------------------------------------------------------
+    # Scheduler (created after resume so total_steps covers remaining epochs)
+    # ------------------------------------------------------------------
+    remaining_epochs = args.epochs - start_epoch
+    total_steps = int(est_batches_per_epoch * remaining_epochs)
+
+    def lr_lambda(step):
+        if step < lr_warmup_steps:
+            return step / max(1, lr_warmup_steps)
+        if args.lr_schedule == "cosine":
+            progress = (step - lr_warmup_steps) / max(1, total_steps - lr_warmup_steps)
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress))))
+        return 1.0
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda, lr_lambda])
+    print(f"Estimated ~{est_batches_per_epoch:.0f} batches/epoch ({total_steps} total steps over "
+          f"{remaining_epochs} remaining epoch(s)), warmup: {lr_warmup_steps} steps, "
+          f"schedule: {args.lr_schedule}")
 
     # ------------------------------------------------------------------
     # Training loop
