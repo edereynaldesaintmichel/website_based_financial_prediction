@@ -300,7 +300,7 @@ def _prefetch_iter(batches, prepare_fn):
 
 # ─── Training ────────────────────────────────────────────────────────────────
 
-def run_epoch(model, documents, reg_documents, optimizer, scheduler, scaler,
+def run_epoch(model, documents, optimizer, scheduler, scaler,
               device, epoch, args, tok_info, use_amp, amp_dtype, training=True):
     """Run one training or validation epoch."""
     prefix = "Train" if training else "Val"
@@ -321,39 +321,24 @@ def run_epoch(model, documents, reg_documents, optimizer, scheduler, scaler,
 
     # ─── Step 1: Chunk all documents ────────────────────────────────────
     print(f"  Chunking documents...")
-    fin_chunks = chunk_all_documents(documents, cls_id, sep_id, nl_ids)
-    n_fin = len(fin_chunks)
-    avg_fin = sum(c["seq_length"] for c in fin_chunks) / max(n_fin, 1)
-
-    reg_chunks = []
-    if reg_documents:
-        reg_chunks = chunk_all_documents(reg_documents, cls_id, sep_id, nl_ids)
-    n_reg = len(reg_chunks)
-    avg_reg = sum(c["seq_length"] for c in reg_chunks) / max(n_reg, 1)
-
-    print(f"  Chunks: {n_fin} financial (avg {avg_fin:.0f}), "
-          f"{n_reg} regularization (avg {avg_reg:.0f})")
+    all_chunks = chunk_all_documents(documents, cls_id, sep_id, nl_ids)
+    n_chunks = len(all_chunks)
+    avg_len = sum(c["seq_length"] for c in all_chunks) / max(n_chunks, 1)
+    print(f"  {n_chunks} chunks (avg {avg_len:.0f} tokens)")
 
     # ─── Step 2: Form batches ───────────────────────────────────────────
-    fin_batches = form_batches_1d(fin_chunks, args.tokens_per_batch)
-    del fin_chunks
-
-    reg_batches = []
-    if reg_chunks:
-        reg_batches = form_batches_1d(reg_chunks, args.tokens_per_batch)
-    del reg_chunks
+    batches = form_batches_1d(all_chunks, args.tokens_per_batch)
+    del all_chunks
 
     # Estimate padding waste
     total_useful = 0
     total_padded = 0
-    for batch in fin_batches + reg_batches:
+    for batch in batches:
         max_len = max(c["seq_length"] for c in batch)
         total_useful += sum(c["seq_length"] for c in batch)
         total_padded += max_len * len(batch)
     waste = 1.0 - total_useful / max(total_padded, 1)
-    print(f"  {len(fin_batches)} financial batches, "
-          f"{len(reg_batches)} regularization batches, "
-          f"padding waste: {waste:.1%}")
+    print(f"  {len(batches)} batches, padding waste: {waste:.1%}")
 
     random.setstate(rng_state)
 
@@ -363,11 +348,7 @@ def run_epoch(model, documents, reg_documents, optimizer, scheduler, scaler,
     total_loss_mag = 0.0
     n_batches = 0
     MA_WINDOW = 100
-    ma = {k: deque(maxlen=MA_WINDOW) for k in ("loss", "text", "mag", "reg")}
-
-    # Build interleaved batch iterator: financial batches with probabilistic
-    # regularization insertion
-    reg_iter = iter(reg_batches) if reg_batches else None
+    ma = {k: deque(maxlen=MA_WINDOW) for k in ("loss", "text", "mag")}
 
     prev_grad = torch.is_grad_enabled()
     if not training:
@@ -397,8 +378,8 @@ def run_epoch(model, documents, reg_documents, optimizer, scheduler, scaler,
 
     try:
         pbar = tqdm(
-            _prefetch_iter(fin_batches, _prepare_batch),
-            total=len(fin_batches), desc=f"  {prefix}", unit="batch",
+            _prefetch_iter(batches, _prepare_batch),
+            total=len(batches), desc=f"  {prefix}", unit="batch",
         )
         for m_ids, m_nums, m_num_mask, labels_t, labels_m, attn_mask in pbar:
 
@@ -416,30 +397,6 @@ def run_epoch(model, documents, reg_documents, optimizer, scheduler, scaler,
 
             if training:
                 scaler.scale(loss).backward()
-
-                # Regularization batch (interleaved)
-                if reg_iter and random.random() < args.regularization_ratio:
-                    try:
-                        reg_batch = next(reg_iter)
-                    except StopIteration:
-                        reg_iter = iter(reg_batches)
-                        reg_batch = next(reg_iter)
-
-                    rm_ids, rm_nums, rm_nm, rl_t, rl_m, r_am = _prepare_batch(reg_batch)
-
-                    with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                        reg_outputs = model(
-                            input_ids=rm_ids,
-                            attention_mask=r_am,
-                            is_number_mask=rm_nm,
-                            number_values=rm_nums,
-                            labels_text=rl_t,
-                            labels_magnitude=rl_m,
-                        )
-                    reg_loss = reg_outputs["loss"]
-                    scaler.scale(reg_loss).backward()
-                    ma["reg"].append(reg_loss.item())
-
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
@@ -463,8 +420,6 @@ def run_epoch(model, documents, reg_documents, optimizer, scheduler, scaler,
                 }
                 if training:
                     postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
-                if ma["reg"]:
-                    postfix["reg"] = f"{sum(ma['reg'])/len(ma['reg']):.4f}"
                 pbar.set_postfix(**postfix)
 
     finally:
@@ -552,15 +507,19 @@ def train(args):
     del documents
 
     # Split financial docs into train/val using deterministic hash
-    train_docs, val_docs = split_documents(financial_docs)
+    train_fin, val_fin = split_documents(financial_docs)
     del financial_docs
 
-    print(f"  {len(train_docs)} train, {len(val_docs)} val financial documents")
-    print(f"  {len(reg_docs)} regularization documents")
+    # Merge regularization docs into training set
+    train_docs = train_fin + reg_docs
+    val_docs = val_fin
+
+    print(f"  {len(train_fin)} train, {len(val_fin)} val financial documents, "
+          f"{len(reg_docs)} regularization documents (mixed into train)")
+    del train_fin, val_fin, reg_docs
 
     total_train_tokens = sum(d["seq_length"] for d in train_docs)
-    total_reg_tokens = sum(d["seq_length"] for d in reg_docs)
-    print(f"  Train tokens: {total_train_tokens:,}, regularization tokens: {total_reg_tokens:,}")
+    print(f"  Train tokens: {total_train_tokens:,}")
 
     # Estimate batches per epoch for scheduler
     est_batches_per_epoch = total_train_tokens / args.tokens_per_batch
@@ -651,7 +610,7 @@ def train(args):
         # Train
         t0 = time.time()
         train_m = run_epoch(
-            model, train_docs, reg_docs, optimizer, scheduler, scaler,
+            model, train_docs, optimizer, scheduler, scaler,
             device, epoch, args, tok_info, use_amp, amp_dtype, training=True)
         t_train = time.time() - t0
         global_step += train_m["n_batches"]
@@ -663,7 +622,7 @@ def train(args):
         # Validate
         t0 = time.time()
         val_m = run_epoch(
-            model, val_docs, None, optimizer, scheduler, scaler,
+            model, val_docs, optimizer, scheduler, scaler,
             device, epoch, args, tok_info, use_amp, amp_dtype, training=False)
         t_val = time.time() - t0
 
@@ -706,9 +665,6 @@ def main():
     parser.add_argument("--lr_schedule", type=str, default="constant",
                         choices=["constant", "cosine"],
                         help="LR schedule after warmup: constant or cosine decay to 0")
-    parser.add_argument("--regularization_ratio", type=float, default=0.3,
-                        help="Probability of inserting a regularization batch "
-                             "after each financial batch (0.3 = ~30%%)")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bf16",
                         choices=["fp32", "fp16", "bf16"])
