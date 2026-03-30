@@ -886,8 +886,7 @@ def main():
 
     decoder = model.decoder
     if args.compile:
-        rprint(rank, "Compiling encoder, decoder, and aggregator with torch.compile...")
-        model.encoder = torch.compile(model.encoder, dynamic=True)
+        rprint(rank, "Compiling decoder with torch.compile...")
         decoder = torch.compile(decoder, dynamic=True)
 
     # Token info
@@ -910,8 +909,6 @@ def main():
     n_agg = sum(p.numel() for p in aggregator.parameters()) / 1e6
     rprint(rank, f"\nAggregator: {n_agg:.1f}M params")
 
-    if args.compile:
-        aggregator = torch.compile(aggregator, dynamic=True)
 
     # Wrap trainable modules in DDP
     if world_size > 1:
