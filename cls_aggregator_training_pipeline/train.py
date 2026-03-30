@@ -838,8 +838,8 @@ def main():
                         default="checkpoints/t5_cls/checkpoint_epoch5/full_model.pt")
     parser.add_argument("--output_dir", default="checkpoints/cls_aggregator")
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--decoder_lr", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--decoder_lr", type=float, default=2e-5)
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -856,7 +856,7 @@ def main():
     parser.add_argument("--agg_heads", type=int, default=16)
     parser.add_argument("--agg_hidden", type=int, default=768)
     parser.add_argument("--agg_dropout", type=float, default=0.1)
-    parser.add_argument("--contrastive_lambda", type=float, default=0.1,
+    parser.add_argument("--contrastive_lambda", type=float, default=1,
                         help="Weight for contrastive loss (0 to disable)")
     parser.add_argument("--contrastive_temp", type=float, default=0.05,
                         help="InfoNCE temperature")
