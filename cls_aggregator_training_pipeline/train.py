@@ -553,6 +553,17 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
     # ─── Step 3c: Shard batches across ranks ──────────────────────────────
     dec_batches = dec_batches[rank::world_size]
 
+    # ─── Step 3d: Pre-collate decoder batches into pinned memory ─────────
+    dec_collated = []
+    for batch in dec_batches:
+        ids, num_mask, num_vals, attn_mask = pad_and_collate(batch, pad_id)
+        dec_collated.append((
+            ids.pin_memory(),
+            num_mask.pin_memory(),
+            num_vals.pin_memory(),
+            attn_mask.pin_memory(),
+        ))
+
     # ─── Step 4: Train/eval on decoder batches ──────────────────────────
     # Unwrap DDP for attribute access (forward still goes through DDP wrapper)
     decoder_inner = decoder.module if isinstance(decoder, DDP) else decoder
@@ -577,9 +588,9 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
         optimizer.zero_grad()
 
     try:
-        pbar = tqdm(dec_batches, desc=f"  {prefix}", unit="batch",
-                    disable=(rank != 0))
-        for batch_idx, batch_chunks in enumerate(pbar):
+        pbar = tqdm(zip(dec_batches, dec_collated), total=len(dec_batches),
+                    desc=f"  {prefix}", unit="batch", disable=(rank != 0))
+        for batch_idx, (batch_chunks, collated) in enumerate(pbar):
             # Aggregator: batched forward over unique documents
             doc_indices = list(set(c["doc_idx"] for c in batch_chunks))
             cls_seqs = [doc_cls[d] for d in doc_indices]
@@ -608,13 +619,9 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
                     loss_cl = compute_contrastive_loss(
                         z1, z2, temperature=contrastive_temp)
 
-                # Pad decoder batch
-                ids, num_mask, num_vals, attn_mask = pad_and_collate(
-                    batch_chunks, pad_id)
-                ids = ids.to(device)
-                num_mask = num_mask.to(device)
-                num_vals = num_vals.to(device)
-                attn_mask = attn_mask.to(device)
+                # Load pre-collated decoder batch from pinned memory
+                ids, num_mask, num_vals, attn_mask = (
+                    t.to(device, non_blocking=True) for t in collated)
 
                 # Apply masking
                 (m_ids, m_nums, m_num_mask,
@@ -879,7 +886,7 @@ def main():
 
     decoder = model.decoder
     if args.compile:
-        rprint(rank, "Compiling encoder and decoder with torch.compile...")
+        rprint(rank, "Compiling encoder, decoder, and aggregator with torch.compile...")
         model.encoder = torch.compile(model.encoder, dynamic=True)
         decoder = torch.compile(decoder, dynamic=True)
 
@@ -902,6 +909,9 @@ def main():
     ).to(device)
     n_agg = sum(p.numel() for p in aggregator.parameters()) / 1e6
     rprint(rank, f"\nAggregator: {n_agg:.1f}M params")
+
+    if args.compile:
+        aggregator = torch.compile(aggregator, dynamic=True)
 
     # Wrap trainable modules in DDP
     if world_size > 1:
