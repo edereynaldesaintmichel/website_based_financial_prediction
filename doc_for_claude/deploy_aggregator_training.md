@@ -22,6 +22,8 @@
    Examples: 1× B200 (192 GB), 4×5090 (32 GB each), 8×5090.
 
 4. **Upload `documents.pt`** to the remote:
+
+   Don't forget to mkdir the necessary directories.
    ```
    rsync -avz --progress -e "ssh -p <PORT>" \
        mlm_data/documents.pt \

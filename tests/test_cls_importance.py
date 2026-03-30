@@ -34,14 +34,14 @@ DOC_DIR = "training_data/processed/SEC_10k_markdown_tagged"
 VAL_BUCKET = "t5_training_data/val/bucket_530.pt"
 
 
-def load_model(checkpoint_path, cross_attn_type="expanded_memory"):
+def load_model(checkpoint_path):
     """Load the T5 model from a checkpoint without needing the original encoder file."""
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = FinancialModernBertConfig.from_pretrained(PRETRAINED_ID)
     config.num_magnitude_bins = ckpt["args"].get("num_magnitude_bins", 128)
 
     from t5_style_training_pipeline.decoder import T5StyleModel
-    model = T5StyleModel(config, cross_attn_type=cross_attn_type)
+    model = T5StyleModel(config)
 
     state_dict = {k.removeprefix("_orig_mod."): v
                   for k, v in ckpt["model_state_dict"].items()}

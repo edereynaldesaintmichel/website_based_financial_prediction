@@ -93,7 +93,7 @@ def load_t5_model(checkpoint_path, device, rank=0):
     config = FinancialModernBertConfig.from_pretrained(PRETRAINED_ID)
     config.num_magnitude_bins = ckpt["args"].get("num_magnitude_bins", 128)
 
-    model = T5StyleModel(config, cross_attn_type="expanded_memory")
+    model = T5StyleModel(config)
     state_dict = {k.removeprefix("_orig_mod."): v
                   for k, v in ckpt["model_state_dict"].items()}
     del ckpt
