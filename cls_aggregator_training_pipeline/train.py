@@ -225,11 +225,12 @@ def form_batches_2d(items, budget, bucket_width=16):
 
 @torch.no_grad()
 def compute_all_cls(model, enc_chunks, device, token_budget, pad_id,
-                    rank=0, world_size=1):
+                    rank=0, world_size=1, cache_path=None):
     """Compute CLS embeddings for all encoder chunks.
 
-    In multi-GPU mode, each rank processes its shard of batches and results
-    are all-gathered so every rank gets the full doc_cls dict.
+    In multi-GPU mode, each rank processes its shard of batches, saves to a
+    temporary file, and rank 0 merges all shards into the final cache.
+    This avoids the memory spike of all-gathering large result dicts.
 
     Returns: dict of doc_idx → Tensor(N, D) on CPU.
     """
@@ -273,11 +274,32 @@ def compute_all_cls(model, enc_chunks, device, token_budget, pad_id,
     # Free GPU memory from encoder forward passes
     torch.cuda.empty_cache()
 
-    # All-gather results across ranks
-    if world_size > 1:
+    # Multi-GPU: merge via disk instead of all-gather to avoid memory spike
+    if world_size > 1 and cache_path is not None:
+        shard_path = cache_path + f".shard_{rank}"
+        torch.save(results, shard_path)
+        del results
+        dist.barrier()
+
+        if rank == 0:
+            merged = {}
+            for r in range(world_size):
+                shard = torch.load(
+                    cache_path + f".shard_{r}",
+                    map_location="cpu", weights_only=False)
+                for doc_idx, chunks_dict in shard.items():
+                    if doc_idx not in merged:
+                        merged[doc_idx] = {}
+                    merged[doc_idx].update(chunks_dict)
+                del shard
+            results = merged
+        else:
+            # Non-zero ranks will load the final cache after rank 0 saves it
+            return None
+    elif world_size > 1:
+        # Fallback if no cache_path: use all-gather
         all_results = [None] * world_size
         dist.all_gather_object(all_results, results)
-        # Merge: each rank may have different doc_idx/chunk_idx pairs
         merged = {}
         for r in all_results:
             for doc_idx, chunks_dict in r.items():
@@ -465,11 +487,21 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
         all_enc_chunks.sort(key=lambda c: c["seq_length"])
         doc_cls = compute_all_cls(
             model, all_enc_chunks, device, args.encoder_token_budget, pad_id,
-            rank=rank, world_size=world_size)
+            rank=rank, world_size=world_size, cache_path=cls_cache_path)
         del all_enc_chunks
         if rank == 0:
             torch.save(doc_cls, cls_cache_path)
             rprint(rank, f"  Cached CLS embeddings to {cls_cache_path}")
+            # Clean up shard files
+            for r in range(world_size):
+                shard = cls_cache_path + f".shard_{r}"
+                if os.path.exists(shard):
+                    os.remove(shard)
+        if world_size > 1:
+            dist.barrier()  # Wait for rank 0 to save the merged cache
+            if doc_cls is None:
+                doc_cls = torch.load(cls_cache_path, map_location="cpu",
+                                     weights_only=False)
     torch.cuda.empty_cache()
 
     # ─── Step 3: 2D bucketing (dec_len × n_cls), form batches ───────────
