@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- A trained T5 checkpoint must exist locally at `checkpoints/t5_expanded_memory/model_only.pt`.
+- A trained T5 checkpoint must exist locally at `checkpoints/t5_cls/checkpoint_epoch5/full_model.pt`.
 - A pre-tokenized `documents.pt` file must exist (produced by the MLM training pipeline's `prepare_data.py`).
 
 ## Steps
@@ -25,14 +25,14 @@
    ```
    rsync -avz --progress -e "ssh -p <PORT>" \
        mlm_data/documents.pt \
-       root@<HOST>:/workspace/data/cls_aggregator/documents.pt
+       root@<HOST>:/workspace/data/documents.pt
    ```
 
 5. **Upload T5 checkpoint** to the remote:
    ```
    rsync -avz --progress -e "ssh -p <PORT>" \
-       checkpoints/t5_expanded_memory/model_only.pt \
-       root@<HOST>:/workspace/data/t5_checkpoint/model_only.pt
+       checkpoints/t5_cls/checkpoint_epoch5/full_model.pt \
+       root@<HOST>:/workspace/data/t5_checkpoint/full_model.pt
    ```
 
 6. **Compute token budgets** based on available VRAM:
@@ -48,8 +48,8 @@
    ```
    cd /workspace/website_based_financial_prediction && python \
        -m cls_aggregator_training_pipeline.train \
-       --data /workspace/data/cls_aggregator/documents.pt \
-       --checkpoint /workspace/data/t5_checkpoint/model_only.pt \
+       --data /workspace/data/documents.pt \
+       --checkpoint /workspace/data/t5_checkpoint/full_model.pt \
        --output_dir /workspace/checkpoints/cls_aggregator \
        --encoder_token_budget 65536 \
        --decoder_token_budget 32768 \
@@ -72,8 +72,8 @@ If training is interrupted, re-run the same command with `--resume`:
 ```
 cd /workspace/website_based_financial_prediction && python \
    -m cls_aggregator_training_pipeline.train \
-   --data /workspace/data/cls_aggregator/documents.pt \
-   --checkpoint /workspace/data/t5_checkpoint/model_only.pt \
+   --data /workspace/data/documents.pt \
+   --checkpoint /workspace/data/t5_checkpoint/full_model.pt \
    --output_dir /workspace/checkpoints/cls_aggregator \
    --resume \
    --encoder_token_budget 65536 \

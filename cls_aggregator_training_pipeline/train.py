@@ -16,8 +16,8 @@ Encoder and decoder are frozen. Only the aggregator is trained.
 
 Usage (single GPU):
     python -m cls_aggregator_training_pipeline.train \
-        --data cls_aggregator_data/documents.pt \
-        --checkpoint checkpoints/t5_expanded_memory/model_only.pt
+        --data mlm_data/documents.pt \
+        --checkpoint checkpoints/t5_cls/checkpoint_epoch5/full_model.pt
 """
 import argparse
 import math
@@ -300,43 +300,24 @@ def compute_contrastive_loss(z1, z2, temperature=0.05):
     return loss
 
 
-# ─── Same-source pair evaluation ────────────────────────────────────────────
+def evaluate_contrastive_positives(dec_batches):
+    """Report unique-documents-per-batch stats (= contrastive positive count).
 
-def evaluate_same_source_pairs(dec_batches, documents, doc_idx_to_source):
-    """Evaluate how many same-source-document pairs exist per batch.
-
-    The 2D bucketing sorts by (n_cls, doc_idx) within length buckets,
-    which may naturally group documents from the same source company.
-
-    Args:
-        dec_batches: list of batches, each a list of chunk dicts with 'doc_idx'
-        documents: list of document dicts (unused, kept for API clarity)
-        doc_idx_to_source: dict mapping doc_idx → source identifier string
-
-    Returns:
-        Average number of same-source document pairs per batch.
+    Each unique document in a batch produces one SimCSE positive pair
+    (same doc, two dropout masks). Batches with ≤1 doc yield no contrastive signal.
     """
-    total_pairs = 0
-    n_batches_with_multiple_docs = 0
-
+    docs_per_batch = []
     for batch in dec_batches:
-        # Unique doc indices in this batch
-        doc_indices = list(set(c["doc_idx"] for c in batch))
-        if len(doc_indices) < 2:
-            continue
-        n_batches_with_multiple_docs += 1
+        n_unique = len(set(c["doc_idx"] for c in batch))
+        docs_per_batch.append(n_unique)
 
-        # Count same-source pairs among unique docs
-        sources = [doc_idx_to_source.get(d, d) for d in doc_indices]
-        n_same = 0
-        for i in range(len(sources)):
-            for j in range(i + 1, len(sources)):
-                if sources[i] == sources[j]:
-                    n_same += 1
-        total_pairs += n_same
+    n_batches = len(docs_per_batch)
+    n_contrastive = sum(1 for d in docs_per_batch if d > 1)
+    avg_docs = sum(docs_per_batch) / max(n_batches, 1)
+    min_docs = min(docs_per_batch) if docs_per_batch else 0
+    max_docs = max(docs_per_batch) if docs_per_batch else 0
 
-    avg = total_pairs / max(n_batches_with_multiple_docs, 1)
-    return avg, total_pairs, n_batches_with_multiple_docs
+    return avg_docs, min_docs, max_docs, n_contrastive, n_batches
 
 
 # ─── LR Schedule ────────────────────────────────────────────────────────────
@@ -473,20 +454,12 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
           f"weighted {weighted_waste:.1%}")
     print(f"  {len(dec_batches)} decoder batches")
 
-    # ─── Step 3b: Evaluate same-source pairs in batches ──────────────────
-    if training:
-        doc_idx_to_source = {}
-        for doc_idx, doc in enumerate(documents):
-            sf = doc.get("source_file", "")
-            # Strip filing-specific suffixes to get the company/source identifier.
-            # e.g. "CompanyX_2023.md" and "CompanyX_2024.md" share source "CompanyX"
-            base = sf.rsplit("_", 1)[0] if "_" in sf else sf
-            doc_idx_to_source[doc_idx] = base
-
-        avg_pairs, total_pairs, n_multi = evaluate_same_source_pairs(
-            dec_batches, documents, doc_idx_to_source)
-        print(f"  Same-source pairs: {avg_pairs:.2f} avg/batch "
-              f"({total_pairs} total across {n_multi} multi-doc batches)")
+    # ─── Step 3b: Contrastive positive stats ──────────────────────────────
+    avg_docs, min_docs, max_docs, n_cl, n_total = evaluate_contrastive_positives(
+        dec_batches)
+    print(f"  Contrastive positives: {avg_docs:.1f} avg docs/batch "
+          f"(min {min_docs}, max {max_docs}), "
+          f"{n_cl}/{n_total} batches with ≥2 docs")
 
     # ─── Step 4: Train/eval on decoder batches ──────────────────────────
     total_loss = 0.0
@@ -655,15 +628,113 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
     }
 
 
+# ─── Dry Run (CPU-only, no model) ──────────────────────────────────────
+
+def _dry_run(args):
+    """Chunk + batch documents and report same-source pair stats, then exit."""
+    random.seed(args.seed)
+
+    tok_info = get_token_info(PRETRAINED_ID)
+    cls_id = tok_info["cls_id"]
+    sep_id = tok_info["sep_id"]
+    nl_ids = tok_info["newline_ids"]
+
+    print(f"Loading documents from {args.data}...")
+    documents = torch.load(args.data, map_location="cpu", weights_only=False)
+    train_docs, val_docs = split_documents(documents, args.val_ratio)
+    del documents
+    print(f"  {len(train_docs)} train, {len(val_docs)} val documents")
+
+    for split_name, docs in [("Train", train_docs), ("Val", val_docs)]:
+        print(f"\n--- {split_name} ---")
+
+        all_enc_chunks = []
+        all_dec_chunks = []
+        doc_enc_spans = {}
+
+        for doc_idx, doc in enumerate(docs):
+            content_len = len(doc["input_ids"]) - 2
+            if content_len < 1:
+                continue
+            boundaries = get_boundaries(doc["input_ids"], nl_ids)
+
+            enc_target = random.randint(CHUNK_MIN, CHUNK_MAX)
+            enc_spans = chunk_spans(content_len, boundaries, lambda: enc_target)
+            doc_enc_spans[doc_idx] = enc_spans
+
+            for ci, (s, e) in enumerate(enc_spans):
+                chunk = extract_chunk(doc, s, e, cls_id, sep_id)
+                chunk["doc_idx"] = doc_idx
+                chunk["chunk_idx"] = ci
+                all_enc_chunks.append(chunk)
+
+            n_cls = len(enc_spans)
+            dec_spans = chunk_spans(
+                content_len, boundaries,
+                lambda: random.randint(CHUNK_MIN, CHUNK_MAX))
+            for ci, (s, e) in enumerate(dec_spans):
+                chunk = extract_chunk(doc, s, e, cls_id, sep_id)
+                chunk["doc_idx"] = doc_idx
+                chunk["n_cls"] = n_cls
+                all_dec_chunks.append(chunk)
+
+        n_enc = len(all_enc_chunks)
+        n_dec = len(all_dec_chunks)
+        avg_enc = sum(c["seq_length"] for c in all_enc_chunks) / max(n_enc, 1)
+        avg_dec = sum(c["seq_length"] for c in all_dec_chunks) / max(n_dec, 1)
+        print(f"  Chunks: {n_enc} encoder (avg {avg_enc:.0f}), "
+              f"{n_dec} decoder (avg {avg_dec:.0f})")
+
+        avg_cls_per_doc = n_enc / max(len(doc_enc_spans), 1)
+        batch_budget = (DEC_COST_WEIGHT * args.decoder_token_budget
+                        + AGG_COST_WEIGHT * avg_cls_per_doc)
+        print(f"  Batch budget: {batch_budget:.0f} "
+              f"(avg {avg_cls_per_doc:.1f} CLS/doc)")
+        dec_batches = form_batches_2d(all_dec_chunks, batch_budget)
+        print(f"  {len(dec_batches)} decoder batches")
+
+        # Padding waste
+        total_dec_useful = total_dec_padded = 0
+        total_agg_useful = total_agg_padded = 0
+        for batch in dec_batches:
+            max_dec = max(c["seq_length"] for c in batch)
+            total_dec_useful += sum(c["seq_length"] for c in batch)
+            total_dec_padded += max_dec * len(batch)
+            batch_docs = {}
+            for c in batch:
+                batch_docs[c["doc_idx"]] = c["n_cls"]
+            max_cls = max(batch_docs.values())
+            total_agg_useful += sum(batch_docs.values())
+            total_agg_padded += max_cls * len(batch_docs)
+        dec_waste = 1.0 - total_dec_useful / max(total_dec_padded, 1)
+        agg_waste = 1.0 - total_agg_useful / max(total_agg_padded, 1)
+        weighted_waste = (
+            (DEC_COST_WEIGHT * (total_dec_padded - total_dec_useful)
+             + AGG_COST_WEIGHT * (total_agg_padded - total_agg_useful))
+            / max(DEC_COST_WEIGHT * total_dec_padded
+                  + AGG_COST_WEIGHT * total_agg_padded, 1)
+        )
+        print(f"  Padding waste: decoder {dec_waste:.1%}, "
+              f"aggregator {agg_waste:.1%}, "
+              f"weighted {weighted_waste:.1%}")
+
+        # Contrastive positive stats
+        avg_docs, min_docs, max_docs, n_cl, n_total = \
+            evaluate_contrastive_positives(dec_batches)
+        print(f"  Contrastive positives: {avg_docs:.1f} avg docs/batch "
+              f"(min {min_docs}, max {max_docs}), "
+              f"{n_cl}/{n_total} batches with ≥2 docs")
+
+
 # ─── Main ──────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Train CLS Aggregator")
-    parser.add_argument("--data", default="cls_aggregator_data/documents.pt")
+    parser.add_argument("--data", default="mlm_data/documents.pt")
     parser.add_argument("--checkpoint",
-                        default="checkpoints/t5_expanded_memory/model_only.pt")
+                        default="checkpoints/t5_cls/checkpoint_epoch5/full_model.pt")
     parser.add_argument("--output_dir", default="checkpoints/cls_aggregator")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--decoder_lr", type=float, default=1e-5)
     parser.add_argument("--warmup_steps", type=int, default=500)
@@ -682,13 +753,19 @@ def main():
     parser.add_argument("--agg_heads", type=int, default=16)
     parser.add_argument("--agg_hidden", type=int, default=768)
     parser.add_argument("--agg_dropout", type=float, default=0.1)
-    parser.add_argument("--contrastive_lambda", type=float, default=0.01,
+    parser.add_argument("--contrastive_lambda", type=float, default=0.1,
                         help="Weight for contrastive loss (0 to disable)")
     parser.add_argument("--contrastive_temp", type=float, default=0.05,
                         help="InfoNCE temperature")
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile for kernel fusion")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Only compute chunking/batching stats (no model, no GPU)")
     args = parser.parse_args()
+
+    if args.dry_run:
+        _dry_run(args)
+        return
 
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)

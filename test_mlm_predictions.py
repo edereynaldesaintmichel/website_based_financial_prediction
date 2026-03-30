@@ -8,7 +8,7 @@ reconstructs each chunk showing predictions inline.
 Usage:
     python test_mlm_predictions.py \
         --doc_index 0 \
-        --checkpoint checkpoints/mlm_full_baseline/checkpoint_epoch3/ \
+        --checkpoint checkpoints/mlm_full/checkpoint_epoch3/ \
         --max_chunks 5
 """
 import argparse
