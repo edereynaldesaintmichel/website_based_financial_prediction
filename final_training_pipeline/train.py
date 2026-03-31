@@ -5,7 +5,7 @@ Pipeline:
 1. Load documents + growth rates, match by company ID
 2. Each epoch: chunk documents, compute CLS embeddings (frozen encoder),
    group by document, forward through GrowthPredictor (aggregator + head)
-3. Train with smoothed cross-entropy + optional aggregator regularization
+3. Train with MSE regression loss + optional aggregator regularization
 
 Supports:
 - BF16 mixed precision
@@ -136,8 +136,7 @@ def load_encoder(checkpoint_path, device):
     return model, config
 
 
-def build_predictor(aggregator_checkpoint, hidden_size, n_bins, min_val, max_val,
-                    train_aggregator):
+def build_predictor(aggregator_checkpoint, hidden_size, train_aggregator):
     """Build GrowthPredictor and load aggregator weights."""
     aggregator = CLSAggregator(hidden_size=hidden_size)
 
@@ -171,9 +170,6 @@ def build_predictor(aggregator_checkpoint, hidden_size, n_bins, min_val, max_val
     predictor = GrowthPredictor(
         aggregator=aggregator,
         hidden_size=hidden_size,
-        n_bins=n_bins,
-        min_val=min_val,
-        max_val=max_val,
     )
     n_head = sum(p.numel() for p in predictor.head.parameters()) / 1e6
     n_agg = sum(p.numel() for p in predictor.aggregator.parameters()) / 1e6
@@ -540,7 +536,7 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
         predictor.eval()
 
     MA_WINDOW = 100
-    ma = {k: deque(maxlen=MA_WINDOW) for k in ("loss", "ce", "reg", "mae")}
+    ma = {k: deque(maxlen=MA_WINDOW) for k in ("loss", "mse", "reg", "mae")}
     total = {k: 0.0 for k in ma}
     n_batches = 0
     accum_count = 0
@@ -564,10 +560,10 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out = predictor(cls_tokens, attention_mask=attention_mask)
-                logits = out["logits"].float()
+                prediction = out["prediction"].float()
 
-            ce_loss = predictor.compute_loss(logits, targets) if not hasattr(predictor, "_orig_mod") \
-                else predictor._orig_mod.compute_loss(logits, targets)
+            mse_loss = predictor.compute_loss(prediction, targets) if not hasattr(predictor, "_orig_mod") \
+                else predictor._orig_mod.compute_loss(prediction, targets)
 
             # Optional aggregator regularization
             reg_loss = torch.tensor(0.0, device=device)
@@ -579,7 +575,7 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
                 ]).to(device)
                 reg_loss = nn.functional.mse_loss(doc_emb, ref_batch)
 
-            loss = ce_loss + args.reg_lambda * reg_loss
+            loss = mse_loss + args.reg_lambda * reg_loss
 
             if training:
                 accum_count += 1
@@ -598,17 +594,15 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
                     if scheduler.get_last_lr()[0] < 1e-8:
                         lr_exhausted = True
 
-            # Compute MAE for monitoring (reuse logits from forward pass)
+            # Compute MAE for monitoring
             with torch.no_grad():
-                unwrapped_p = predictor._orig_mod if hasattr(predictor, "_orig_mod") else predictor
-                preds = unwrapped_p.predict_from_logits(logits)
-                batch_mae = (preds - targets).abs().mean().item()
+                batch_mae = (prediction - targets).abs().mean().item()
 
             doc_counter += cls_tokens.shape[0]
 
             # Track metrics
             ma["loss"].append(loss.item())
-            ma["ce"].append(ce_loss.item())
+            ma["mse"].append(mse_loss.item())
             ma["reg"].append(reg_loss.item())
             ma["mae"].append(batch_mae)
             for k in total:
@@ -621,7 +615,7 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
             if n_batches % 10 == 0 or batch_idx == len(batches) - 1:
                 postfix = dict(
                     loss=f"{_ma_avg(ma['loss']):.4f}",
-                    ce=f"{_ma_avg(ma['ce']):.4f}",
+                    mse=f"{_ma_avg(ma['mse']):.4f}",
                     mae=f"{_ma_avg(ma['mae']):.4f}",
                 )
                 if args.regularization:
@@ -782,9 +776,6 @@ def train(args):
     predictor = build_predictor(
         aggregator_checkpoint=args.aggregator_checkpoint,
         hidden_size=hidden_size,
-        n_bins=args.n_bins,
-        min_val=args.min_val,
-        max_val=args.max_val,
         train_aggregator=args.train_aggregator,
     )
     predictor = predictor.to(device)
@@ -892,7 +883,6 @@ def train(args):
         print(f"Aggregator LR: {args.aggregator_lr}")
     if args.regularization:
         print(f"Regularization: lambda={args.reg_lambda}")
-    print(f"Bins: {args.n_bins}, range: [{args.min_val}, {args.max_val}]")
     print()
 
     # ------------------------------------------------------------------
@@ -913,7 +903,7 @@ def train(args):
         t_train = time.time() - t0
 
         print(f"\n  Train: loss={train_metrics['loss']:.4f} "
-              f"(ce={train_metrics['ce']:.4f}, "
+              f"(mse={train_metrics['mse']:.4f}, "
               f"reg={train_metrics['reg']:.4f}, "
               f"mae={train_metrics['mae']:.4f}) [{t_train:.0f}s]")
 
@@ -929,7 +919,7 @@ def train(args):
             t_val = time.time() - t0
             val_loss = val_metrics["loss"]
             print(f"  Val:   loss={val_metrics['loss']:.4f} "
-                  f"(ce={val_metrics['ce']:.4f}, "
+                  f"(mse={val_metrics['mse']:.4f}, "
                   f"mae={val_metrics['mae']:.4f}) [{t_val:.0f}s]")
 
         # End-of-epoch checkpoint (weights only)
@@ -967,14 +957,6 @@ def main():
                         help="Path to T5 checkpoint (full_model.pt)")
     parser.add_argument("--aggregator-checkpoint", type=str, default=None,
                         help="Path to aggregator checkpoint")
-
-    # Model
-    parser.add_argument("--n-bins", type=int, default=32,
-                        help="Number of growth rate bins")
-    parser.add_argument("--min-val", type=float, default=-1.0,
-                        help="Minimum growth rate")
-    parser.add_argument("--max-val", type=float, default=1.0,
-                        help="Maximum growth rate")
 
     # Training
     parser.add_argument("--epochs", type=int, default=10)
