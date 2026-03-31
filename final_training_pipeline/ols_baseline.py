@@ -137,24 +137,55 @@ def main():
     print(f"Predict-mean baseline:  val MSE={val_mse_mean:.4f}, MAE={val_mae_mean:.4f}")
     print(f"{'='*60}")
 
-    # Ridge sweep
-    print(f"\n{'alpha':>10} | {'train MSE':>10} {'train MAE':>10} | {'val MSE':>10} {'val MAE':>10} {'val R²':>8}")
-    print("-" * 70)
+    # PCA on train (fit on train, apply to val)
+    D = X_train.shape[1]
+    pca_dims = [D]  # full
+    d = D // 2
+    while d >= D // 16:
+        pca_dims.append(d)
+        d //= 2
 
-    for alpha in alphas:
-        w = ridge_regression(X_train, y_train, alpha=alpha)
+    train_mean_vec = X_train.mean(axis=0)
+    X_train_c = X_train - train_mean_vec
+    X_val_c = X_val - train_mean_vec
 
-        pred_train = predict(X_train, w)
-        train_mse = ((pred_train - y_train) ** 2).mean()
-        train_mae = np.abs(pred_train - y_train).mean()
+    # SVD on centered train data
+    print("\nComputing PCA via SVD...")
+    t0 = time.time()
+    U, S, Vt = np.linalg.svd(X_train_c, full_matrices=False)
+    print(f"  SVD done in {time.time() - t0:.1f}s")
 
-        pred_val = predict(X_val, w)
-        val_mse = ((pred_val - y_val) ** 2).mean()
-        val_mae = np.abs(pred_val - y_val).mean()
-        val_r2 = 1 - val_mse / val_mse_mean
+    # Explained variance
+    var_explained = (S ** 2) / (S ** 2).sum()
+    for nd in pca_dims:
+        print(f"  Top {nd:>4d} components: {var_explained[:nd].sum()*100:.1f}% variance")
 
-        print(f"{alpha:>10.2f} | {train_mse:>10.4f} {train_mae:>10.4f} | "
-              f"{val_mse:>10.4f} {val_mae:>10.4f} {val_r2:>8.4f}")
+    # Ridge sweep for each PCA dimensionality
+    for nd in pca_dims:
+        V_k = Vt[:nd].T  # (D, k)
+        X_train_pca = X_train_c @ V_k
+        X_val_pca = X_val_c @ V_k
+
+        label = f"full ({D}D)" if nd == D else f"PCA {nd}D"
+        print(f"\n--- {label} ---")
+        print(f"{'alpha':>10} | {'train MSE':>10} {'train MAE':>10} | "
+              f"{'val MSE':>10} {'val MAE':>10} {'val R²':>8}")
+        print("-" * 70)
+
+        for alpha in alphas:
+            w = ridge_regression(X_train_pca, y_train, alpha=alpha)
+
+            pred_train = predict(X_train_pca, w)
+            train_mse = ((pred_train - y_train) ** 2).mean()
+            train_mae = np.abs(pred_train - y_train).mean()
+
+            pred_val = predict(X_val_pca, w)
+            val_mse = ((pred_val - y_val) ** 2).mean()
+            val_mae = np.abs(pred_val - y_val).mean()
+            val_r2 = 1 - val_mse / val_mse_mean
+
+            print(f"{alpha:>10.2f} | {train_mse:>10.4f} {train_mae:>10.4f} | "
+                  f"{val_mse:>10.4f} {val_mae:>10.4f} {val_r2:>8.4f}")
 
     print(f"\n(For reference: gradient descent got val MSE=0.0072, MAE=0.0621)")
 
