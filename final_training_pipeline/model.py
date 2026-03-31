@@ -15,14 +15,14 @@ class GrowthPredictor(nn.Module):
 
     def __init__(self, aggregator: CLSAggregator = None, hidden_size: int = 768):
         super().__init__()
-        self.aggregator = aggregator or CLSAggregator(hidden_size=hidden_size, dropout=0.3)
+        self.aggregator = aggregator or CLSAggregator(hidden_size=hidden_size, dropout=0.4)
 
         self.head = nn.Sequential(
-            nn.Dropout(0.2),
-            nn.Linear(hidden_size, 2*hidden_size),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_size, 4*hidden_size),
             nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(2*hidden_size, 1),
+            nn.Dropout(0.3),
+            nn.Linear(4*hidden_size, 1),
         )
 
     # ------------------------------------------------------------------
