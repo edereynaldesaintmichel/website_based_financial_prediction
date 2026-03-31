@@ -19,10 +19,10 @@ class GrowthPredictor(nn.Module):
 
         self.head = nn.Sequential(
             nn.Dropout(0.3),
-            nn.Linear(hidden_size, 4*hidden_size),
+            nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
             nn.Dropout(0.3),
-            nn.Linear(4*hidden_size, 1),
+            nn.Linear(hidden_size, 1),
         )
 
     # ------------------------------------------------------------------
