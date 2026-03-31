@@ -492,10 +492,12 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
     cache_path = os.path.join(args.output_dir, f"cls_cache_epoch{epoch}_{split_tag}.pt")
 
     if os.path.exists(cache_path):
+        t_cache = time.time()
         print(f"  {prefix}: Loading cached CLS embeddings from {cache_path}")
         cached = torch.load(cache_path, map_location="cpu", weights_only=False)
         doc_cls = cached["doc_cls"]
         doc_rates = cached["doc_rates"]
+        print(f"  [TIMING] load CLS cache: {time.time() - t_cache:.1f}s")
     else:
         # 1b. Chunk documents (fresh each epoch)
         all_chunks = chunk_documents(docs_with_rates, nl_ids, cls_id, sep_id, chunk_seed)
@@ -521,10 +523,12 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
     print(f"  {len(doc_cls)} documents with CLS embeddings")
 
     # 4. Form document batches
+    t_batch = time.time()
     batches = form_doc_batches(doc_cls, doc_rates, args.cls_budget,
                                shuffle=training)
     del doc_cls, doc_rates
     print(f"  {len(batches)} batches (cls_budget={args.cls_budget})")
+    print(f"  [TIMING] form batches: {time.time() - t_batch:.1f}s")
 
     # 5. Forward/backward
     if training:
@@ -674,24 +678,31 @@ def train(args):
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------
+    t_section = time.time()
     print(f"\nLoading documents from {args.data}...")
     documents = torch.load(args.data, map_location="cpu", weights_only=False)
+    print(f"  [TIMING] torch.load documents: {time.time() - t_section:.1f}s")
 
+    t_section = time.time()
     print(f"Loading growth rates from {args.growth_rates}...")
     with open(args.growth_rates, "r") as f:
         growth_rates = json.load(f)
     print(f"  {len(growth_rates)} companies with growth rates")
+    print(f"  [TIMING] load growth rates: {time.time() - t_section:.1f}s")
 
     # Match documents to growth rates
+    t_section = time.time()
     print("\nMatching documents to growth rates...")
     matched = match_documents_to_growth_rates(documents, growth_rates)
     del documents, growth_rates
+    print(f"  [TIMING] match documents: {time.time() - t_section:.1f}s")
 
     if not matched:
         print("ERROR: No documents matched to growth rates. Check company ID extraction.")
         return
 
     # Extract just the docs for splitting (split_documents needs dicts with source_file)
+    t_section = time.time()
     matched_docs = [doc for doc, _ in matched]
     train_docs_raw, val_docs_raw = split_documents(matched_docs, args.val_ratio)
     del matched_docs
@@ -704,21 +715,27 @@ def train(args):
     del rate_lookup, train_docs_raw, val_docs_raw
 
     print(f"  {len(train_data)} train, {len(val_data)} val documents")
+    print(f"  [TIMING] split documents: {time.time() - t_section:.1f}s")
 
     # ------------------------------------------------------------------
     # Token info
     # ------------------------------------------------------------------
+    t_section = time.time()
     tok_info = get_token_info(PRETRAINED_ID)
+    print(f"  [TIMING] get_token_info: {time.time() - t_section:.1f}s")
 
     # ------------------------------------------------------------------
     # Encoder (frozen)
     # ------------------------------------------------------------------
+    t_section = time.time()
     print("\nLoading encoder...")
     encoder_model, config = load_encoder(args.encoder_checkpoint, device)
+    print(f"  [TIMING] load encoder: {time.time() - t_section:.1f}s")
 
     # ------------------------------------------------------------------
     # GrowthPredictor (aggregator + head)
     # ------------------------------------------------------------------
+    t_section = time.time()
     print("\nBuilding GrowthPredictor...")
     predictor = build_predictor(
         aggregator_checkpoint=args.aggregator_checkpoint,
@@ -733,6 +750,7 @@ def train(args):
     if args.compile:
         print("Compiling predictor with torch.compile...")
         predictor = torch.compile(predictor, dynamic=True)
+    print(f"  [TIMING] build predictor: {time.time() - t_section:.1f}s")
 
     # ------------------------------------------------------------------
     # Optimizer + schedule
@@ -764,10 +782,12 @@ def train(args):
         weight_decay=args.weight_decay,
     )
 
+    t_section = time.time()
     print("\nEstimating steps per epoch...")
     steps_per_epoch = estimate_steps_per_epoch(
         train_data, tok_info, args.seed, args.cls_budget, args.grad_accum_steps,
     )
+    print(f"  [TIMING] estimate steps: {time.time() - t_section:.1f}s")
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
 
