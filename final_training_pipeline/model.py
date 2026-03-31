@@ -80,17 +80,29 @@ class GrowthPredictor(nn.Module):
     # Inference
     # ------------------------------------------------------------------
 
-    def predict(self, cls_tokens, attention_mask=None):
-        """Return expected growth rate per sample (weighted sum of bin centres).
+    def predict_from_logits(self, logits, k=5):
+        """Return expected growth rate per sample (peak-window strategy).
 
         Args:
-            cls_tokens:     (B, N, D)
-            attention_mask: (B, N) optional
+            logits: (B, n_bins) — raw logits from forward()
+            k:      window size around the peak bin
         Returns:
             (B,) expected growth rates
         """
-        out = self.forward(cls_tokens, attention_mask=attention_mask)
-        probs = F.softmax(out["logits"], dim=-1)  # (B, n_bins)
+        probs = F.softmax(logits, dim=-1)  # (B, n_bins)
         centres = torch.linspace(self.min_val, self.max_val, self.n_bins,
-                                 device=probs.device)  # (n_bins,)
-        return (probs * centres).sum(dim=-1)
+                                 device=logits.device)  # (n_bins,)
+
+        peak_idx = probs.argmax(dim=-1)  # (B,)
+        radius = (k - 1) // 2
+
+        # Build per-sample window mask: (B, n_bins)
+        bin_indices = torch.arange(self.n_bins, device=logits.device).unsqueeze(0)  # (1, n_bins)
+        start = (peak_idx - radius).clamp(min=0).unsqueeze(1)  # (B, 1)
+        end = (peak_idx + radius + 1).clamp(max=self.n_bins).unsqueeze(1)  # (B, 1)
+        mask = (bin_indices >= start) & (bin_indices < end)  # (B, n_bins)
+
+        masked_probs = probs * mask
+        masked_probs = masked_probs / masked_probs.sum(dim=-1, keepdim=True)
+
+        return (masked_probs * centres).sum(dim=-1)

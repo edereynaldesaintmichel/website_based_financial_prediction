@@ -595,10 +595,10 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
                     if scheduler.get_last_lr()[0] < 1e-8:
                         lr_exhausted = True
 
-            # Compute MAE for monitoring
+            # Compute MAE for monitoring (reuse logits from forward pass)
             with torch.no_grad():
-                preds = predictor.predict(cls_tokens, attention_mask) if not hasattr(predictor, "_orig_mod") \
-                    else predictor._orig_mod.predict(cls_tokens, attention_mask)
+                unwrapped_p = predictor._orig_mod if hasattr(predictor, "_orig_mod") else predictor
+                preds = unwrapped_p.predict_from_logits(logits)
                 batch_mae = (preds - targets).abs().mean().item()
 
             doc_counter += cls_tokens.shape[0]
