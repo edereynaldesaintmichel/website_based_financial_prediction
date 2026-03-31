@@ -477,10 +477,11 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
     """
     prefix = "Train" if training else "Val"
 
-    # 1. Check CLS cache
-    chunk_seed = args.seed + epoch + (0 if training else 10000)
+    # 1. Check CLS cache (cycle through 10 cache files)
+    cache_epoch = epoch % 10
+    chunk_seed = args.seed + cache_epoch + (0 if training else 10000)
     split_tag = "train" if training else "val"
-    cache_path = os.path.join(args.output_dir, f"cls_cache_epoch{epoch}_{split_tag}.pt")
+    cache_path = os.path.join(args.output_dir, f"cls_cache_epoch{cache_epoch}_{split_tag}.pt")
 
     if os.path.exists(cache_path):
         t_cache = time.time()
@@ -660,10 +661,15 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
 # ---------------------------------------------------------------------------
 
 def _check_all_caches_exist(output_dir, epochs, start_epoch=0):
-    """Check if CLS caches exist for all epochs (both train and val)."""
-    for epoch in range(start_epoch, epochs):
+    """Check if CLS caches exist for all needed epochs (both train and val).
+
+    Cache files cycle every 10 epochs, so we only need caches for
+    the unique cache_epoch values (epoch % 10) that will be used.
+    """
+    needed = set(e % 10 for e in range(start_epoch, epochs))
+    for cache_epoch in sorted(needed):
         for split in ("train", "val"):
-            path = os.path.join(output_dir, f"cls_cache_epoch{epoch}_{split}.pt")
+            path = os.path.join(output_dir, f"cls_cache_epoch{cache_epoch}_{split}.pt")
             if not os.path.exists(path):
                 return False, path
     return True, None
@@ -909,7 +915,7 @@ def train(args):
 
         # Validation (run if we have val_data OR if val cache exists)
         val_loss = None
-        val_cache = os.path.join(args.output_dir, f"cls_cache_epoch{epoch}_val.pt")
+        val_cache = os.path.join(args.output_dir, f"cls_cache_epoch{epoch % 10}_val.pt")
         if val_data or os.path.exists(val_cache):
             t0 = time.time()
             val_metrics, _, _ = run_epoch(
