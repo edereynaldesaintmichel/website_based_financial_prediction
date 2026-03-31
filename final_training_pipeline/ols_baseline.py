@@ -141,7 +141,7 @@ def main():
     D = X_train.shape[1]
     pca_dims = [D]  # full
     d = D // 2
-    while d >= D // 16:
+    while d >= D // 128:
         pca_dims.append(d)
         d //= 2
 
