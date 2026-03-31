@@ -666,6 +666,43 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
 # Main
 # ---------------------------------------------------------------------------
 
+def _check_all_caches_exist(output_dir, epochs, start_epoch=0):
+    """Check if CLS caches exist for all epochs (both train and val)."""
+    for epoch in range(start_epoch, epochs):
+        for split in ("train", "val"):
+            path = os.path.join(output_dir, f"cls_cache_epoch{epoch}_{split}.pt")
+            if not os.path.exists(path):
+                return False, path
+    return True, None
+
+
+def _estimate_steps_from_cache(cache_path, cls_budget, grad_accum_steps):
+    """Estimate steps/epoch from a cached CLS file (fast: just count doc sizes)."""
+    cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+    doc_cls = cached["doc_cls"]
+
+    # Simulate greedy batch packing (sorted by n_chunks)
+    sorted_counts = sorted(t.shape[0] for t in doc_cls)
+    n_batches = 0
+    current_total = 0
+    started = False
+    for n in sorted_counts:
+        if started and current_total + n > cls_budget:
+            n_batches += 1
+            current_total = n
+        else:
+            current_total += n
+            started = True
+    if started:
+        n_batches += 1
+
+    steps = max(1, n_batches // grad_accum_steps)
+    print(f"  From cache: {len(doc_cls)} docs -> {n_batches} batches, "
+          f"~{steps} optimizer steps/epoch")
+    del cached, doc_cls
+    return steps
+
+
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -675,62 +712,68 @@ def train(args):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # ------------------------------------------------------------------
-    # Data
-    # ------------------------------------------------------------------
-    t_section = time.time()
-    print(f"\nLoading documents from {args.data}...")
-    documents = torch.load(args.data, map_location="cpu", weights_only=False)
-    print(f"  [TIMING] torch.load documents: {time.time() - t_section:.1f}s")
-
-    t_section = time.time()
-    print(f"Loading growth rates from {args.growth_rates}...")
-    with open(args.growth_rates, "r") as f:
-        growth_rates = json.load(f)
-    print(f"  {len(growth_rates)} companies with growth rates")
-    print(f"  [TIMING] load growth rates: {time.time() - t_section:.1f}s")
-
-    # Match documents to growth rates
-    t_section = time.time()
-    print("\nMatching documents to growth rates...")
-    matched = match_documents_to_growth_rates(documents, growth_rates)
-    del documents, growth_rates
-    print(f"  [TIMING] match documents: {time.time() - t_section:.1f}s")
-
-    if not matched:
-        print("ERROR: No documents matched to growth rates. Check company ID extraction.")
-        return
-
-    # Extract just the docs for splitting (split_documents needs dicts with source_file)
-    t_section = time.time()
-    matched_docs = [doc for doc, _ in matched]
-    train_docs_raw, val_docs_raw = split_documents(matched_docs, args.val_ratio)
-    del matched_docs
-
-    # Rebuild matched pairs from split results
-    rate_lookup = {id(doc): rate for doc, rate in matched}
-    del matched
-    train_data = [(doc, rate_lookup[id(doc)]) for doc in train_docs_raw]
-    val_data = [(doc, rate_lookup[id(doc)]) for doc in val_docs_raw]
-    del rate_lookup, train_docs_raw, val_docs_raw
-
-    print(f"  {len(train_data)} train, {len(val_data)} val documents")
-    print(f"  [TIMING] split documents: {time.time() - t_section:.1f}s")
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Token info
+    # Check if all CLS caches exist (skip heavy loading if so)
     # ------------------------------------------------------------------
-    t_section = time.time()
-    tok_info = get_token_info(PRETRAINED_ID)
-    print(f"  [TIMING] get_token_info: {time.time() - t_section:.1f}s")
+    all_cached, missing = _check_all_caches_exist(
+        args.output_dir, args.epochs, start_epoch=0)
+    if all_cached:
+        print("\nAll CLS caches found — skipping document/encoder loading.")
 
     # ------------------------------------------------------------------
-    # Encoder (frozen)
+    # Data (skip if all cached and no regularization needed)
     # ------------------------------------------------------------------
-    t_section = time.time()
-    print("\nLoading encoder...")
-    encoder_model, config = load_encoder(args.encoder_checkpoint, device)
-    print(f"  [TIMING] load encoder: {time.time() - t_section:.1f}s")
+    train_data = None
+    val_data = None
+    need_documents = not all_cached or (args.regularization and args.train_aggregator)
+
+    if need_documents:
+        t_section = time.time()
+        print(f"\nLoading documents from {args.data}...")
+        documents = torch.load(args.data, map_location="cpu", weights_only=False)
+        print(f"  [TIMING] torch.load documents: {time.time() - t_section:.1f}s")
+
+        t_section = time.time()
+        print(f"Loading growth rates from {args.growth_rates}...")
+        with open(args.growth_rates, "r") as f:
+            growth_rates = json.load(f)
+        print(f"  {len(growth_rates)} companies with growth rates")
+
+        print("\nMatching documents to growth rates...")
+        matched = match_documents_to_growth_rates(documents, growth_rates)
+        del documents, growth_rates
+
+        if not matched:
+            print("ERROR: No documents matched to growth rates.")
+            return
+
+        matched_docs = [doc for doc, _ in matched]
+        train_docs_raw, val_docs_raw = split_documents(matched_docs, args.val_ratio)
+        del matched_docs
+
+        rate_lookup = {id(doc): rate for doc, rate in matched}
+        del matched
+        train_data = [(doc, rate_lookup[id(doc)]) for doc in train_docs_raw]
+        val_data = [(doc, rate_lookup[id(doc)]) for doc in val_docs_raw]
+        del rate_lookup, train_docs_raw, val_docs_raw
+        print(f"  {len(train_data)} train, {len(val_data)} val documents")
+
+    # ------------------------------------------------------------------
+    # Token info + Encoder (skip if all cached)
+    # ------------------------------------------------------------------
+    tok_info = None
+    encoder_model = None
+    hidden_size = 768  # ModernBERT-base default
+
+    if need_documents:
+        tok_info = get_token_info(PRETRAINED_ID)
+        t_section = time.time()
+        print("\nLoading encoder...")
+        encoder_model, config = load_encoder(args.encoder_checkpoint, device)
+        hidden_size = config.hidden_size
+        print(f"  [TIMING] load encoder: {time.time() - t_section:.1f}s")
 
     # ------------------------------------------------------------------
     # GrowthPredictor (aggregator + head)
@@ -739,7 +782,7 @@ def train(args):
     print("\nBuilding GrowthPredictor...")
     predictor = build_predictor(
         aggregator_checkpoint=args.aggregator_checkpoint,
-        hidden_size=config.hidden_size,
+        hidden_size=hidden_size,
         n_bins=args.n_bins,
         min_val=args.min_val,
         max_val=args.max_val,
@@ -757,7 +800,6 @@ def train(args):
     # ------------------------------------------------------------------
     param_groups = []
 
-    # Head parameters (always trainable)
     unwrapped = predictor._orig_mod if hasattr(predictor, "_orig_mod") else predictor
     head_params = list(unwrapped.head.parameters())
     param_groups.append({
@@ -766,7 +808,6 @@ def train(args):
         "name": "head",
     })
 
-    # Aggregator parameters (optionally trainable)
     if args.train_aggregator:
         agg_params = list(unwrapped.aggregator.parameters())
         param_groups.append({
@@ -782,18 +823,21 @@ def train(args):
         weight_decay=args.weight_decay,
     )
 
+    # Estimate steps: from cache if available, else dry-run chunking
     t_section = time.time()
     print("\nEstimating steps per epoch...")
-    steps_per_epoch = estimate_steps_per_epoch(
-        train_data, tok_info, args.seed, args.cls_budget, args.grad_accum_steps,
-    )
+    first_cache = os.path.join(args.output_dir, "cls_cache_epoch0_train.pt")
+    if os.path.exists(first_cache):
+        steps_per_epoch = _estimate_steps_from_cache(
+            first_cache, args.cls_budget, args.grad_accum_steps)
+    else:
+        steps_per_epoch = estimate_steps_per_epoch(
+            train_data, tok_info, args.seed, args.cls_budget, args.grad_accum_steps)
     print(f"  [TIMING] estimate steps: {time.time() - t_section:.1f}s")
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
 
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-
-    os.makedirs(args.output_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Resume from checkpoint
@@ -821,7 +865,6 @@ def train(args):
     reference_outputs = None
     if args.regularization and args.train_aggregator:
         print("\nPre-computing reference aggregator outputs for regularization...")
-        # Need to chunk + CLS once to get references
         ref_chunks = chunk_documents(
             train_data, tok_info["newline_ids"],
             tok_info["cls_id"], tok_info["sep_id"], args.seed,
