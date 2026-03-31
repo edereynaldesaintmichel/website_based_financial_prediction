@@ -316,7 +316,7 @@ def main():
                 total_num_masked += 1
                 chunk_num_masked += 1
                 decoded = tokenizer.decode_number(
-                    mag_logits[m["pos"]], model_config
+                    mag_logits[m["pos"]], model_config, k=1
                 )
                 if abs(m["original_log"] - decoded["log_magnitude"]) < 1.0:
                     total_num_close += 1

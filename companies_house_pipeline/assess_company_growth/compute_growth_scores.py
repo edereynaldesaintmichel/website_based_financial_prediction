@@ -113,6 +113,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fields", type=str, default="common_fields.json",
                         help="Path to common_fields.json with field weights")
     parser.add_argument("--output", type=str, default="growth_scores.json")
+    parser.add_argument("--growth-rates-output", type=str,
+                        default="annual_growth_rates.json",
+                        help="Path to flat {company_id: annual_growth_rate} JSON")
     return parser.parse_args()
 
 
@@ -182,7 +185,13 @@ def main():
         print(f"  Grew:   {positive} ({100 * positive / n:.1f}%)")
         print(f"  Shrank: {n - positive} ({100 * (n - positive) / n:.1f}%)")
 
+    growth_rates = {r["company_id"]: r["annual_growth_score"]
+                     for r in results if r["annual_growth_score"] is not None}
+    with open(args.growth_rates_output, "w", encoding="utf-8") as fh:
+        json.dump(growth_rates, fh, indent=2, ensure_ascii=False)
+
     print(f"\nSaved to {args.output}")
+    print(f"Saved to {args.growth_rates_output}")
 
 
 if __name__ == "__main__":
