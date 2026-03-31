@@ -481,11 +481,6 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
     """
     prefix = "Train" if training else "Val"
 
-    cls_id = tok_info["cls_id"]
-    sep_id = tok_info["sep_id"]
-    pad_id = tok_info["pad_id"]
-    nl_ids = tok_info["newline_ids"]
-
     # 1. Check CLS cache
     chunk_seed = args.seed + epoch + (0 if training else 10000)
     split_tag = "train" if training else "val"
@@ -500,6 +495,10 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
         print(f"  [TIMING] load CLS cache: {time.time() - t_cache:.1f}s")
     else:
         # 1b. Chunk documents (fresh each epoch)
+        cls_id = tok_info["cls_id"]
+        sep_id = tok_info["sep_id"]
+        pad_id = tok_info["pad_id"]
+        nl_ids = tok_info["newline_ids"]
         all_chunks = chunk_documents(docs_with_rates, nl_ids, cls_id, sep_id, chunk_seed)
 
         n_chunks = len(all_chunks)
