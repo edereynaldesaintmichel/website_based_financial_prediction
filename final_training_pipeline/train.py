@@ -486,23 +486,38 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
     pad_id = tok_info["pad_id"]
     nl_ids = tok_info["newline_ids"]
 
-    # 1. Chunk documents (fresh each epoch)
+    # 1. Check CLS cache
     chunk_seed = args.seed + epoch + (0 if training else 10000)
-    all_chunks = chunk_documents(docs_with_rates, nl_ids, cls_id, sep_id, chunk_seed)
+    split_tag = "train" if training else "val"
+    cache_path = os.path.join(args.output_dir, f"cls_cache_epoch{epoch}_{split_tag}.pt")
 
-    n_chunks = len(all_chunks)
-    avg_len = sum(c["seq_length"] for c in all_chunks) / max(n_chunks, 1)
-    print(f"  {prefix}: {n_chunks} chunks from {len(docs_with_rates)} docs "
-          f"(avg {avg_len:.0f} tokens)")
+    if os.path.exists(cache_path):
+        print(f"  {prefix}: Loading cached CLS embeddings from {cache_path}")
+        cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+        doc_cls = cached["doc_cls"]
+        doc_rates = cached["doc_rates"]
+    else:
+        # 1b. Chunk documents (fresh each epoch)
+        all_chunks = chunk_documents(docs_with_rates, nl_ids, cls_id, sep_id, chunk_seed)
 
-    # 2. Compute CLS embeddings (frozen encoder)
-    cls_dict = compute_all_cls(encoder_model, all_chunks, device, pad_id,
-                               args.token_budget)
-    del all_chunks
+        n_chunks = len(all_chunks)
+        avg_len = sum(c["seq_length"] for c in all_chunks) / max(n_chunks, 1)
+        print(f"  {prefix}: {n_chunks} chunks from {len(docs_with_rates)} docs "
+              f"(avg {avg_len:.0f} tokens)")
 
-    # 3. Gather per-document
-    doc_cls, doc_rates = gather_doc_embeddings(cls_dict, docs_with_rates)
-    del cls_dict
+        # 2. Compute CLS embeddings (frozen encoder)
+        cls_dict = compute_all_cls(encoder_model, all_chunks, device, pad_id,
+                                   args.token_budget)
+        del all_chunks
+
+        # 3. Gather per-document
+        doc_cls, doc_rates = gather_doc_embeddings(cls_dict, docs_with_rates)
+        del cls_dict
+
+        # 3b. Cache to disk
+        torch.save({"doc_cls": doc_cls, "doc_rates": doc_rates}, cache_path)
+        print(f"  Cached CLS embeddings to {cache_path}")
+
     print(f"  {len(doc_cls)} documents with CLS embeddings")
 
     # 4. Form document batches
