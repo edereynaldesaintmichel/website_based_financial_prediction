@@ -543,7 +543,6 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
     accum_count = 0
     last_ckpt_time = time.time()
     doc_counter = 0  # global doc index for reference lookup
-    lr_exhausted = False
 
     prev_grad = torch.is_grad_enabled()
     if not training:
@@ -592,8 +591,6 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
                     optimizer.zero_grad()
                     global_step += 1
 
-                    if scheduler.get_last_lr()[0] < 1e-8:
-                        lr_exhausted = True
 
             # Compute MAE for monitoring
             with torch.no_grad():
@@ -633,12 +630,8 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
                                 epoch, global_step, ma=ma)
                 last_ckpt_time = time.time()
 
-            if lr_exhausted:
-                print(f"\n  LR reached zero at step {global_step}, stopping epoch early")
-                break
-
         # Flush remaining accumulated gradients
-        if training and not lr_exhausted and accum_count % args.grad_accum_steps != 0:
+        if training and accum_count % args.grad_accum_steps != 0:
             nn.utils.clip_grad_norm_(
                 [p for p in predictor.parameters() if p.requires_grad],
                 args.max_grad_norm,
@@ -653,7 +646,7 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
 
     n = max(n_batches, 1)
     metrics = {k: total[k] / n for k in total}
-    return metrics, global_step, lr_exhausted
+    return metrics, global_step
 
 
 # ---------------------------------------------------------------------------
@@ -900,7 +893,7 @@ def train(args):
         print(f"{'='*70}")
 
         t0 = time.time()
-        train_metrics, global_step, lr_exhausted = run_epoch(
+        train_metrics, global_step = run_epoch(
             predictor, train_data, encoder_model, device, tok_info, args,
             optimizer=optimizer, scheduler=scheduler,
             epoch=epoch, global_step=global_step,
@@ -918,7 +911,7 @@ def train(args):
         val_cache = os.path.join(args.output_dir, f"cls_cache_epoch{epoch % 10}_val.pt")
         if val_data or os.path.exists(val_cache):
             t0 = time.time()
-            val_metrics, _, _ = run_epoch(
+            val_metrics, _ = run_epoch(
                 predictor, val_data, encoder_model, device, tok_info, args,
                 epoch=epoch, training=False,
             )
@@ -940,9 +933,6 @@ def train(args):
             save_checkpoint(latest_path, predictor, optimizer, scheduler,
                             epoch + 1, global_step,
                             val_loss=val_loss, args=args, weights_only=False)
-
-        if lr_exhausted:
-            break
 
     print("\nTraining complete.")
 
