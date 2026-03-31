@@ -18,9 +18,9 @@ class GrowthPredictor(nn.Module):
         self.aggregator = aggregator or CLSAggregator(hidden_size=hidden_size)
 
         self.head = nn.Sequential(
-            nn.Linear(hidden_size, 2 * hidden_size),
-            nn.GELU(),
-            nn.Linear(2 * hidden_size, 1),
+            nn.Linear(hidden_size, 1),
+            # nn.GELU(),
+            # nn.Linear(2 * hidden_size, 1),
         )
 
     # ------------------------------------------------------------------
