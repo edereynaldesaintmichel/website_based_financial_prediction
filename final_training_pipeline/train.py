@@ -887,6 +887,9 @@ def train(args):
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
+    best_val_loss = float("inf")
+    best_val_mae = float("inf")
+
     for epoch in range(start_epoch, args.epochs):
         print(f"\n{'='*70}")
         print(f"Epoch {epoch + 1}/{args.epochs}")
@@ -920,6 +923,9 @@ def train(args):
             print(f"  Val:   loss={val_metrics['loss']:.4f} "
                   f"(mse={val_metrics['mse']:.4f}, "
                   f"mae={val_metrics['mae']:.4f}) [{t_val:.0f}s]")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_val_mae = val_metrics["mae"]
 
         if not args.no_save:
             # End-of-epoch checkpoint (weights only)
@@ -934,6 +940,8 @@ def train(args):
                             epoch + 1, global_step,
                             val_loss=val_loss, args=args, weights_only=False)
 
+    if best_val_loss < float("inf"):
+        print(f"\nBest val loss: {best_val_loss:.4f} (MAE={best_val_mae:.4f})")
     print("\nTraining complete.")
 
 
