@@ -626,7 +626,7 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
                 pbar.set_postfix(postfix)
 
             # Periodic checkpoint
-            if (training and args.checkpoint_minutes > 0
+            if (training and not args.no_save and args.checkpoint_minutes > 0
                     and time.time() - last_ckpt_time >= args.checkpoint_minutes * 60):
                 ckpt_path = os.path.join(args.output_dir, "checkpoint_latest")
                 save_checkpoint(ckpt_path, predictor, optimizer, scheduler,
@@ -928,17 +928,18 @@ def train(args):
                   f"(mse={val_metrics['mse']:.4f}, "
                   f"mae={val_metrics['mae']:.4f}) [{t_val:.0f}s]")
 
-        # End-of-epoch checkpoint (weights only)
-        ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch + 1}")
-        save_checkpoint(ckpt_path, predictor, optimizer, scheduler,
-                        epoch + 1, global_step,
-                        val_loss=val_loss, args=args, weights_only=True)
+        if not args.no_save:
+            # End-of-epoch checkpoint (weights only)
+            ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch + 1}")
+            save_checkpoint(ckpt_path, predictor, optimizer, scheduler,
+                            epoch + 1, global_step,
+                            val_loss=val_loss, args=args, weights_only=True)
 
-        # Latest checkpoint (with optimizer state for resuming)
-        latest_path = os.path.join(args.output_dir, "checkpoint_latest")
-        save_checkpoint(latest_path, predictor, optimizer, scheduler,
-                        epoch + 1, global_step,
-                        val_loss=val_loss, args=args, weights_only=False)
+            # Latest checkpoint (with optimizer state for resuming)
+            latest_path = os.path.join(args.output_dir, "checkpoint_latest")
+            save_checkpoint(latest_path, predictor, optimizer, scheduler,
+                            epoch + 1, global_step,
+                            val_loss=val_loss, args=args, weights_only=False)
 
         if lr_exhausted:
             break
@@ -996,6 +997,8 @@ def main():
                         help="Path to checkpoint directory to resume from")
     parser.add_argument("--checkpoint-minutes", type=int, default=30,
                         help="Save periodic checkpoint every N minutes (0=disable)")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Disable all checkpoint saving")
 
     args = parser.parse_args()
 
