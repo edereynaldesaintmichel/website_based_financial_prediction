@@ -917,9 +917,10 @@ def train(args):
               f"reg={train_metrics['reg']:.4f}, "
               f"mae={train_metrics['mae']:.4f}) [{t_train:.0f}s]")
 
-        # Validation
+        # Validation (run if we have val_data OR if val cache exists)
         val_loss = None
-        if val_data:
+        val_cache = os.path.join(args.output_dir, f"cls_cache_epoch{epoch}_val.pt")
+        if val_data or os.path.exists(val_cache):
             t0 = time.time()
             val_metrics, _, _ = run_epoch(
                 predictor, val_data, encoder_model, device, tok_info, args,
