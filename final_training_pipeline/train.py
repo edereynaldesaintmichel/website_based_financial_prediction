@@ -142,11 +142,15 @@ def build_predictor(aggregator_checkpoint, hidden_size, n_bins, min_val, max_val
     aggregator = CLSAggregator(hidden_size=hidden_size)
 
     if aggregator_checkpoint:
-        state_dict = torch.load(aggregator_checkpoint, map_location="cpu",
-                                weights_only=False)
-        # Handle both raw state dict and wrapped checkpoint
-        if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
-            state_dict = state_dict["model_state_dict"]
+        ckpt = torch.load(aggregator_checkpoint, map_location="cpu",
+                          weights_only=False)
+        # Full training checkpoint: extract aggregator sub-dict
+        if isinstance(ckpt, dict) and "aggregator" in ckpt:
+            state_dict = ckpt["aggregator"]
+        elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            state_dict = ckpt["model_state_dict"]
+        else:
+            state_dict = ckpt
         # Strip prefixes if present
         cleaned = {}
         for k, v in state_dict.items():
