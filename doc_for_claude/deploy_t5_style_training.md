@@ -20,24 +20,29 @@
    nvidia-smi --query-gpu=memory.total --format=csv,noheader
    ```
 
-4. **Upload `documents.pt`** (only if not already present on the remote):
+4. **Create data directories** on the remote:
+   ```
+   ssh -p <PORT> root@<HOST> "mkdir -p /workspace/data/encoder_checkpoint"
+   ```
+
+5. **Upload `documents.pt`** (only if not already present on the remote):
    ```
    ssh -p <PORT> root@<HOST> "ls /workspace/data/documents.pt" 2>/dev/null || \
      rsync -avz --progress -e "ssh -p <PORT>" mlm_data/documents.pt root@<HOST>:/workspace/data/documents.pt
    ```
 
-5. **Upload encoder checkpoint** to remote `/workspace/data/encoder_checkpoint/`:
+6. **Upload encoder checkpoint** to remote `/workspace/data/encoder_checkpoint/`:
    ```
    rsync -avz --progress -e "ssh -p <PORT>" checkpoints/mlm_full_baseline/<CHECKPOINT_DIR>/full_model.pt root@<HOST>:/workspace/data/encoder_checkpoint/
    ```
 
-6. **Compute batch size and learning rate** based on available VRAM:
+7. **Compute batch size and learning rate** based on available VRAM:
    - Reference point: **8192 tokens_per_batch** uses ~54 GB VRAM on H100, with **lr=5e-5**.
    - VRAM scales linearly with batch size. LR scales linearly with batch size too.
    - Example (assuming ~8 GB overhead for model weights):
      - 48 GB VRAM -> tokens_per_batch=10240, lr=6.25e-5
 
-7. **Give the user the training command** to run in their remote terminal:
+8. **Give the user the training command** to run in their remote terminal:
    ```
    cd /workspace/website_based_financial_prediction && python -m t5_style_training_pipeline.train --data /workspace/data/documents.pt --encoder_checkpoint /workspace/data/encoder_checkpoint/full_model.pt --tokens_per_batch <BATCH> --lr <LR> --compile
    ```

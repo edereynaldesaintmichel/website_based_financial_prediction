@@ -36,37 +36,26 @@ from financial_bert import (
     PredictionHead,
 )
 
-NUM_MEMORY_SLOTS = 128
-SLOT_RANK = 24
+NUM_MEMORY_SLOTS = 16
 
 class ExpandedMemoryCrossAttention(nn.Module):
-    """Multi-head cross-attention to expanded CLS memory (low-rank factored).
+    """Multi-head cross-attention to expanded CLS memory.
 
-    CLS (B, D) is projected into N memory slots via per-slot rank-r projections:
-        slot_i = B_i @ A_i @ cls    (rank r each)
-
-    Batched as two matmuls:
-        z = cls @ A^T             → (B, N, r)   [A ∈ R^{Nr × D}]
-        memory = einsum(z, B)     → (B, N, D)   [B ∈ R^{N × r × D}]
-
-    Then standard multi-head cross-attention from decoder positions to memory.
-    Params: 2·N·r·D  (vs N·D² for full-rank).
+    CLS (B, D) is projected into N memory slots (B, N, D), then standard
+    multi-head cross-attention lets each decoder position attend to different
+    slots based on content. This gives position-dependent retrieval from CLS,
+    unlike single-vector approaches where every position gets the same info.
     """
 
-    def __init__(self, config, num_slots=NUM_MEMORY_SLOTS, slot_rank=SLOT_RANK):
+    def __init__(self, config, num_slots=NUM_MEMORY_SLOTS):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_slots = num_slots
-        self.slot_rank = slot_rank
         D = config.hidden_size
 
-        assert D % slot_rank == 0, f"hidden_size {D} must be divisible by slot_rank {slot_rank}"
-
-        # Low-rank CLS expansion: A (down) + B (up)
-        self.W_down = nn.Linear(D, num_slots * slot_rank, bias=False)  # (D → N*r)
-        self.W_up = nn.Parameter(torch.empty(num_slots, slot_rank, D))  # (N, r, D)
-        nn.init.kaiming_uniform_(self.W_up)
+        # Expand CLS into N memory slots
+        self.W_expand = nn.Linear(D, num_slots * D, bias=False)
 
         # Standard cross-attention projections
         self.Wq = nn.Linear(D, D, bias=False)
@@ -88,11 +77,9 @@ class ExpandedMemoryCrossAttention(nn.Module):
         B, S, D = hidden_states.shape
         H, d = self.num_heads, self.head_dim
         N = self.num_slots
-        r = self.slot_rank
 
-        # Low-rank CLS expansion: two matmuls
-        z = self.W_down(cls_hidden).view(B, N, r)           # (B, N, r)
-        memory = torch.einsum('bnr,nrd->bnd', z, self.W_up)  # (B, N, D)
+        # Expand CLS into memory slots
+        memory = self.W_expand(cls_hidden).view(B, N, D)  # (B, N, D)
 
         q = self.Wq(hidden_states).view(B, S, H, d).transpose(1, 2)  # (B, H, S, d)
         k = self.Wk(memory).view(B, N, H, d).transpose(1, 2)          # (B, H, N, d)
