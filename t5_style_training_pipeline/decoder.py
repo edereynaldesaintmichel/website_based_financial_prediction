@@ -39,11 +39,12 @@ from financial_bert import (
 NUM_MEMORY_SLOTS = 64
 
 class ExpandedMemoryCrossAttention(nn.Module):
-    """Multi-head cross-attention to pre-expanded CLS memory.
+    """Multi-head cross-attention to expanded CLS memory.
 
-    Memory slots are computed once externally (shared W_expand across layers)
-    and passed in, just like encoder states in vanilla cross-attention.
-    Each layer has its own Wq/Wk/Wv/Wo to project the shared memory differently.
+    CLS (B, D) is projected into N memory slots (B, N, D), then standard
+    multi-head cross-attention lets each decoder position attend to different
+    slots based on content. This gives position-dependent retrieval from CLS,
+    unlike single-vector approaches where every position gets the same info.
     """
 
     def __init__(self, config, num_slots=NUM_MEMORY_SLOTS):
@@ -53,7 +54,10 @@ class ExpandedMemoryCrossAttention(nn.Module):
         self.num_slots = num_slots
         D = config.hidden_size
 
-        # Standard cross-attention projections (per-layer)
+        # Expand CLS into N memory slots
+        self.W_expand = nn.Linear(D, num_slots * D, bias=False)
+
+        # Standard cross-attention projections
         self.Wq = nn.Linear(D, D, bias=False)
         self.Wk = nn.Linear(D, D, bias=False)
         self.Wv = nn.Linear(D, D, bias=False)
@@ -62,17 +66,20 @@ class ExpandedMemoryCrossAttention(nn.Module):
         # Zero-init output so cross-attention starts as a no-op
         nn.init.zeros_(self.Wo.weight)
 
-    def forward(self, hidden_states, memory):
+    def forward(self, hidden_states, cls_hidden):
         """
         Args:
             hidden_states: (B, S, D) decoder hidden states
-            memory: (B, N, D) expanded CLS memory slots (shared across layers)
+            cls_hidden: (B, D) encoder CLS representation
         Returns:
             (B, S, D) cross-attention output
         """
         B, S, D = hidden_states.shape
         H, d = self.num_heads, self.head_dim
         N = self.num_slots
+
+        # Expand CLS into memory slots
+        memory = self.W_expand(cls_hidden).view(B, N, D)  # (B, N, D)
 
         q = self.Wq(hidden_states).view(B, S, H, d).transpose(1, 2)  # (B, H, S, d)
         k = self.Wk(memory).view(B, N, H, d).transpose(1, 2)          # (B, H, N, d)
@@ -100,11 +107,7 @@ class CLSBottleneckDecoder(nn.Module):
         # Backbone: standard ModernBERT (bidirectional)
         self.backbone = ModernBertModel(config)
 
-        # Shared CLS expansion (computed once, reused by all layers)
-        D = config.hidden_size
-        self.W_expand = nn.Linear(D, NUM_MEMORY_SLOTS * D, bias=False)
-
-        # Cross-attention modules (one per layer, sharing the expanded memory)
+        # Cross-attention modules (one per layer, each with its own frozen random W_expand)
         num_layers = config.num_hidden_layers
         self.cross_attn_norms = nn.ModuleList([
             nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
@@ -162,15 +165,11 @@ class CLSBottleneckDecoder(nn.Module):
         else:
             attention_mask_mapping = attention_mask
 
-        # Expand CLS into memory slots once (shared across all layers)
-        D = hidden_states.shape[-1]
-        memory = self.W_expand(cls_hidden).view(-1, NUM_MEMORY_SLOTS, D)  # (B, N, D)
-
         # Run through layers with cross-attention
         for i, layer in enumerate(self.backbone.layers):
-            # Cross-attention to shared CLS memory (residual)
+            # Cross-attention to CLS (residual)
             hidden_states = hidden_states + self.cross_attns[i](
-                self.cross_attn_norms[i](hidden_states), memory
+                self.cross_attn_norms[i](hidden_states), cls_hidden
             )
             # Self-attention + FFN (standard ModernBERT layer)
             hidden_states = layer(
