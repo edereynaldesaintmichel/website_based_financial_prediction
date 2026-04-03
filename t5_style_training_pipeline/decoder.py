@@ -54,8 +54,8 @@ class ExpandedMemoryCrossAttention(nn.Module):
         self.num_slots = num_slots
         D = config.hidden_size
 
-        # Frozen random CLS expansion (not trained)
-        self.register_buffer("W_expand", torch.randn(num_slots * D, D))
+        # Expand CLS into N memory slots
+        self.W_expand = nn.Linear(D, num_slots * D, bias=False)
 
         # Standard cross-attention projections
         self.Wq = nn.Linear(D, D, bias=False)
@@ -79,7 +79,7 @@ class ExpandedMemoryCrossAttention(nn.Module):
         N = self.num_slots
 
         # Expand CLS into memory slots
-        memory = F.linear(cls_hidden, self.W_expand).view(B, N, D)  # (B, N, D)
+        memory = self.W_expand(cls_hidden).view(B, N, D)  # (B, N, D)
 
         q = self.Wq(hidden_states).view(B, S, H, d).transpose(1, 2)  # (B, H, S, d)
         k = self.Wk(memory).view(B, N, H, d).transpose(1, 2)          # (B, H, N, d)
