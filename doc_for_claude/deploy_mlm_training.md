@@ -17,7 +17,7 @@
 
 4. **Upload local training data** from `mlm_data/documents.pt` to remote `/workspace/data/`:
    ```
-   rsync -avz --progress -e "ssh -p <PORT>" mlm_data/documents.pt root@<HOST>:/workspace/data/documents.pt
+   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" mlm_data/documents.pt root@<HOST>:/workspace/data/documents.pt
    ```
 
 5. **Compute batch size and learning rates** based on available VRAM:

@@ -25,14 +25,14 @@
 
    Don't forget to mkdir the necessary directories.
    ```
-   rsync -avz --progress -e "ssh -p <PORT>" \
+   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
        mlm_data/documents.pt \
        root@<HOST>:/workspace/data/documents.pt
    ```
 
 5. **Upload T5 checkpoint** to the remote:
    ```
-   rsync -avz --progress -e "ssh -p <PORT>" \
+   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
        checkpoints/t5_cls/checkpoint_epoch5/full_model.pt \
        root@<HOST>:/workspace/data/t5_checkpoint/full_model.pt
    ```
@@ -82,7 +82,7 @@
 
 8. **Download checkpoints** after training (from local machine):
    ```
-   rsync -avz --progress -e "ssh -p <PORT>" \
+   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
        root@<HOST>:/workspace/checkpoints/cls_aggregator/ \
        checkpoints/cls_aggregator/
    ```

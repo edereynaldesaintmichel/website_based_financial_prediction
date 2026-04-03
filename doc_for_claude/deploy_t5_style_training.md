@@ -28,12 +28,12 @@
 5. **Upload `documents.pt`** (only if not already present on the remote):
    ```
    ssh -p <PORT> root@<HOST> "ls /workspace/data/documents.pt" 2>/dev/null || \
-     rsync -avz --progress -e "ssh -p <PORT>" mlm_data/documents.pt root@<HOST>:/workspace/data/documents.pt
+     rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" mlm_data/documents.pt root@<HOST>:/workspace/data/documents.pt
    ```
 
 6. **Upload encoder checkpoint** to remote `/workspace/data/encoder_checkpoint/`:
    ```
-   rsync -avz --progress -e "ssh -p <PORT>" checkpoints/mlm_full_baseline/<CHECKPOINT_DIR>/full_model.pt root@<HOST>:/workspace/data/encoder_checkpoint/
+   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" checkpoints/mlm_full_baseline/<CHECKPOINT_DIR>/full_model.pt root@<HOST>:/workspace/data/encoder_checkpoint/
    ```
 
 7. **Compute batch size and learning rate** based on available VRAM:

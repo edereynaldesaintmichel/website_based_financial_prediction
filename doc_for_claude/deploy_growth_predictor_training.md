@@ -25,22 +25,22 @@
    ```
    ssh -p <PORT> root@<HOST> "mkdir -p /workspace/data/t5_checkpoint /workspace/data/aggregator_checkpoint"
 
-   rsync -avz --progress -e "ssh -p <PORT>" \
+   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
        mlm_data/documents.pt \
        root@<HOST>:/workspace/data/documents.pt
 
-   rsync -avz --progress -e "ssh -p <PORT>" \
+   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
        growth_rates.json \
        root@<HOST>:/workspace/data/growth_rates.json
    ```
 
 5. **Upload model checkpoints** to the remote:
    ```
-   rsync -avz --progress -e "ssh -p <PORT>" \
+   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
        checkpoints/t5_cls/checkpoint_epoch5/full_model.pt \
        root@<HOST>:/workspace/data/t5_checkpoint/full_model.pt
 
-   rsync -avz --progress -e "ssh -p <PORT>" \
+   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
        checkpoints/cls_aggregator/aggregator.pt \
        root@<HOST>:/workspace/data/aggregator_checkpoint/aggregator.pt
    ```
@@ -98,7 +98,7 @@
 
 8. **Download checkpoints** after training (from local machine):
    ```
-   rsync -avz --progress -e "ssh -p <PORT>" \
+   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
        root@<HOST>:/workspace/checkpoints/growth_predictor/ \
        checkpoints/growth_predictor/
    ```
