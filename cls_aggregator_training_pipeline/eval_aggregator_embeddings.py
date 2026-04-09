@@ -319,9 +319,10 @@ def main():
 
     model = T5StyleModel(config)
     state_dict = {k.removeprefix("_orig_mod."): v
-                  for k, v in t5_ckpt["model_state_dict"].items()}
+                  for k, v in t5_ckpt["model_state_dict"].items()
+                  if k.removeprefix("_orig_mod.").startswith("encoder.")}
     del t5_ckpt
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     del state_dict
     model.encoder.eval()
     for p in model.parameters():
