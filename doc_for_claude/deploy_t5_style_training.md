@@ -28,7 +28,7 @@
 5. **Upload `documents.pt`** (only if not already present on the remote):
    ```
    ssh -p <PORT> root@<HOST> "ls /workspace/data/documents.pt" 2>/dev/null || \
-     rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" mlm_data/documents.pt root@<HOST>:/workspace/data/documents.pt
+     rsync -az --progress -e "ssh -p <PORT>" mlm_data/documents.pt root@<HOST>:/workspace/data/documents.pt
    ```
 
 6. **Upload encoder checkpoint** to remote `/workspace/data/encoder_checkpoint/`:
@@ -37,14 +37,14 @@
    ```
 
 7. **Compute batch size and learning rate** based on available VRAM:
-   - Reference point: **8192 tokens_per_batch** uses ~54 GB VRAM on H100, with **lr=5e-5**.
+   - Reference point: **16384 tokens_per_batch** uses ~98 GB VRAM on RTX 6000 Blackwell, with **lr=1e-4**.
    - VRAM scales linearly with batch size. LR scales linearly with batch size too.
    - Example (assuming ~8 GB overhead for model weights):
-     - 48 GB VRAM -> tokens_per_batch=10240, lr=6.25e-5
+     - 48 GB VRAM -> tokens_per_batch=6553, lr=4e-5
 
 8. **Give the user the training command** to run in their remote terminal:
    ```
-   cd /workspace/website_based_financial_prediction && python -m t5_style_training_pipeline.train --data /workspace/data/documents.pt --encoder_checkpoint /workspace/data/encoder_checkpoint/full_model.pt --tokens_per_batch <BATCH> --lr <LR> --compile
+   cd /workspace/website_based_financial_prediction && nohup python -m t5_style_training_pipeline.train --data /workspace/data/documents.pt --encoder_checkpoint /workspace/data/encoder_checkpoint/full_model.pt --tokens_per_batch <BATCH> --lr <LR> --compile > train.log 2>&1 &
    ```
    Do NOT run this command yourself. The user runs it directly in their SSH session.
 
