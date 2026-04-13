@@ -2,43 +2,30 @@
 
 ## Prerequisites
 
-- A trained T5 checkpoint must exist locally at `checkpoints/t5_cls/checkpoint_epoch5/full_model.pt`.
-- A trained aggregator checkpoint must exist locally at `checkpoints/cls_aggregator/aggregator.pt`.
-- A pre-tokenized `documents.pt` file must exist.
+- `HF_TOKEN` with read access to the `edereynal/financial_prediction` dataset. All artifacts are pulled from there.
 
 ## Steps
 
 1. **Connect** via SSH (connection details provided by user each session).
 
-2. **Clone repo and run setup** on the remote:
+2. **Clone repo and run setup** on the remote in `eval` mode (this also fetches the trained aggregator checkpoint):
    ```
+   export HF_TOKEN=<user-provided>
    cd /workspace && git clone https://github.com/edereynaldesaintmichel/website_based_financial_prediction.git
-   cd website_based_financial_prediction && bash t5_style_training_pipeline/setup.sh
+   cd website_based_financial_prediction && bash cls_aggregator_training_pipeline/setup.sh eval
    ```
+
+   Result:
+   - `/workspace/data/documents.pt`
+   - `/workspace/data/t5_checkpoint/full_model.pt`
+   - `/workspace/data/aggregator/aggregator.pt`
 
 3. **Check GPUs** on the remote:
    ```
    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
    ```
 
-4. **Upload data and checkpoints** to the remote:
-   ```
-   ssh -p <PORT> root@<HOST> "mkdir -p /workspace/data/t5_checkpoint /workspace/data/aggregator"
-
-   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
-       mlm_data/documents.pt \
-       root@<HOST>:/workspace/data/documents.pt
-
-   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
-       checkpoints/t5_cls/checkpoint_epoch5/full_model.pt \
-       root@<HOST>:/workspace/data/t5_checkpoint/full_model.pt
-
-   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
-       checkpoints/cls_aggregator/aggregator.pt \
-       root@<HOST>:/workspace/data/aggregator/aggregator.pt
-   ```
-
-5. **Give the user the eval command** to run in their remote terminal.
+4. **Give the user the eval command** to run in their remote terminal.
 
    **Single GPU:**
    ```
@@ -78,5 +65,6 @@
 ## Notes
 
 - SSH connection details change daily — always provided by the user at the start of each session.
+- `HF_TOKEN` must be exported before running `setup.sh`.
 - The remote instance is typically a vast.ai GPU instance with PyTorch + CUDA pre-installed.
 - This is an eval-only script — no training happens, no checkpoints are produced. All inference is `@torch.no_grad`.

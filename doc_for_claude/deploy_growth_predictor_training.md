@@ -2,50 +2,31 @@
 
 ## Prerequisites
 
-- A trained T5 checkpoint must exist locally at `checkpoints/t5_cls/checkpoint_epoch5/full_model.pt`.
-- A trained CLS aggregator checkpoint must exist locally at `checkpoints/cls_aggregator/aggregator.pt` (aggregator-only weights).
-- A pre-tokenized `documents.pt` file must exist (produced by the MLM training pipeline's `prepare_data.py`).
-- A merged `growth_rates.json` file must exist (produced by `python -m final_training_pipeline.prepare_data`).
+- `HF_TOKEN` with read access to the `edereynal/financial_prediction` dataset. All artifacts (`documents.pt`, `growth_rates.json`, T5 checkpoint, aggregator checkpoint) are pulled from there.
 
 ## Steps
 
 1. **Connect** via SSH (connection details provided by user each session).
 
-2. **Clone repo and run setup** on the remote:
+2. **Clone repo and run setup** on the remote. The setup script downloads every artifact needed into `/workspace/data/`:
    ```
+   export HF_TOKEN=<user-provided>
    cd /workspace && git clone https://github.com/edereynaldesaintmichel/website_based_financial_prediction.git
+   cd website_based_financial_prediction && bash final_training_pipeline/setup.sh
    ```
+
+   Result:
+   - `/workspace/data/documents.pt`
+   - `/workspace/data/growth_rates.json`
+   - `/workspace/data/t5_checkpoint/full_model.pt`
+   - `/workspace/data/aggregator_checkpoint/aggregator.pt`
 
 3. **Check GPUs** on the remote:
    ```
    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
    ```
 
-4. **Upload data files** to the remote:
-   ```
-   ssh -p <PORT> root@<HOST> "mkdir -p /workspace/data/t5_checkpoint /workspace/data/aggregator_checkpoint"
-
-   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
-       mlm_data/documents.pt \
-       root@<HOST>:/workspace/data/documents.pt
-
-   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
-       growth_rates.json \
-       root@<HOST>:/workspace/data/growth_rates.json
-   ```
-
-5. **Upload model checkpoints** to the remote:
-   ```
-   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
-       checkpoints/t5_cls/checkpoint_epoch5/full_model.pt \
-       root@<HOST>:/workspace/data/t5_checkpoint/full_model.pt
-
-   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
-       checkpoints/cls_aggregator/aggregator.pt \
-       root@<HOST>:/workspace/data/aggregator_checkpoint/aggregator.pt
-   ```
-
-6. **Compute token budgets** based on available VRAM:
+4. **Compute token budgets** based on available VRAM:
    - The T5 encoder (~150M params, frozen) uses ~1 GB in bf16.
    - The GrowthPredictor (aggregator + head) is small (<60M params).
    - `--token-budget` controls encoder CLS computation batching (same as aggregator training).
@@ -56,7 +37,7 @@
    - If OOM during CLS computation, halve `--token-budget`.
    - If OOM during predictor forward pass, halve `--cls-budget`.
 
-7. **Give the user the training command** to run in their remote terminal.
+5. **Give the user the training command** to run in their remote terminal.
 
    **Frozen aggregator (train head only):**
    ```
@@ -96,36 +77,17 @@
 
    Do NOT run this command yourself. The user runs it directly in their SSH session.
 
-8. **Download checkpoints** after training (from local machine):
-   ```
-   rsync -avW --compress-level=0 --progress -e "ssh -p <PORT>" \
-       root@<HOST>:/workspace/checkpoints/growth_predictor/ \
-       checkpoints/growth_predictor/
-   ```
+6. **Retrieve checkpoints** after training — either `rsync` back locally, or push to the HF dataset from the remote.
 
 ## Resuming
 
-If training is interrupted, re-run the same command with `--resume-from`:
-```
-cd /workspace/website_based_financial_prediction && python \
-    -m final_training_pipeline.train \
-    --data /workspace/data/documents.pt \
-    --growth-rates /workspace/data/growth_rates.json \
-    --encoder-checkpoint /workspace/data/t5_checkpoint/full_model.pt \
-    --aggregator-checkpoint /workspace/data/aggregator_checkpoint/aggregator.pt \
-    --output-dir /workspace/checkpoints/growth_predictor \
-    --resume-from /workspace/checkpoints/growth_predictor/checkpoint_latest \
-    --token-budget 65536 \
-    --cls-budget 1024 \
-    --lr 1e-4 \
-    --epochs 10 \
-    --compile
-```
+If training is interrupted, re-run the same command with `--resume-from /workspace/checkpoints/growth_predictor/checkpoint_latest`.
 
 ## Notes
 
 - This is a single-GPU training script (no DDP) — the encoder is frozen and only the predictor head (and optionally the aggregator) are trained.
 - SSH connection details change daily — always provided by the user at the start of each session.
+- `HF_TOKEN` must be exported before running `setup.sh`.
 - The remote instance is typically a vast.ai GPU instance with PyTorch + CUDA pre-installed.
 - Training stops automatically when the cosine LR schedule reaches zero, even if not all epochs are completed.
-- The `growth_rates.json` file is produced locally by `python -m final_training_pipeline.prepare_data` (merges UK and SEC rates).
+- To refresh `growth_rates.json`, run `python -m final_training_pipeline.prepare_data` locally, then `hf upload edereynal/financial_prediction growth_rates.json growth_rates.json --repo-type dataset`.
