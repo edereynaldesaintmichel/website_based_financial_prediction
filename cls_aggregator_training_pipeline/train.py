@@ -254,26 +254,27 @@ def chunk_documents(documents, tok_info, rank=0):
 
 def form_doc_batches(doc_ids_to_n, cls_token_budget):
     """Group doc_idx values into batches whose padded CLS tensor respects a
-    cls-token budget (B × max_n_cls ≤ budget).
+    cls-token budget ((B+pad) × max_n_cls ≤ budget).
 
-    Buckets documents by n_chunks to keep padding waste bounded.
+    Sorts docs by n_chunks and greedily packs consecutive docs until the next
+    one would exceed the budget; then shuffles batch order.
     """
-    items = list(doc_ids_to_n.items())  # (doc_idx, n_chunks)
-    random.shuffle(items)
-    # Bucket by ceil(n / 16) * 16 to bound padding; sort buckets so small ones
-    # can pack many docs per batch and large ones fewer.
-    from collections import defaultdict
-    buckets = defaultdict(list)
-    for d, n in items:
-        key = (n + 15) // 16 * 16
-        buckets[key].append((d, n))
+    items = sorted(doc_ids_to_n.items(), key=lambda x: x[1])  # (doc_idx, n)
 
     batches = []
-    for bucket_n, docs in buckets.items():
-        random.shuffle(docs)
-        per_batch = max(1, cls_token_budget // bucket_n)
-        for i in range(0, len(docs), per_batch):
-            batches.append([d for d, _ in docs[i:i + per_batch]])
+    cur = []
+    cur_max = 0
+    for d, n in items:
+        new_max = max(cur_max, n)
+        if cur and (len(cur) + 1) * new_max > cls_token_budget:
+            batches.append(cur)
+            cur = [d]
+            cur_max = n
+        else:
+            cur.append(d)
+            cur_max = new_max
+    if cur:
+        batches.append(cur)
     random.shuffle(batches)
     return batches
 
@@ -362,16 +363,19 @@ def per_slot_view_sigreg(pred, is_masked):
 
     total = pred.new_zeros(())
     n_views = 0
+    total_points = 0
     for k in range(max_m):
         keep = n_mask_per_row > k                                 # (B,)
-        if keep.sum().item() < MIN_VIEW_SIZE:
+        n_keep = int(keep.sum().item())
+        if n_keep < MIN_VIEW_SIZE:
             continue
         view = ordered_pred[keep, k, :]                           # (n, D)
         total = total + sigreg_loss(view)
         n_views += 1
+        total_points += n_keep
     if n_views == 0:
-        return pred.new_zeros(()), 0
-    return total / n_views, n_views
+        return pred.new_zeros(()), 0, 0.0
+    return total / n_views, n_views, total_points / n_views
 
 
 # ─── LR schedule ────────────────────────────────────────────────────────────
@@ -463,7 +467,7 @@ def run_epoch(aggregator, optimizer, scheduler,
     batches = batches[rank::world_size]
 
     # ─── Iterate ────────────────────────────────────────────────────────
-    totals = dict(loss=0.0, mse=0.0, reg=0.0, n=0, n_views=0)
+    totals = dict(loss=0.0, mse=0.0, reg=0.0, n=0, n_views=0, avg_pts=0.0)
     recent_mse = deque(maxlen=100)
     recent_reg = deque(maxlen=100)
 
@@ -500,7 +504,7 @@ def run_epoch(aggregator, optimizer, scheduler,
             else:
                 mse = pred_f.new_zeros(())
 
-            reg, n_views = per_slot_view_sigreg(pred_f, is_masked)
+            reg, n_views, avg_pts = per_slot_view_sigreg(pred_f, is_masked)
             loss = mse + args.sigreg_lambda * reg
 
             if training:
@@ -518,6 +522,7 @@ def run_epoch(aggregator, optimizer, scheduler,
             totals["reg"] += reg.item() if torch.is_tensor(reg) else float(reg)
             totals["n"] += 1
             totals["n_views"] += n_views
+            totals["avg_pts"] += avg_pts
             recent_mse.append(mse.item())
             recent_reg.append(reg.item() if torch.is_tensor(reg) else float(reg))
 
@@ -547,6 +552,7 @@ def run_epoch(aggregator, optimizer, scheduler,
         "mse": totals["mse"] / n,
         "reg": totals["reg"] / n,
         "avg_views_per_batch": totals["n_views"] / n,
+        "avg_points_per_view": totals["avg_pts"] / n,
         "n_batches": totals["n"],
     }
 
@@ -720,6 +726,7 @@ def main():
             rprint(rank, f"\n  Train: loss={tr['loss']:.4f} "
                          f"mse={tr['mse']:.4f} reg={tr['reg']:.4f} "
                          f"views/batch={tr['avg_views_per_batch']:.1f} "
+                         f"pts/view={tr['avg_points_per_view']:.1f} "
                          f"[{t_train:.0f}s]")
 
             t0 = time.time()
@@ -729,6 +736,7 @@ def main():
             t_val = time.time() - t0
             rprint(rank, f"  Val:   loss={va['loss']:.4f} "
                          f"mse={va['mse']:.4f} reg={va['reg']:.4f} "
+                         f"pts/view={va['avg_points_per_view']:.1f} "
                          f"[{t_val:.0f}s]")
 
             if rank == 0:
