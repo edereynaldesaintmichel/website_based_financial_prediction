@@ -346,7 +346,6 @@ def run_epoch(predictor, idx_to_rate, device, args, split,
     total = {k: 0.0 for k in ma}
     n_batches = 0
     accum_count = 0
-    last_ckpt_time = time.time()
     doc_counter = 0
 
     prev_grad = torch.is_grad_enabled()
@@ -421,13 +420,6 @@ def run_epoch(predictor, idx_to_rate, device, args, split,
                 if training and scheduler is not None:
                     postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
                 pbar.set_postfix(postfix)
-
-            if (training and not args.no_save and args.checkpoint_minutes > 0
-                    and time.time() - last_ckpt_time >= args.checkpoint_minutes * 60):
-                ckpt_path = os.path.join(args.output_dir, "checkpoint_latest")
-                save_checkpoint(ckpt_path, predictor, optimizer, scheduler,
-                                epoch, global_step, ma=ma)
-                last_ckpt_time = time.time()
 
         if training and accum_count % args.grad_accum_steps != 0:
             nn.utils.clip_grad_norm_(
@@ -654,16 +646,11 @@ def train(args):
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_val_mae = val_metrics["mae"]
-
-        if not args.no_save:
-            ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch + 1}")
-            save_checkpoint(ckpt_path, predictor, optimizer, scheduler,
-                            epoch + 1, global_step,
-                            val_loss=val_loss, args=args, weights_only=True)
-            latest_path = os.path.join(args.output_dir, "checkpoint_latest")
-            save_checkpoint(latest_path, predictor, optimizer, scheduler,
-                            epoch + 1, global_step,
-                            val_loss=val_loss, args=args, weights_only=False)
+                if not args.no_save:
+                    best_path = os.path.join(args.output_dir, "checkpoint_best")
+                    save_checkpoint(best_path, predictor, optimizer, scheduler,
+                                    epoch + 1, global_step,
+                                    val_loss=val_loss, args=args, weights_only=False)
 
     if best_val_loss < float("inf"):
         print(f"\nBest val loss: {best_val_loss:.4f} (MAE={best_val_mae:.4f})")
