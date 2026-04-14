@@ -233,6 +233,104 @@ def form_doc_batches(doc_cls, doc_rates, cls_budget, shuffle=True):
 
 
 # ---------------------------------------------------------------------------
+# Per-(split, cache_epoch) batch cache
+# ---------------------------------------------------------------------------
+
+_BATCH_CACHE = {}  # (split, cache_epoch) -> list of (cls_tokens, attn_mask, targets)
+
+
+def prepare_batches(args, split, cache_epoch, idx_to_rate):
+    """Load+align+form batches for one cache_epoch, cached across training epochs.
+
+    Returned list uses shuffle=False; callers shuffle a copy of the list order
+    when training. Subsequent calls for the same (split, cache_epoch) are O(1).
+    """
+    key = (split, cache_epoch)
+    cached = _BATCH_CACHE.get(key)
+    if cached is not None:
+        print(f"  Reusing cached batches for {split} cache_epoch={cache_epoch} "
+              f"({len(cached)} batches)")
+        return cached
+
+    t0 = time.time()
+    print(f"  Building batches for {split} cache_epoch={cache_epoch}...")
+    cls_cache = load_cls_cache(args.output_dir, split, cache_epoch)
+    doc_cls, doc_rates, _ = align_cache_with_rates(cls_cache, idx_to_rate)
+    del cls_cache
+    batches = form_doc_batches(doc_cls, doc_rates, args.cls_budget, shuffle=False)
+    del doc_cls, doc_rates
+    _BATCH_CACHE[key] = batches
+    print(f"  [TIMING] prepare+cache batches: {time.time() - t0:.1f}s "
+          f"({len(batches)} batches, cls_budget={args.cls_budget})")
+    return batches
+
+
+# ---------------------------------------------------------------------------
+# Embedding diagnostics (effective dimensionality, anisotropy)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def diagnose_embeddings(predictor, idx_to_rate, args, device, n_sample=1000):
+    """Compute anisotropy, PCA explained variance, and participation ratio of
+    the aggregator's doc embeddings on a random sample of training docs."""
+    print("\nDiagnosing embedding effective dimensionality...")
+    cls_cache = load_cls_cache(args.output_dir, "train", 0)
+    doc_cls, doc_rates, _ = align_cache_with_rates(cls_cache, idx_to_rate)
+    del cls_cache
+
+    idx = list(range(len(doc_cls)))
+    random.shuffle(idx)
+    idx = idx[:n_sample]
+    sub_cls = [doc_cls[i] for i in idx]
+    sub_rates = [doc_rates[i] for i in idx]
+    del doc_cls, doc_rates
+
+    batches = form_doc_batches(sub_cls, sub_rates, args.cls_budget, shuffle=False)
+
+    was_training = predictor.training
+    predictor.eval()
+    embs = []
+    for cls_tokens, attention_mask, _ in tqdm(batches, desc="  Diag embeddings"):
+        cls_tokens = cls_tokens.to(device)
+        attention_mask = attention_mask.to(device)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = predictor(cls_tokens, attention_mask=attention_mask)
+        embs.append(out["doc_embedding"].float().cpu())
+    if was_training:
+        predictor.train()
+
+    E = torch.cat(embs, dim=0)
+    N, D = E.shape
+    print(f"  Collected {N} document embeddings of dim {D}")
+
+    E_norm = E / (E.norm(dim=1, keepdim=True) + 1e-8)
+    n_pairs = min(20000, N * (N - 1))
+    a = torch.randint(0, N, (n_pairs,))
+    b = torch.randint(0, N, (n_pairs,))
+    m = a != b
+    cos = (E_norm[a[m]] * E_norm[b[m]]).sum(dim=1)
+    print(f"  Anisotropy (mean pairwise cos sim): {cos.mean().item():+.4f} "
+          f"(std={cos.std().item():.4f}, "
+          f"|mean|={cos.mean().abs().item():.4f})")
+
+    mean_norm = E.norm(dim=1).mean().item()
+    print(f"  Mean embedding L2 norm: {mean_norm:.4f}")
+
+    Ec = E - E.mean(dim=0, keepdim=True)
+    S = torch.linalg.svdvals(Ec)
+    var = (S ** 2) / max(1, N - 1)
+    evr = var / var.sum()
+    cum = torch.cumsum(evr, dim=0)
+    top = [f"{v:.3f}" for v in evr[:10].tolist()]
+    print(f"  Top-10 PCA explained variance ratio: [{', '.join(top)}]")
+    for thresh in (0.5, 0.9, 0.95, 0.99):
+        k = int((cum < thresh).sum().item()) + 1
+        print(f"  #components for {int(thresh*100)}% variance: {k} / {D}")
+    eff = (evr.sum() ** 2) / (evr ** 2).sum()
+    print(f"  Participation ratio (effective dim): {eff.item():.2f} / {D}")
+
+
+# ---------------------------------------------------------------------------
 # Regularization reference outputs
 # ---------------------------------------------------------------------------
 
@@ -318,20 +416,11 @@ def run_epoch(predictor, idx_to_rate, device, args, split,
     prefix = "Train" if training else "Val"
     cache_epoch = epoch % NUM_CACHED_EPOCHS
 
-    t_cache = time.time()
-    print(f"  {prefix}: Loading CLS cache (cache_epoch={cache_epoch})...")
-    cls_cache = load_cls_cache(args.output_dir, split, cache_epoch)
-    doc_cls, doc_rates, _ = align_cache_with_rates(cls_cache, idx_to_rate)
-    del cls_cache
-    print(f"  [TIMING] load+align CLS cache: {time.time() - t_cache:.1f}s")
-    print(f"  {len(doc_cls)} rated documents with CLS embeddings")
-
-    t_batch = time.time()
-    batches = form_doc_batches(doc_cls, doc_rates, args.cls_budget,
-                               shuffle=training)
-    del doc_cls, doc_rates
-    print(f"  {len(batches)} batches (cls_budget={args.cls_budget})")
-    print(f"  [TIMING] form batches: {time.time() - t_batch:.1f}s")
+    print(f"  {prefix}: cache_epoch={cache_epoch}")
+    batches = prepare_batches(args, split, cache_epoch, idx_to_rate)
+    if training:
+        batches = list(batches)
+        random.shuffle(batches)
 
     if training:
         predictor.train()
@@ -606,6 +695,11 @@ def train(args):
     if args.regularization:
         print(f"Regularization: lambda={args.reg_lambda}")
     print()
+
+    # -----------------------------------------------------------
+    # Pre-training embedding diagnostics
+    # -----------------------------------------------------------
+    diagnose_embeddings(predictor, train_idx_to_rate, args, device, n_sample=1000)
 
     # -----------------------------------------------------------
     # Training loop
