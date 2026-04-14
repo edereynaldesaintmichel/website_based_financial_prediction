@@ -74,7 +74,7 @@ def extract_company_id(source_file):
 # ---------------------------------------------------------------------------
 
 def build_predictor(aggregator_checkpoint, hidden_size, train_aggregator,
-                    num_heads=16, num_layers=6, ffn_mult=4, dropout=0.0):
+                    num_heads=16, num_layers=6, ffn_mult=4, dropout=0.2):
     """Build GrowthPredictor and load aggregator weights."""
     aggregator = CLSAggregator(
         hidden_size=hidden_size,
