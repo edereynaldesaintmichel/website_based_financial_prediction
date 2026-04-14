@@ -112,9 +112,10 @@ def load_encoder(checkpoint_path, device, rank=0):
 
     model = T5StyleModel(config)
     state_dict = {k.removeprefix("_orig_mod."): v
-                  for k, v in ckpt["model_state_dict"].items()}
+                  for k, v in ckpt["model_state_dict"].items()
+                  if not k.removeprefix("_orig_mod.").startswith("decoder.")}
     del ckpt
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     del state_dict
 
     model.encoder.eval()
