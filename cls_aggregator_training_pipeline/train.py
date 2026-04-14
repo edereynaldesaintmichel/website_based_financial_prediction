@@ -1,36 +1,39 @@
 """
-CLS Aggregator training: chunking → CLS encoding → aggregation → decoder denoising.
+Latent-MLM training for the CLS aggregator.
 
-Per epoch:
-1. Chunk each document twice with random strategies:
-   - Encoder: consistent random target size per doc, segment-aware boundaries
-   - Decoder: random target size per chunk, random boundaries
-2. Sort encoder chunks by length, batch by token budget, compute CLS embeddings
-3. Gather CLS embeddings per document → aggregator input
-4. Sort decoder chunks by length, batch by token budget
-5. Train: aggregator(doc_CLS) → single enriched CLS → decoder denoises chunk → loss
-6. Contrastive loss: same document with 2 dropout masks → positive pair,
-   different documents → negatives (InfoNCE)
+Pipeline:
+1. Chunk every document with boundary-aware random chunk sizes.
+2. Encode every chunk with the frozen T5 encoder to get per-chunk CLS embeddings.
+   Results are cached on disk per epoch (expensive, done once per seed/epoch).
+3. Per batch of documents:
+      target = sg(W(cls))                          # frozen teacher in latent
+      x_in   = target, with 20% of positions replaced by the learnable mask
+               token (per-doc, min 2 masked positions, at least 1 visible)
+      pred   = aggregator(x_in)                    # (B, N, D)
+      L_mse  = MSE(pred[masked], target[masked])
+      L_reg  = mean_k SIGReg({ pred[i, k-th masked pos of doc i] : i })
+      loss   = L_mse + λ · L_reg
+   W is trained only through the aggregator's input path (unmasked positions).
 
-Encoder and decoder are frozen. Only the aggregator is trained.
+Inference: mean-pool `aggregator(cls_tokens)` over valid positions.
 
-Usage (single GPU):
+Usage:
     python -m cls_aggregator_training_pipeline.train \
         --data mlm_data/documents.pt \
         --checkpoint checkpoints/t5_cls/checkpoint_epoch5/full_model.pt
 
-Usage (multi-GPU via DDP):
-    torchrun --nproc_per_node=4 -m cls_aggregator_training_pipeline.train \
-        --data mlm_data/documents.pt \
-        --checkpoint checkpoints/t5_cls/checkpoint_epoch5/full_model.pt
+Multi-GPU:
+    torchrun --nproc_per_node=4 -m cls_aggregator_training_pipeline.train ...
 """
 import argparse
 import math
 import os
 import random
 import sys
+import threading
 import time
-from collections import defaultdict, deque
+from collections import deque
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -39,33 +42,28 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cls_aggregator_training_pipeline.aggregator import CLSAggregator
+from cls_aggregator_training_pipeline.muon import Muon, CombinedOptimizer
 from chunk_utils import (
-    get_token_info,
-    get_boundaries,
-    snap_to_boundary,
-    chunk_spans,
-    extract_chunk,
-    pad_and_collate,
+    get_token_info, get_boundaries, chunk_spans, extract_chunk, pad_and_collate,
 )
-from financial_bert import FinancialBertTokenizer, FinancialModernBertConfig
+from financial_bert import FinancialModernBertConfig
 from split_utils import split_documents
 from t5_style_training_pipeline.decoder import T5StyleModel
-from t5_style_training_pipeline.train import create_masked_inputs
 
 PRETRAINED_ID = "answerdotai/ModernBERT-base"
 
+HF_REPO_ID = "edereynal/financial_prediction"
+HF_REPO_TYPE = "dataset"
 
 CHUNK_MIN = 128
 CHUNK_MAX = 1024
+MIN_DOC_CHUNKS = 3          # need at least one masked + one visible, with headroom
+MIN_VIEW_SIZE = 32          # SIGReg views with fewer samples are skipped
 
 
-# ─── Distributed Helpers ──────────────────────────────────────────────────
+# ─── Distributed helpers ────────────────────────────────────────────────────
 
 def setup_distributed():
-    """Detect torchrun env and init process group. Returns (rank, world_size).
-
-    Returns (0, 1) when running without torchrun (single-GPU).
-    """
     if "RANK" not in os.environ:
         return 0, 1
     dist.init_process_group("nccl")
@@ -81,14 +79,33 @@ def cleanup_distributed():
 
 
 def rprint(rank, *args, **kwargs):
-    """Print only on rank 0."""
     if rank == 0:
         print(*args, **kwargs)
 
-# ─── Model Loading ──────────────────────────────────────────────────────────
 
-def load_t5_model(checkpoint_path, device, rank=0):
-    """Load T5 model from checkpoint. Encoder is frozen, decoder is trainable."""
+# ─── HF upload (background, best-effort) ────────────────────────────────────
+
+def upload_to_hf_async(local_path, repo_path):
+    """Upload a single file to HF in a background thread. Never blocks or
+    raises — failures are logged and training continues."""
+    def _run():
+        try:
+            from huggingface_hub import HfApi
+            HfApi().upload_file(
+                path_or_fileobj=local_path,
+                path_in_repo=repo_path,
+                repo_id=HF_REPO_ID,
+                repo_type=HF_REPO_TYPE,
+            )
+            print(f"  HF: uploaded {repo_path}")
+        except Exception as e:
+            print(f"  HF upload failed for {repo_path} (non-fatal): {e}")
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ─── T5 encoder (frozen) ────────────────────────────────────────────────────
+
+def load_encoder(checkpoint_path, device, rank=0):
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = FinancialModernBertConfig.from_pretrained(PRETRAINED_ID)
     config.num_magnitude_bins = ckpt["args"].get("num_magnitude_bins", 128)
@@ -100,155 +117,53 @@ def load_t5_model(checkpoint_path, device, rank=0):
     model.load_state_dict(state_dict)
     del state_dict
 
-    # Freeze encoder, leave decoder trainable
     model.encoder.eval()
     for p in model.encoder.parameters():
         p.requires_grad_(False)
-    model.to(device)
+    # Decoder is unused — drop it to free memory.
+    del model.decoder
+    torch.cuda.empty_cache()
 
+    model.to(device)
     n_enc = sum(p.numel() for p in model.encoder.parameters()) / 1e6
-    n_dec = sum(p.numel() for p in model.decoder.parameters()) / 1e6
-    rprint(rank, f"  Loaded T5 model: encoder {n_enc:.1f}M (frozen), "
-                 f"decoder {n_dec:.1f}M (trainable)")
+    rprint(rank, f"  Loaded T5 encoder: {n_enc:.1f}M params (frozen)")
     return model, config
 
 
-# ─── Batching ───────────────────────────────────────────────────────────────
+# ─── Chunking & CLS encoding ────────────────────────────────────────────────
 
-def form_batches(items, token_budget):
-    """Group length-sorted items into batches (max_len × batch_size ≤ budget)."""
-    batches = []
-    current = []
-    current_max = 0
-
+def form_encoder_batches(items, token_budget):
+    batches, current, current_max = [], [], 0
     for item in items:
         l = item["seq_length"]
         new_max = max(current_max, l)
         if current and new_max * (len(current) + 1) > token_budget:
             batches.append(current)
-            current = [item]
-            current_max = l
+            current, current_max = [item], l
         else:
             current.append(item)
             current_max = new_max
-
     if current:
         batches.append(current)
     return batches
 
 
-def form_batches_shuffled(items, token_budget, bucket_width=16):
-    """Bucket items by length, form batches per bucket, shuffle batch order.
-
-    Like form_batches but without systematic short→long ordering.
-    Padding overhead is bounded by bucket_width per sequence.
-    """
-    buckets = defaultdict(list)
-    for item in items:
-        key = (item["seq_length"] + bucket_width - 1) // bucket_width * bucket_width
-        buckets[key].append(item)
-
-    all_batches = []
-    for bucket_len, bucket_items in buckets.items():
-        random.shuffle(bucket_items)
-        batch_size = max(1, token_budget // bucket_len)
-        for i in range(0, len(bucket_items), batch_size):
-            all_batches.append(bucket_items[i:i + batch_size])
-
-    random.shuffle(all_batches)
-    return all_batches
-
-
-AGG_COST_WEIGHT = 6    # relative memory cost per aggregator token
-DEC_COST_WEIGHT = 30   # relative memory cost per decoder token
-
-
-def form_batches_2d(items, budget, bucket_width=16):
-    """Batch decoder chunks using 2D bucketing (dec_len × n_cls).
-
-    Groups chunks from the same document together and accounts for
-    aggregator memory cost (per unique document) separately from
-    decoder memory cost (per chunk).
-
-    Budget constraint per batch:
-        AGG_COST_WEIGHT * n_unique_docs * max_n_cls
-        + DEC_COST_WEIGHT * n_chunks * max_dec_len ≤ budget
-
-    Each item must have 'seq_length', 'n_cls', and 'doc_idx' fields.
-    """
-    # Bucket by decoder length (rows)
-    buckets = defaultdict(list)
-    for item in items:
-        key = (item["seq_length"] + bucket_width - 1) // bucket_width * bucket_width
-        buckets[key].append(item)
-
-    all_batches = []
-    for bucket_dec_len, bucket_items in buckets.items():
-        # Sort by (n_cls, doc_idx) — groups same-doc chunks, orders by agg cost
-        bucket_items.sort(key=lambda c: (c["n_cls"], c["doc_idx"]))
-
-        # Greedily form batches
-        current_batch = []
-        current_docs = set()
-        current_max_n_cls = 0
-
-        for chunk in bucket_items:
-            doc_idx = chunk["doc_idx"]
-            n_cls = chunk["n_cls"]
-
-            # Cost if we add this chunk
-            new_unique = len(current_docs | {doc_idx})
-            new_max_n_cls = max(current_max_n_cls, n_cls)
-            new_n_chunks = len(current_batch) + 1
-
-            cost = (AGG_COST_WEIGHT * new_unique * new_max_n_cls
-                    + DEC_COST_WEIGHT * new_n_chunks * bucket_dec_len)
-
-            if current_batch and cost > budget:
-                all_batches.append(current_batch)
-                current_batch = [chunk]
-                current_docs = {doc_idx}
-                current_max_n_cls = n_cls
-            else:
-                current_batch.append(chunk)
-                current_docs.add(doc_idx)
-                current_max_n_cls = new_max_n_cls
-
-        if current_batch:
-            all_batches.append(current_batch)
-
-    random.shuffle(all_batches)
-    return all_batches
-
-
-# ─── CLS Computation ───────────────────────────────────────────────────────
-
 @torch.no_grad()
 def compute_all_cls(model, enc_chunks, device, token_budget, pad_id,
                     rank=0, world_size=1, cache_path=None):
-    """Compute CLS embeddings for all encoder chunks.
-
-    In multi-GPU mode, each rank processes its shard of batches, saves to a
-    temporary file, and rank 0 merges all shards into the final cache.
-    This avoids the memory spike of all-gathering large result dicts.
-
-    Returns: dict of doc_idx → Tensor(N, D) on CPU.
-    """
-    batches = form_batches(enc_chunks, token_budget)
-    # Each rank takes its slice of batches
+    """Returns dict: doc_idx → Tensor(n_chunks, D) on CPU."""
+    batches = form_encoder_batches(enc_chunks, token_budget)
     my_batches = batches[rank::world_size]
 
     hidden_size = None
-    results = {}  # doc_idx → {chunk_idx → cls_vec}
+    results = {}  # doc_idx → {chunk_idx: cls_vec}
 
     pbar = tqdm(my_batches, desc="  CLS embeddings", unit="batch",
                 disable=(rank != 0))
     for batch in pbar:
         ids, num_mask, num_vals, attn_mask = pad_and_collate(batch, pad_id)
-        ids = ids.to(device)
-        num_mask = num_mask.to(device)
-        num_vals = num_vals.to(device)
-        attn_mask = attn_mask.to(device)
+        ids = ids.to(device); num_mask = num_mask.to(device)
+        num_vals = num_vals.to(device); attn_mask = attn_mask.to(device)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             embeds = model._build_embeds(
@@ -260,143 +175,205 @@ def compute_all_cls(model, enc_chunks, device, token_budget, pad_id,
                 inputs_embeds=embeds, attention_mask=attn_mask,
             )
         cls_vecs = out.last_hidden_state[:, 0, :].float().cpu()
-
         if hidden_size is None:
             hidden_size = cls_vecs.shape[1]
 
         for i, chunk in enumerate(batch):
-            doc_idx = chunk["doc_idx"]
-            chunk_idx = chunk["chunk_idx"]
-            if doc_idx not in results:
-                results[doc_idx] = {}
-            results[doc_idx][chunk_idx] = cls_vecs[i]
+            d, c = chunk["doc_idx"], chunk["chunk_idx"]
+            results.setdefault(d, {})[c] = cls_vecs[i]
 
-    # Free GPU memory from encoder forward passes
     torch.cuda.empty_cache()
 
-    # Multi-GPU: merge via disk instead of all-gather to avoid memory spike
+    # Merge across ranks via disk shards (avoids all-gather memory spike).
     if world_size > 1 and cache_path is not None:
-        shard_path = cache_path + f".shard_{rank}"
-        torch.save(results, shard_path)
+        shard = cache_path + f".shard_{rank}"
+        torch.save(results, shard)
         del results
         dist.barrier()
-
         if rank == 0:
             merged = {}
             for r in range(world_size):
-                shard = torch.load(
-                    cache_path + f".shard_{r}",
-                    map_location="cpu", weights_only=False)
-                for doc_idx, chunks_dict in shard.items():
-                    if doc_idx not in merged:
-                        merged[doc_idx] = {}
-                    merged[doc_idx].update(chunks_dict)
-                del shard
+                s = torch.load(cache_path + f".shard_{r}",
+                               map_location="cpu", weights_only=False)
+                for d, cd in s.items():
+                    merged.setdefault(d, {}).update(cd)
+                del s
             results = merged
         else:
-            # Non-zero ranks will load the final cache after rank 0 saves it
             return None
     elif world_size > 1:
-        # Fallback if no cache_path: use all-gather
-        all_results = [None] * world_size
-        dist.all_gather_object(all_results, results)
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, results)
         merged = {}
-        for r in all_results:
-            for doc_idx, chunks_dict in r.items():
-                if doc_idx not in merged:
-                    merged[doc_idx] = {}
-                merged[doc_idx].update(chunks_dict)
+        for r in gathered:
+            for d, cd in r.items():
+                merged.setdefault(d, {}).update(cd)
         results = merged
 
     if hidden_size is None:
-        hidden_size = 768  # fallback
+        hidden_size = 768
 
-    # Assemble per-document tensors ordered by chunk_idx
     doc_cls = {}
-    for doc_idx, chunks_dict in results.items():
-        n = max(chunks_dict.keys()) + 1
-        tensor = torch.zeros(n, hidden_size)
-        for ci, vec in chunks_dict.items():
-            tensor[ci] = vec
-        doc_cls[doc_idx] = tensor
-
+    for d, cd in results.items():
+        n = max(cd.keys()) + 1
+        t = torch.zeros(n, hidden_size)
+        for ci, v in cd.items():
+            t[ci] = v
+        doc_cls[d] = t
     return doc_cls
 
 
-# ─── Loss ───────────────────────────────────────────────────────────────────
-
-def compute_loss(text_logits, mag_logits, labels_text, labels_magnitude, config):
-    """Combined text CE + magnitude bin loss. Returns (total, text, mag)."""
-    loss_text = F.cross_entropy(
-        text_logits.view(-1, config.vocab_size),
-        labels_text.view(-1),
-        ignore_index=-100,
-    )
-
-    valid = labels_magnitude.view(-1) != -100
-    if valid.any():
-        targets = labels_magnitude.view(-1)[valid]
-        preds = mag_logits.view(-1, config.num_magnitude_bins)[valid]
-
-        mn, mx = config.magnitude_min, config.magnitude_max
-        n_bins = config.num_magnitude_bins
-        norm = (targets.clamp(mn, mx) - mn) / (mx - mn) * (n_bins - 1)
-        lo = norm.floor().long()
-        hi = norm.ceil().long()
-        w_hi = norm - lo.float()
-        w_lo = 1.0 - w_hi
-
-        log_p = F.log_softmax(preds, dim=-1)
-        loss_mag = -(
-            w_lo * log_p.gather(1, lo.unsqueeze(1)).squeeze(1)
-            + w_hi * log_p.gather(1, hi.unsqueeze(1)).squeeze(1)
-        ).mean()
-    else:
-        loss_mag = 0.0 * mag_logits.sum()  # keep in graph
-
-    return loss_text + loss_mag, loss_text, loss_mag
+def chunk_documents(documents, tok_info, rank=0):
+    cls_id, sep_id, nl_ids = tok_info["cls_id"], tok_info["sep_id"], tok_info["newline_ids"]
+    all_enc_chunks = []
+    doc_n_chunks = {}
+    for doc_idx, doc in enumerate(documents):
+        content_len = len(doc["input_ids"]) - 2
+        if content_len < 1:
+            continue
+        boundaries = get_boundaries(doc["input_ids"], nl_ids)
+        target = random.randint(CHUNK_MIN, CHUNK_MAX)
+        spans = chunk_spans(content_len, boundaries, lambda t=target: t)
+        if len(spans) < MIN_DOC_CHUNKS:
+            continue
+        doc_n_chunks[doc_idx] = len(spans)
+        for ci, (s, e) in enumerate(spans):
+            chunk = extract_chunk(doc, s, e, cls_id, sep_id)
+            chunk["doc_idx"] = doc_idx
+            chunk["chunk_idx"] = ci
+            all_enc_chunks.append(chunk)
+    n = len(all_enc_chunks)
+    avg = sum(c["seq_length"] for c in all_enc_chunks) / max(n, 1)
+    rprint(rank, f"  Chunks: {n} (avg {avg:.0f} tokens), "
+                 f"{len(doc_n_chunks)} documents ≥{MIN_DOC_CHUNKS} chunks")
+    return all_enc_chunks, doc_n_chunks
 
 
-def compute_contrastive_loss(z1, z2, temperature=0.05):
-    """InfoNCE contrastive loss between two views of the same documents.
+# ─── Batching documents ─────────────────────────────────────────────────────
 
-    Args:
-        z1, z2: (N, D) L2-normalized embeddings from two dropout-augmented
-                forward passes of the aggregator on the same documents.
-        temperature: softmax temperature.
-    Returns:
-        Scalar InfoNCE loss.
+def form_doc_batches(doc_ids_to_n, cls_token_budget):
+    """Group doc_idx values into batches whose padded CLS tensor respects a
+    cls-token budget (B × max_n_cls ≤ budget).
+
+    Buckets documents by n_chunks to keep padding waste bounded.
     """
-    # (N, N) similarity matrix
-    logits = z1 @ z2.T / temperature  # (N, N)
-    labels = torch.arange(z1.shape[0], device=z1.device)
-    # Symmetric: average both directions
-    loss = (F.cross_entropy(logits, labels)
-            + F.cross_entropy(logits.T, labels)) * 0.5
-    return loss
+    items = list(doc_ids_to_n.items())  # (doc_idx, n_chunks)
+    random.shuffle(items)
+    # Bucket by ceil(n / 16) * 16 to bound padding; sort buckets so small ones
+    # can pack many docs per batch and large ones fewer.
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for d, n in items:
+        key = (n + 15) // 16 * 16
+        buckets[key].append((d, n))
+
+    batches = []
+    for bucket_n, docs in buckets.items():
+        random.shuffle(docs)
+        per_batch = max(1, cls_token_budget // bucket_n)
+        for i in range(0, len(docs), per_batch):
+            batches.append([d for d, _ in docs[i:i + per_batch]])
+    random.shuffle(batches)
+    return batches
 
 
-def evaluate_contrastive_positives(dec_batches):
-    """Report unique-documents-per-batch stats (= contrastive positive count).
+def pad_doc_batch(doc_cls, doc_ids):
+    seqs = [doc_cls[d] for d in doc_ids]
+    B = len(seqs)
+    max_n = max(s.shape[0] for s in seqs)
+    D = seqs[0].shape[1]
+    padded = torch.zeros(B, max_n, D)
+    valid = torch.zeros(B, max_n, dtype=torch.bool)
+    for i, s in enumerate(seqs):
+        padded[i, :s.shape[0]] = s
+        valid[i, :s.shape[0]] = True
+    return padded, valid
 
-    Each unique document in a batch produces one SimCSE positive pair
-    (same doc, two dropout masks). Batches with ≤1 doc yield no contrastive signal.
+
+# ─── Latent MLM loss ────────────────────────────────────────────────────────
+
+def sample_mask(valid, mask_prob, min_mask, generator=None):
+    """Per-row random mask.
+
+    For each row: mask ceil(mask_prob * n_valid) positions, clamped to
+    [min_mask, n_valid-1] so at least one token remains visible.
+    Returns (B, N) bool.
     """
-    docs_per_batch = []
-    for batch in dec_batches:
-        n_unique = len(set(c["doc_idx"] for c in batch))
-        docs_per_batch.append(n_unique)
+    B, N = valid.shape
+    device = valid.device
+    n_valid = valid.sum(dim=1)                                    # (B,)
+    n_mask = (mask_prob * n_valid.float()).ceil().long()
+    n_mask = torch.clamp(n_mask, min=min_mask)
+    n_mask = torch.minimum(n_mask, torch.clamp(n_valid - 1, min=0))  # keep ≥1 visible
 
-    n_batches = len(docs_per_batch)
-    n_contrastive = sum(1 for d in docs_per_batch if d > 1)
-    avg_docs = sum(docs_per_batch) / max(n_batches, 1)
-    min_docs = min(docs_per_batch) if docs_per_batch else 0
-    max_docs = max(docs_per_batch) if docs_per_batch else 0
+    scores = torch.rand(B, N, device=device, generator=generator)
+    scores = scores.masked_fill(~valid, float("-inf"))
+    sorted_scores, _ = scores.sort(dim=1, descending=True)
+    idx = (n_mask - 1).clamp(min=0).unsqueeze(1)
+    thresh = sorted_scores.gather(1, idx)                         # (B, 1)
+    is_masked = (scores >= thresh) & valid & (n_mask.unsqueeze(1) > 0)
+    return is_masked
 
-    return avg_docs, min_docs, max_docs, n_contrastive, n_batches
+
+def sigreg_loss(x, sketch_dim=64):
+    """Force ECF(x) ~ ECF(standard Gaussian) in a random sketch direction.
+
+    x: (N, C). Returns scalar.
+    """
+    N, C = x.shape
+    A = torch.randn(C, sketch_dim, device=x.device, dtype=x.dtype)
+    A = A / (A.norm(p=2, dim=0, keepdim=True) + 1e-6)
+
+    t = torch.linspace(-5, 5, 17, device=x.device, dtype=x.dtype)
+    exp_f = torch.exp(-0.5 * t * t)                               # (T,)
+
+    proj = x @ A                                                  # (N, sketch)
+    args = proj.unsqueeze(2) * t.view(1, 1, -1)                   # (N, sketch, T)
+    ecf = torch.exp(1j * args.float()).mean(dim=0)                # (sketch, T)
+
+    diff_sq = (ecf - exp_f.float().unsqueeze(0)).abs().square()
+    err = diff_sq * exp_f.float().unsqueeze(0)
+    loss = torch.trapz(err, t.float(), dim=1) * N
+    return loss.mean()
 
 
-# ─── LR Schedule ────────────────────────────────────────────────────────────
+def per_slot_view_sigreg(pred, is_masked):
+    """Average SIGReg across per-slot views of masked predictions.
+
+    For each doc, randomly permute its masked positions; the k-th view contains
+    the k-th masked position from every doc that has ≥ k+1 masked positions.
+    Views with < MIN_VIEW_SIZE samples are skipped.
+    """
+    B, N, D = pred.shape
+    device = pred.device
+
+    # For each row, sort indices by a random key so masked positions come first
+    # in a shuffled order. sort is stable but we use a random tiebreak.
+    rand_key = torch.rand(B, N, device=device)
+    # Masked positions get a large score so they sort to the front.
+    score = is_masked.float() + rand_key * 0.5                    # masked ∈ [1, 1.5], unmasked ∈ [0, 0.5]
+    order = score.argsort(dim=1, descending=True)                 # (B, N)
+    # Gather predictions in that order: (B, N, D).
+    ordered_pred = pred.gather(1, order.unsqueeze(-1).expand(-1, -1, D))
+    # Row k of ordered_pred[:, k, :] is the k-th masked pred (or junk if row has fewer masks).
+    n_mask_per_row = is_masked.sum(dim=1)                         # (B,)
+    max_m = int(n_mask_per_row.max().item()) if B > 0 else 0
+
+    total = pred.new_zeros(())
+    n_views = 0
+    for k in range(max_m):
+        keep = n_mask_per_row > k                                 # (B,)
+        if keep.sum().item() < MIN_VIEW_SIZE:
+            continue
+        view = ordered_pred[keep, k, :]                           # (n, D)
+        total = total + sigreg_loss(view)
+        n_views += 1
+    if n_views == 0:
+        return pred.new_zeros(()), 0
+    return total / n_views, n_views
+
+
+# ─── LR schedule ────────────────────────────────────────────────────────────
 
 def get_cosine_schedule(optimizer, warmup_steps, total_steps):
     def lr_lambda(step):
@@ -409,81 +386,29 @@ def get_cosine_schedule(optimizer, warmup_steps, total_steps):
 
 # ─── Epoch ──────────────────────────────────────────────────────────────────
 
-def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
-              device, epoch, args, config, tok_info, training=True,
+def run_epoch(aggregator, model, documents, optimizer, scheduler,
+              device, epoch, args, tok_info, training=True,
               rank=0, world_size=1):
-    """Run one training or validation epoch."""
     prefix = "Train" if training else "Val"
-    contrastive_lambda = getattr(args, "contrastive_lambda", 0.0)
-    contrastive_temp = getattr(args, "contrastive_temp", 0.05)
-    if training:
-        aggregator.train()
-        decoder.train()
-    else:
-        aggregator.eval()
-        decoder.eval()
+    aggregator.train() if training else aggregator.eval()
 
-    # Fixed seed per epoch (deterministic for val)
     rng_state = random.getstate()
     random.seed(args.seed + epoch + (0 if training else 10000))
-
-    cls_id = tok_info["cls_id"]
-    sep_id = tok_info["sep_id"]
     pad_id = tok_info["pad_id"]
-    mask_id = tok_info["mask_id"]
-    nl_ids = tok_info["newline_ids"]
-    mag_sentinel = config.magnitude_max + 1.0
 
-    # ─── Step 1: Chunk all documents ────────────────────────────────────
-    all_enc_chunks = []
-    all_dec_chunks = []
-    doc_enc_spans = {}
+    # ─── Chunk ──────────────────────────────────────────────────────────
+    all_enc_chunks, doc_n_chunks = chunk_documents(documents, tok_info, rank=rank)
 
-    for doc_idx, doc in enumerate(documents):
-        content_len = len(doc["input_ids"]) - 2  # strip CLS/SEP
-        if content_len < 1:
-            continue
-
-        boundaries = get_boundaries(doc["input_ids"], nl_ids)
-
-        # Encoder: consistent target per doc
-        enc_target = random.randint(CHUNK_MIN, CHUNK_MAX)
-        enc_spans = chunk_spans(content_len, boundaries, lambda: enc_target)
-        doc_enc_spans[doc_idx] = enc_spans
-
-        for ci, (s, e) in enumerate(enc_spans):
-            chunk = extract_chunk(doc, s, e, cls_id, sep_id)
-            chunk["doc_idx"] = doc_idx
-            chunk["chunk_idx"] = ci
-            all_enc_chunks.append(chunk)
-
-        # Decoder: random target per chunk
-        dec_spans = chunk_spans(
-            content_len, boundaries, lambda: random.randint(CHUNK_MIN, CHUNK_MAX))
-        n_cls = len(enc_spans)
-        for ci, (s, e) in enumerate(dec_spans):
-            chunk = extract_chunk(doc, s, e, cls_id, sep_id)
-            chunk["doc_idx"] = doc_idx
-            chunk["n_cls"] = n_cls
-            all_dec_chunks.append(chunk)
-
-    n_enc = len(all_enc_chunks)
-    n_dec = len(all_dec_chunks)
-    avg_enc = sum(c["seq_length"] for c in all_enc_chunks) / max(n_enc, 1)
-    avg_dec = sum(c["seq_length"] for c in all_dec_chunks) / max(n_dec, 1)
-    rprint(rank, f"  Chunks: {n_enc} encoder (avg {avg_enc:.0f}), "
-                 f"{n_dec} decoder (avg {avg_dec:.0f})")
-
-    # ─── Step 2: Compute CLS embeddings (cached to disk) ────────────────
+    # ─── CLS embeddings (cached) ────────────────────────────────────────
     cache_tag = "train" if training else "val"
     cls_cache_path = os.path.join(
-        args.output_dir, f"cls_cache_{cache_tag}_epoch{epoch}.pt")
-
+        args.cls_cache_dir, f"cls_cache_{cache_tag}_epoch{epoch}.pt")
     if os.path.exists(cls_cache_path):
-        rprint(rank, f"  Loading cached CLS embeddings from {cls_cache_path}")
+        rprint(rank, f"  Loading cached CLS embeddings: {cls_cache_path}")
         doc_cls = torch.load(cls_cache_path, map_location="cpu", weights_only=False)
         del all_enc_chunks
     else:
+        assert model is not None, "encoder required to compute CLSs (no cache found)"
         all_enc_chunks.sort(key=lambda c: c["seq_length"])
         doc_cls = compute_all_cls(
             model, all_enc_chunks, device, args.encoder_token_budget, pad_id,
@@ -492,383 +417,151 @@ def run_epoch(aggregator, decoder, model, documents, optimizer, scheduler,
         if rank == 0:
             torch.save(doc_cls, cls_cache_path)
             rprint(rank, f"  Cached CLS embeddings to {cls_cache_path}")
-            # Clean up shard files
+            upload_to_hf_async(
+                cls_cache_path,
+                f"aggregator/cls_cache/{os.path.basename(cls_cache_path)}",
+            )
             for r in range(world_size):
                 shard = cls_cache_path + f".shard_{r}"
                 if os.path.exists(shard):
                     os.remove(shard)
         if world_size > 1:
-            dist.barrier()  # Wait for rank 0 to save the merged cache
+            dist.barrier()
             if doc_cls is None:
                 doc_cls = torch.load(cls_cache_path, map_location="cpu",
                                      weights_only=False)
     torch.cuda.empty_cache()
 
-    # ─── Step 3: 2D bucketing (dec_len × n_cls), form batches ───────────
-    avg_cls_per_doc = n_enc / max(len(doc_enc_spans), 1)
-    batch_budget = (DEC_COST_WEIGHT * args.decoder_token_budget
-                    + AGG_COST_WEIGHT * avg_cls_per_doc)
-    rprint(rank, f"  Batch budget: {batch_budget:.0f} "
-                 f"(avg {avg_cls_per_doc:.1f} CLS/doc)")
-    dec_batches = form_batches_2d(all_dec_chunks, batch_budget)
-    del all_dec_chunks
+    # ─── Form doc batches, shard across ranks ───────────────────────────
+    batches = form_doc_batches(doc_n_chunks, args.cls_token_budget)
+    rprint(rank, f"  {len(batches)} doc batches "
+                 f"(budget {args.cls_token_budget} CLS tokens)")
+    batches = batches[rank::world_size]
 
-    # Padding waste estimation
-    total_dec_useful = 0
-    total_dec_padded = 0
-    total_agg_useful = 0
-    total_agg_padded = 0
-    for batch in dec_batches:
-        # Decoder: each chunk padded to max length in batch
-        max_dec = max(c["seq_length"] for c in batch)
-        total_dec_useful += sum(c["seq_length"] for c in batch)
-        total_dec_padded += max_dec * len(batch)
-        # Aggregator: unique docs padded to max n_cls in batch
-        docs = {}
-        for c in batch:
-            docs[c["doc_idx"]] = c["n_cls"]
-        max_cls = max(docs.values())
-        total_agg_useful += sum(docs.values())
-        total_agg_padded += max_cls * len(docs)
-    dec_waste = 1.0 - total_dec_useful / max(total_dec_padded, 1)
-    agg_waste = 1.0 - total_agg_useful / max(total_agg_padded, 1)
-    weighted_waste = (
-        (DEC_COST_WEIGHT * (total_dec_padded - total_dec_useful)
-         + AGG_COST_WEIGHT * (total_agg_padded - total_agg_useful))
-        / max(DEC_COST_WEIGHT * total_dec_padded
-              + AGG_COST_WEIGHT * total_agg_padded, 1)
-    )
-    rprint(rank, f"  Padding waste: decoder {dec_waste:.1%}, "
-                 f"aggregator {agg_waste:.1%}, "
-                 f"weighted {weighted_waste:.1%}")
-    rprint(rank, f"  {len(dec_batches)} decoder batches")
-
-    # ─── Step 3b: Contrastive positive stats ──────────────────────────────
-    avg_docs, min_docs, max_docs, n_cl, n_total = evaluate_contrastive_positives(
-        dec_batches)
-    rprint(rank, f"  Contrastive positives: {avg_docs:.1f} avg docs/batch "
-                 f"(min {min_docs}, max {max_docs}), "
-                 f"{n_cl}/{n_total} batches with ≥2 docs")
-
-    # ─── Step 3c: Shard batches across ranks ──────────────────────────────
-    dec_batches = dec_batches[rank::world_size]
-
-    # ─── Step 3d: Pre-collate decoder batches into pinned memory ─────────
-    dec_collated = []
-    for batch in dec_batches:
-        ids, num_mask, num_vals, attn_mask = pad_and_collate(batch, pad_id)
-        dec_collated.append((
-            ids.pin_memory(),
-            num_mask.pin_memory(),
-            num_vals.pin_memory(),
-            attn_mask.pin_memory(),
-        ))
-
-    # ─── Step 4: Train/eval on decoder batches ──────────────────────────
-    # Unwrap DDP for attribute access (forward still goes through DDP wrapper)
-    decoder_inner = decoder.module if isinstance(decoder, DDP) else decoder
-
-    total_loss = 0.0
-    total_loss_text = 0.0
-    total_loss_mag = 0.0
-    total_loss_contrastive = 0.0
-    total_correct = 0
-    total_masked = 0
-    n_batches = 0
-    accum_count = 0
-    recent_loss_text = deque(maxlen=100)
-    recent_loss_mag = deque(maxlen=100)
-    recent_loss_contrastive = deque(maxlen=100)
+    # ─── Iterate ────────────────────────────────────────────────────────
+    totals = dict(loss=0.0, mse=0.0, reg=0.0, n=0, n_views=0)
+    recent_mse = deque(maxlen=100)
+    recent_reg = deque(maxlen=100)
 
     prev_grad = torch.is_grad_enabled()
     if not training:
         torch.set_grad_enabled(False)
-
     if training:
         optimizer.zero_grad()
+    accum = 0
 
     try:
-        pbar = tqdm(zip(dec_batches, dec_collated), total=len(dec_batches),
-                    desc=f"  {prefix}", unit="batch", disable=(rank != 0))
-        for batch_idx, (batch_chunks, collated) in enumerate(pbar):
-            # Aggregator: batched forward over unique documents
-            doc_indices = list(set(c["doc_idx"] for c in batch_chunks))
-            cls_seqs = [doc_cls[d] for d in doc_indices]
-            max_n = max(s.shape[0] for s in cls_seqs)
-            padded = torch.zeros(len(doc_indices), max_n, cls_seqs[0].shape[1])
-            agg_mask = torch.zeros(len(doc_indices), max_n)
-            for i, s in enumerate(cls_seqs):
-                padded[i, :s.shape[0]] = s
-                agg_mask[i, :s.shape[0]] = 1
+        pbar = tqdm(batches, desc=f"  {prefix}", unit="batch", disable=(rank != 0))
+        for doc_ids in pbar:
+            padded, valid = pad_doc_batch(doc_cls, doc_ids)
+            padded = padded.to(device, non_blocking=True)
+            valid = valid.to(device, non_blocking=True)
 
-            padded_dev = padded.to(device)
-            agg_mask_dev = agg_mask.to(device)
+            is_masked = sample_mask(
+                valid, mask_prob=args.mask_prob, min_mask=args.min_mask)
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                enriched = aggregator(padded_dev, agg_mask_dev)
-                doc_to_cls = {d: enriched[i] for i, d in enumerate(doc_indices)}
-                batch_cls = torch.stack(
-                    [doc_to_cls[c["doc_idx"]] for c in batch_chunks])
+                pred, target = aggregator(padded, valid, is_masked)
 
-                # Contrastive loss: second forward with different dropout mask
-                loss_cl = torch.tensor(0.0, device=device)
-                if training and contrastive_lambda > 0 and len(doc_indices) > 1:
-                    enriched2 = aggregator(padded_dev, agg_mask_dev)
-                    z1 = F.normalize(enriched.float(), dim=-1)
-                    z2 = F.normalize(enriched2.float(), dim=-1)
-                    loss_cl = compute_contrastive_loss(
-                        z1, z2, temperature=contrastive_temp)
+            pred_f = pred.float()
+            target_f = target.float()
 
-                # Load pre-collated decoder batch from pinned memory
-                ids, num_mask, num_vals, attn_mask = (
-                    t.to(device, non_blocking=True) for t in collated)
-
-                # Apply masking
-                (m_ids, m_nums, m_num_mask,
-                 labels_t, labels_m) = create_masked_inputs(
-                    ids, num_mask, num_vals,
-                    mask_token_id=mask_id, pad_token_id=pad_id,
-                    magnitude_sentinel=mag_sentinel,
-                    vocab_size=config.vocab_size,
-                    magnitude_min=config.magnitude_min,
-                    magnitude_max=config.magnitude_max,
-                    mask_prob_min=args.mask_prob_min,
-                    mask_prob_max=args.mask_prob_max,
+            # MSE on masked positions only.
+            masked_flat = is_masked.view(-1)
+            if masked_flat.any():
+                mse = F.mse_loss(
+                    pred_f.reshape(-1, pred_f.shape[-1])[masked_flat],
+                    target_f.reshape(-1, target_f.shape[-1])[masked_flat],
                 )
+            else:
+                mse = pred_f.new_zeros(())
 
-                # Build decoder embeddings and forward
-                dec_embeds = model._build_embeds(
-                    m_ids, m_nums, m_num_mask,
-                    decoder_inner._get_tok_embeddings(),
-                    decoder_inner.number_embedder,
-                )
-                text_logits, mag_logits = decoder(
-                    dec_embeds, batch_cls, attn_mask)
-
-            # Loss in fp32
-            text_logits = text_logits.float()
-            mag_logits = mag_logits.float()
-            loss_recon, lt, lm = compute_loss(
-                text_logits, mag_logits, labels_t, labels_m, config)
-            loss = loss_recon + contrastive_lambda * loss_cl
+            reg, n_views = per_slot_view_sigreg(pred_f, is_masked)
+            loss = mse + args.sigreg_lambda * reg
 
             if training:
-                accum_count += 1
+                accum += 1
                 (loss / args.grad_accum_steps).backward()
-
-                if accum_count % args.grad_accum_steps == 0:
+                if accum % args.grad_accum_steps == 0:
                     torch.nn.utils.clip_grad_norm_(
-                        list(aggregator.parameters()) +
-                        list(decoder.parameters()),
-                        args.max_grad_norm)
+                        aggregator.parameters(), args.max_grad_norm)
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
 
-            # Metrics
-            total_loss += loss.item()
-            total_loss_text += lt.item()
-            total_loss_mag += lm.item()
-            cl_val = loss_cl.item() if torch.is_tensor(loss_cl) else 0.0
-            total_loss_contrastive += cl_val
-            recent_loss_text.append(lt.item())
-            recent_loss_mag.append(lm.item())
-            recent_loss_contrastive.append(cl_val)
+            totals["loss"] += loss.item()
+            totals["mse"] += mse.item()
+            totals["reg"] += reg.item() if torch.is_tensor(reg) else float(reg)
+            totals["n"] += 1
+            totals["n_views"] += n_views
+            recent_mse.append(mse.item())
+            recent_reg.append(reg.item() if torch.is_tensor(reg) else float(reg))
 
-            text_masked = labels_t.view(-1) != -100
-            if text_masked.any():
-                preds = text_logits.detach().view(
-                    -1, config.vocab_size)[text_masked].argmax(-1)
-                total_correct += (preds == labels_t.view(-1)[text_masked]).sum().item()
-                total_masked += text_masked.sum().item()
-
-            n_batches += 1
-
-            if n_batches % 20 == 0:
-                ma_lt = sum(recent_loss_text) / len(recent_loss_text)
-                ma_lm = sum(recent_loss_mag) / len(recent_loss_mag)
-                ma_cl = sum(recent_loss_contrastive) / len(recent_loss_contrastive)
+            if totals["n"] % 20 == 0:
+                ma_mse = sum(recent_mse) / len(recent_mse)
+                ma_reg = sum(recent_reg) / len(recent_reg)
                 if training:
-                    agg_lr = optimizer.param_groups[0]["lr"]
-                    dec_lr = optimizer.param_groups[1]["lr"]
-                    postfix = dict(
-                        text=f"{ma_lt:.3f}", mag=f"{ma_lm:.3f}",
-                        agg_lr=f"{agg_lr:.2e}", dec_lr=f"{dec_lr:.2e}")
-                    if contrastive_lambda > 0:
-                        postfix["cl"] = f"{ma_cl:.3f}"
-                    pbar.set_postfix(**postfix)
-                else:
                     pbar.set_postfix(
-                        text=f"{ma_lt:.3f}", mag=f"{ma_lm:.3f}")
+                        mse=f"{ma_mse:.4f}", reg=f"{ma_reg:.4f}",
+                        lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+                else:
+                    pbar.set_postfix(mse=f"{ma_mse:.4f}", reg=f"{ma_reg:.4f}")
 
-        # Flush remaining accumulated gradients
-        if training and accum_count % args.grad_accum_steps != 0:
+        if training and accum % args.grad_accum_steps != 0:
             torch.nn.utils.clip_grad_norm_(
-                list(aggregator.parameters()) +
-                list(decoder.parameters()),
-                args.max_grad_norm)
+                aggregator.parameters(), args.max_grad_norm)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-
     finally:
         torch.set_grad_enabled(prev_grad)
         random.setstate(rng_state)
 
-    avg_loss = total_loss / max(n_batches, 1)
-    avg_lt = total_loss_text / max(n_batches, 1)
-    avg_lm = total_loss_mag / max(n_batches, 1)
-    avg_cl = total_loss_contrastive / max(n_batches, 1)
-    acc = total_correct / max(total_masked, 1)
-
+    n = max(totals["n"], 1)
     return {
-        "loss": avg_loss,
-        "loss_text": avg_lt,
-        "loss_mag": avg_lm,
-        "loss_contrastive": avg_cl,
-        "text_acc": acc,
-        "n_batches": n_batches,
+        "loss": totals["loss"] / n,
+        "mse": totals["mse"] / n,
+        "reg": totals["reg"] / n,
+        "avg_views_per_batch": totals["n_views"] / n,
+        "n_batches": totals["n"],
     }
-
-
-# ─── Dry Run (CPU-only, no model) ──────────────────────────────────────
-
-def _dry_run(args):
-    """Chunk + batch documents and report same-source pair stats, then exit."""
-    random.seed(args.seed)
-
-    tok_info = get_token_info(PRETRAINED_ID)
-    cls_id = tok_info["cls_id"]
-    sep_id = tok_info["sep_id"]
-    nl_ids = tok_info["newline_ids"]
-
-    print(f"Loading documents from {args.data}...")
-    documents = torch.load(args.data, map_location="cpu", weights_only=False)
-    train_docs, val_docs = split_documents(documents, args.val_ratio)
-    del documents
-    print(f"  {len(train_docs)} train, {len(val_docs)} val documents")
-
-    for split_name, docs in [("Train", train_docs), ("Val", val_docs)]:
-        print(f"\n--- {split_name} ---")
-
-        all_enc_chunks = []
-        all_dec_chunks = []
-        doc_enc_spans = {}
-
-        for doc_idx, doc in enumerate(docs):
-            content_len = len(doc["input_ids"]) - 2
-            if content_len < 1:
-                continue
-            boundaries = get_boundaries(doc["input_ids"], nl_ids)
-
-            enc_target = random.randint(CHUNK_MIN, CHUNK_MAX)
-            enc_spans = chunk_spans(content_len, boundaries, lambda: enc_target)
-            doc_enc_spans[doc_idx] = enc_spans
-
-            for ci, (s, e) in enumerate(enc_spans):
-                chunk = extract_chunk(doc, s, e, cls_id, sep_id)
-                chunk["doc_idx"] = doc_idx
-                chunk["chunk_idx"] = ci
-                all_enc_chunks.append(chunk)
-
-            n_cls = len(enc_spans)
-            dec_spans = chunk_spans(
-                content_len, boundaries,
-                lambda: random.randint(CHUNK_MIN, CHUNK_MAX))
-            for ci, (s, e) in enumerate(dec_spans):
-                chunk = extract_chunk(doc, s, e, cls_id, sep_id)
-                chunk["doc_idx"] = doc_idx
-                chunk["n_cls"] = n_cls
-                all_dec_chunks.append(chunk)
-
-        n_enc = len(all_enc_chunks)
-        n_dec = len(all_dec_chunks)
-        avg_enc = sum(c["seq_length"] for c in all_enc_chunks) / max(n_enc, 1)
-        avg_dec = sum(c["seq_length"] for c in all_dec_chunks) / max(n_dec, 1)
-        print(f"  Chunks: {n_enc} encoder (avg {avg_enc:.0f}), "
-              f"{n_dec} decoder (avg {avg_dec:.0f})")
-
-        avg_cls_per_doc = n_enc / max(len(doc_enc_spans), 1)
-        batch_budget = (DEC_COST_WEIGHT * args.decoder_token_budget
-                        + AGG_COST_WEIGHT * avg_cls_per_doc)
-        print(f"  Batch budget: {batch_budget:.0f} "
-              f"(avg {avg_cls_per_doc:.1f} CLS/doc)")
-        dec_batches = form_batches_2d(all_dec_chunks, batch_budget)
-        print(f"  {len(dec_batches)} decoder batches")
-
-        # Padding waste
-        total_dec_useful = total_dec_padded = 0
-        total_agg_useful = total_agg_padded = 0
-        for batch in dec_batches:
-            max_dec = max(c["seq_length"] for c in batch)
-            total_dec_useful += sum(c["seq_length"] for c in batch)
-            total_dec_padded += max_dec * len(batch)
-            batch_docs = {}
-            for c in batch:
-                batch_docs[c["doc_idx"]] = c["n_cls"]
-            max_cls = max(batch_docs.values())
-            total_agg_useful += sum(batch_docs.values())
-            total_agg_padded += max_cls * len(batch_docs)
-        dec_waste = 1.0 - total_dec_useful / max(total_dec_padded, 1)
-        agg_waste = 1.0 - total_agg_useful / max(total_agg_padded, 1)
-        weighted_waste = (
-            (DEC_COST_WEIGHT * (total_dec_padded - total_dec_useful)
-             + AGG_COST_WEIGHT * (total_agg_padded - total_agg_useful))
-            / max(DEC_COST_WEIGHT * total_dec_padded
-                  + AGG_COST_WEIGHT * total_agg_padded, 1)
-        )
-        print(f"  Padding waste: decoder {dec_waste:.1%}, "
-              f"aggregator {agg_waste:.1%}, "
-              f"weighted {weighted_waste:.1%}")
-
-        # Contrastive positive stats
-        avg_docs, min_docs, max_docs, n_cl, n_total = \
-            evaluate_contrastive_positives(dec_batches)
-        print(f"  Contrastive positives: {avg_docs:.1f} avg docs/batch "
-              f"(min {min_docs}, max {max_docs}), "
-              f"{n_cl}/{n_total} batches with ≥2 docs")
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Train CLS Aggregator")
+    parser = argparse.ArgumentParser(description="Latent-MLM CLS aggregator training")
     parser.add_argument("--data", default="mlm_data/documents.pt")
     parser.add_argument("--checkpoint",
                         default="checkpoints/t5_cls/checkpoint_epoch5/full_model.pt")
-    parser.add_argument("--output_dir", default="checkpoints/cls_aggregator")
+    parser.add_argument("--output_dir", default="checkpoints/cls_aggregator_latentmlm")
+    parser.add_argument("--cls_cache_dir", default=None,
+                        help="Where to read/write CLS caches. "
+                             "Defaults to {output_dir}/cls_cache.")
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--decoder_lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=3e-4,
+                        help="AdamW LR for 1D params (norms, mask_token).")
+    parser.add_argument("--muon_lr", type=float, default=0.02,
+                        help="Muon LR for 2D hidden matrices.")
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--encoder_token_budget", type=int, default=32768)
-    parser.add_argument("--decoder_token_budget", type=int, default=16384)
+    parser.add_argument("--cls_token_budget", type=int, default=16384,
+                        help="Per-batch cap on padded CLS tokens (B × max_n_cls).")
     parser.add_argument("--grad_accum_steps", type=int, default=1)
-    parser.add_argument("--mask_prob_min", type=float, default=0.15)
-    parser.add_argument("--mask_prob_max", type=float, default=0.85)
+    parser.add_argument("--mask_prob", type=float, default=0.2)
+    parser.add_argument("--min_mask", type=int, default=2)
+    parser.add_argument("--sigreg_lambda", type=float, default=1.0)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
-    # Aggregator hyperparams
     parser.add_argument("--agg_layers", type=int, default=6)
     parser.add_argument("--agg_heads", type=int, default=16)
     parser.add_argument("--agg_hidden", type=int, default=768)
-    parser.add_argument("--agg_dropout", type=float, default=0.1)
-    parser.add_argument("--contrastive_lambda", type=float, default=1,
-                        help="Weight for contrastive loss (0 to disable)")
-    parser.add_argument("--contrastive_temp", type=float, default=0.05,
-                        help="InfoNCE temperature")
-    parser.add_argument("--compile", action="store_true",
-                        help="Use torch.compile for kernel fusion")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Only compute chunking/batching stats (no model, no GPU)")
+    parser.add_argument("--agg_dropout", type=float, default=0.0)
+    parser.add_argument("--compile", action="store_true")
     args = parser.parse_args()
-
-    if args.dry_run:
-        _dry_run(args)
-        return
 
     rank, world_size = setup_distributed()
     device = torch.device("cuda", rank)
@@ -877,29 +570,31 @@ def main():
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.set_float32_matmul_precision("high")
-
     rprint(rank, f"Device: {device} (world_size={world_size})")
 
-    # Load T5 model (encoder frozen, decoder trainable)
-    rprint(rank, f"\nLoading T5 model from {args.checkpoint}...")
-    model, config = load_t5_model(args.checkpoint, device, rank=rank)
+    os.makedirs(args.output_dir, exist_ok=True)
+    if args.cls_cache_dir is None:
+        args.cls_cache_dir = os.path.join(args.output_dir, "cls_cache")
+    os.makedirs(args.cls_cache_dir, exist_ok=True)
 
-    decoder = model.decoder
-    if args.compile:
-        rprint(rank, "Compiling decoder with torch.compile...")
-        decoder = torch.compile(decoder, dynamic=True)
+    # Defer loading the T5 encoder: needed only if the CLS cache is missing.
+    model = None
 
-    # Token info
+    def ensure_encoder():
+        nonlocal model
+        if model is None:
+            rprint(rank, f"\nLoading T5 encoder from {args.checkpoint}...")
+            model, _ = load_encoder(args.checkpoint, device, rank=rank)
+        return model
+
     tok_info = get_token_info(PRETRAINED_ID)
 
-    # Load documents
     rprint(rank, f"\nLoading documents from {args.data}...")
     documents = torch.load(args.data, map_location="cpu", weights_only=False)
     train_docs, val_docs = split_documents(documents, args.val_ratio)
     del documents
     rprint(rank, f"  {len(train_docs)} train, {len(val_docs)} val documents")
 
-    # Build aggregator
     aggregator = CLSAggregator(
         hidden_size=args.agg_hidden,
         num_heads=args.agg_heads,
@@ -909,94 +604,91 @@ def main():
     n_agg = sum(p.numel() for p in aggregator.parameters()) / 1e6
     rprint(rank, f"\nAggregator: {n_agg:.1f}M params")
 
+    if args.compile:
+        rprint(rank, "Compiling aggregator with torch.compile...")
+        aggregator = torch.compile(aggregator, dynamic=True)
 
-    # Wrap trainable modules in DDP
     if world_size > 1:
         aggregator = DDP(aggregator, device_ids=[rank])
-        decoder = DDP(decoder, device_ids=[rank])
 
-    # Optimizer & schedule (separate LR for decoder)
-    optimizer = torch.optim.AdamW([
-        {"params": aggregator.parameters(), "lr": args.lr},
-        {"params": decoder.parameters(), "lr": args.decoder_lr},
-    ], weight_decay=args.weight_decay)
-
-    total_content = sum(len(d["input_ids"]) - 2 for d in train_docs)
-    est_batches = total_content / args.decoder_token_budget
-    total_steps = int(est_batches * args.epochs / args.grad_accum_steps)
-
-    scheduler = get_cosine_schedule(optimizer, args.warmup_steps, total_steps)
+    # Muon for 2D hidden matrices (Wqkv, Wo, w_gate/up/down, W projection);
+    # AdamW for the rest (LayerNorm params, mask_token).
+    muon_params = [p for p in aggregator.parameters()
+                   if p.requires_grad and p.ndim == 2]
+    adamw_params = [p for p in aggregator.parameters()
+                    if p.requires_grad and p.ndim != 2]
     rprint(rank,
-           f"Estimated ~{est_batches:.0f} batches/epoch, {total_steps} total steps")
+           f"Optimizer: Muon ({sum(p.numel() for p in muon_params)/1e6:.1f}M params) "
+           f"+ AdamW ({sum(p.numel() for p in adamw_params)/1e6:.2f}M params)")
+    optimizer = CombinedOptimizer([
+        Muon(muon_params, lr=args.muon_lr, momentum=0.95,
+             weight_decay=args.weight_decay),
+        torch.optim.AdamW(adamw_params, lr=args.lr,
+                          weight_decay=args.weight_decay),
+    ])
 
-    # Resume
+    # Rough step estimate for cosine schedule.
+    avg_chunks = max(sum((len(d["input_ids"]) - 2) / ((CHUNK_MIN + CHUNK_MAX) / 2)
+                         for d in train_docs), 1)
+    est_batches = max(avg_chunks / args.cls_token_budget * 1.5, 1)
+    total_steps = int(est_batches * args.epochs / args.grad_accum_steps) + args.warmup_steps
+    scheduler = get_cosine_schedule(optimizer, args.warmup_steps, total_steps)
+    rprint(rank, f"Estimated ~{est_batches:.0f} batches/epoch, "
+                 f"{total_steps} total steps")
+
     start_epoch = 0
-    os.makedirs(args.output_dir, exist_ok=True)
-
     if args.resume:
         latest = os.path.join(args.output_dir, "latest.pt")
         if os.path.exists(latest):
             ckpt = torch.load(latest, map_location="cpu", weights_only=False)
-            agg_unwrap = (aggregator.module if isinstance(aggregator, DDP)
-                          else aggregator)
+            agg_unwrap = aggregator.module if isinstance(aggregator, DDP) else aggregator
             agg_unwrap.load_state_dict(ckpt["aggregator"])
-            if "decoder" in ckpt:
-                model.decoder.load_state_dict(ckpt["decoder"])
             optimizer.load_state_dict(ckpt["optimizer"])
             scheduler.load_state_dict(ckpt["scheduler"])
             start_epoch = ckpt["epoch"] + 1
             rprint(rank, f"Resumed from epoch {start_epoch}")
             del ckpt
 
-    # Training loop
     try:
         for epoch in range(start_epoch, args.epochs):
-            rprint(rank, f"\n{'='*70}")
-            rprint(rank, f"Epoch {epoch + 1}/{args.epochs}")
-            rprint(rank, f"{'='*70}")
+            rprint(rank, f"\n{'='*70}\nEpoch {epoch + 1}/{args.epochs}\n{'='*70}")
 
-            # Train
+            # Load encoder lazily: only if the train cache is missing this epoch.
+            train_cache = os.path.join(
+                args.cls_cache_dir, f"cls_cache_train_epoch{epoch}.pt")
+            val_cache = os.path.join(
+                args.cls_cache_dir, f"cls_cache_val_epoch{epoch}.pt")
+            if not os.path.exists(train_cache) or not os.path.exists(val_cache):
+                ensure_encoder()
+
             t0 = time.time()
-            train_m = run_epoch(
-                aggregator, decoder, model, train_docs, optimizer, scheduler,
-                device, epoch, args, config, tok_info, training=True,
-                rank=rank, world_size=world_size)
+            tr = run_epoch(aggregator, model, train_docs, optimizer, scheduler,
+                           device, epoch, args, tok_info, training=True,
+                           rank=rank, world_size=world_size)
             t_train = time.time() - t0
+            rprint(rank, f"\n  Train: loss={tr['loss']:.4f} "
+                         f"mse={tr['mse']:.4f} reg={tr['reg']:.4f} "
+                         f"views/batch={tr['avg_views_per_batch']:.1f} "
+                         f"[{t_train:.0f}s]")
 
-            cl_str = (f", cl={train_m['loss_contrastive']:.4f}"
-                      if args.contrastive_lambda > 0 else "")
-            rprint(rank,
-                   f"\n  Train: loss={train_m['loss']:.4f} "
-                   f"(text={train_m['loss_text']:.4f}, "
-                   f"mag={train_m['loss_mag']:.4f}{cl_str}) "
-                   f"acc={train_m['text_acc']:.1%} [{t_train:.0f}s]")
-
-            # Validate
             t0 = time.time()
-            val_m = run_epoch(
-                aggregator, decoder, model, val_docs, optimizer, scheduler,
-                device, epoch, args, config, tok_info, training=False,
-                rank=rank, world_size=world_size)
+            va = run_epoch(aggregator, model, val_docs, optimizer, scheduler,
+                           device, epoch, args, tok_info, training=False,
+                           rank=rank, world_size=world_size)
             t_val = time.time() - t0
+            rprint(rank, f"  Val:   loss={va['loss']:.4f} "
+                         f"mse={va['mse']:.4f} reg={va['reg']:.4f} "
+                         f"[{t_val:.0f}s]")
 
-            rprint(rank,
-                   f"  Val:   loss={val_m['loss']:.4f} "
-                   f"(text={val_m['loss_text']:.4f}, "
-                   f"mag={val_m['loss_mag']:.4f}) "
-                   f"acc={val_m['text_acc']:.1%} [{t_val:.0f}s]")
-
-            # Save checkpoint (rank 0 only)
             if rank == 0:
-                agg_unwrap = (aggregator.module if isinstance(aggregator, DDP)
-                              else aggregator)
+                agg_unwrap = aggregator.module if isinstance(aggregator, DDP) else aggregator
                 ckpt = {
                     "aggregator": agg_unwrap.state_dict(),
-                    "decoder": model.decoder.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
                     "epoch": epoch,
-                    "train_metrics": train_m,
-                    "val_metrics": val_m,
+                    "train_metrics": tr,
+                    "val_metrics": va,
                     "args": vars(args),
                 }
                 torch.save(ckpt, os.path.join(args.output_dir, "latest.pt"))
@@ -1004,7 +696,6 @@ def main():
                     args.output_dir, f"epoch_{epoch + 1}.pt"))
                 rprint(rank, f"  Saved checkpoint: epoch_{epoch + 1}.pt")
 
-            # Sync all ranks before next epoch
             if world_size > 1:
                 dist.barrier()
     finally:
