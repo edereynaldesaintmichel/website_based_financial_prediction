@@ -1,27 +1,28 @@
 """
 Training script for growth rate prediction from document embeddings.
 
-Pipeline:
-1. Load documents + growth rates, match by company ID
-2. Each epoch: chunk documents, compute CLS embeddings (frozen encoder),
-   group by document, forward through GrowthPredictor (aggregator + head)
-3. Train with MSE regression loss + optional aggregator regularization
+The CLS embeddings are pre-computed and cached in the HuggingFace dataset
+`edereynal/financial_prediction` under `aggregator/cls_cache/` (produced by
+cls_aggregator_training_pipeline/train.py). Cache files are:
 
-Supports:
-- BF16 mixed precision
-- Gradient accumulation
-- Cosine LR schedule with warmup
-- Frozen or trainable aggregator (separate LR)
-- Aggregator output regularization
-- Resume from checkpoint
-- Periodic checkpointing
-- torch.compile
+    cls_cache_{train,val}_epoch{0..N-1}.pt
+
+Each file is a dict: {doc_idx -> Tensor(n_chunks, D)} where `doc_idx` is the
+position of the document in the corresponding split of `documents.pt`, with
+the same `split_utils.split_documents` used by both pipelines.
+
+Pipeline:
+1. Load documents.pt + growth_rates.json, apply the same train/val split as
+   the aggregator pipeline, and build a {doc_idx -> growth_rate} table per
+   split (by extracting the company_id from each document's source_file).
+2. Each epoch: load (or download from HF) the epoch's CLS cache, align with
+   growth rates, form batches, forward through GrowthPredictor.
+3. Train with MSE + optional aggregator-output regularization.
 
 Usage:
-    python -m final_training_pipeline.train \
-        --data mlm_data/documents.pt \
-        --growth-rates growth_rates.json \
-        --encoder-checkpoint checkpoints/t5_cls/checkpoint_epoch5/full_model.pt \
+    python -m final_training_pipeline.train \\
+        --data mlm_data/documents.pt \\
+        --growth-rates growth_rates.json \\
         --aggregator-checkpoint checkpoints/cls_aggregator/checkpoint_epoch10/aggregator.pt
 """
 import argparse
@@ -39,118 +40,59 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from chunk_utils import (
-    get_token_info,
-    get_boundaries,
-    chunk_spans,
-    extract_chunk,
-    pad_and_collate,
-)
-from financial_bert import FinancialModernBertConfig
 from split_utils import split_documents
-from t5_style_training_pipeline.decoder import T5StyleModel
 from final_training_pipeline.model import GrowthPredictor
 from cls_aggregator_training_pipeline.aggregator import CLSAggregator
 
 
-PRETRAINED_ID = "answerdotai/ModernBERT-base"
-CHUNK_MIN = 128
-CHUNK_MAX = 1024
+HF_REPO_ID = "edereynal/financial_prediction"
+HF_REPO_TYPE = "dataset"
+HF_CACHE_PREFIX = "aggregator/cls_cache"
+NUM_CACHED_EPOCHS = 5  # matches cls_aggregator_training_pipeline default
 
 
 # ---------------------------------------------------------------------------
-# Company ID extraction
+# Company ID extraction (must match the cls_aggregator pipeline filtering)
 # ---------------------------------------------------------------------------
 
 def extract_company_id(source_file):
-    """Extract company identifier from source_file name.
-
-    SEC:       '1000045_2018-06-27.md' -> '1000045'
-    UK:        'Prod224_0052_00781277_20171231.md' -> '00781277'
-    Wikipedia: '000000_alabama.txt' -> None (no growth data)
-    """
+    """SEC: '1000045_2018-06-27.md' -> '1000045'
+    UK:  'Prod224_0052_00781277_20171231.md' -> '00781277'
+    Wiki: '000000_alabama.txt' -> None"""
     if source_file.endswith('.txt'):
-        return None  # Wikipedia
+        return None
     if source_file.startswith('Prod'):
         parts = source_file.split('_')
         if len(parts) >= 4:
-            return parts[2]  # company_id
-    else:
-        # SEC: CIK_DATE.md
-        return source_file.split('_')[0]
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Data matching
-# ---------------------------------------------------------------------------
-
-def match_documents_to_growth_rates(documents, growth_rates):
-    """Match documents to growth rates by company ID.
-
-    Returns list of (doc, growth_rate) pairs for documents with a match.
-    """
-    matched = []
-    skipped_wiki = 0
-    skipped_no_rate = 0
-
-    for doc in documents:
-        cid = extract_company_id(doc["source_file"])
-        if cid is None:
-            skipped_wiki += 1
-            continue
-        if cid not in growth_rates:
-            skipped_no_rate += 1
-            continue
-        matched.append((doc, growth_rates[cid]))
-
-    print(f"  Matched: {len(matched)} documents")
-    print(f"  Skipped: {skipped_wiki} Wikipedia, {skipped_no_rate} no growth rate")
-    return matched
+            return parts[2]
+        return None
+    return source_file.split('_')[0]
 
 
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_encoder(checkpoint_path, device):
-    """Load T5 model with frozen encoder."""
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    config = FinancialModernBertConfig.from_pretrained(PRETRAINED_ID)
-    config.num_magnitude_bins = ckpt["args"].get("num_magnitude_bins", 128)
-
-    model = T5StyleModel(config)
-    state_dict = {k.removeprefix("_orig_mod."): v
-                  for k, v in ckpt["model_state_dict"].items()}
-    del ckpt
-    model.load_state_dict(state_dict)
-    del state_dict
-
-    model.encoder.eval()
-    for p in model.encoder.parameters():
-        p.requires_grad_(False)
-    model.to(device)
-
-    n_enc = sum(p.numel() for p in model.encoder.parameters()) / 1e6
-    print(f"  Encoder: {n_enc:.1f}M parameters (frozen)")
-    return model, config
-
-
-def build_predictor(aggregator_checkpoint, hidden_size, train_aggregator):
+def build_predictor(aggregator_checkpoint, hidden_size, train_aggregator,
+                    num_heads=16, num_layers=6, ffn_mult=4, dropout=0.0):
     """Build GrowthPredictor and load aggregator weights."""
-    aggregator = CLSAggregator(hidden_size=hidden_size)
+    aggregator = CLSAggregator(
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        ffn_mult=ffn_mult,
+        dropout=dropout,
+    )
 
     if aggregator_checkpoint:
         ckpt = torch.load(aggregator_checkpoint, map_location="cpu",
                           weights_only=False)
-        # Full training checkpoint: extract aggregator sub-dict
         if isinstance(ckpt, dict) and "aggregator" in ckpt:
             state_dict = ckpt["aggregator"]
         elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             state_dict = ckpt["model_state_dict"]
         else:
             state_dict = ckpt
-        # Strip prefixes if present
         cleaned = {}
         for k, v in state_dict.items():
             k = k.removeprefix("_orig_mod.")
@@ -167,10 +109,7 @@ def build_predictor(aggregator_checkpoint, hidden_size, train_aggregator):
     else:
         print("  Aggregator: trainable")
 
-    predictor = GrowthPredictor(
-        aggregator=aggregator,
-        hidden_size=hidden_size,
-    )
+    predictor = GrowthPredictor(aggregator=aggregator, hidden_size=hidden_size)
     n_head = sum(p.numel() for p in predictor.head.parameters()) / 1e6
     n_agg = sum(p.numel() for p in predictor.aggregator.parameters()) / 1e6
     print(f"  GrowthPredictor: aggregator {n_agg:.1f}M, head {n_head:.2f}M")
@@ -178,117 +117,69 @@ def build_predictor(aggregator_checkpoint, hidden_size, train_aggregator):
 
 
 # ---------------------------------------------------------------------------
-# Chunking
+# CLS cache: local + HF fallback
 # ---------------------------------------------------------------------------
 
-def chunk_documents(docs_with_rates, nl_ids, cls_id, sep_id, seed):
-    """Chunk all documents with consistent random target size per doc.
+def cache_filename(split, epoch_idx):
+    return f"cls_cache_{split}_epoch{epoch_idx}.pt"
 
-    Returns list of chunk dicts with doc_idx, chunk_idx, and growth_rate fields.
-    """
-    rng = random.Random(seed)
-    all_chunks = []
 
-    for doc_idx, (doc, rate) in enumerate(docs_with_rates):
-        content_len = len(doc["input_ids"]) - 2  # strip CLS/SEP
-        if content_len < 1:
+def ensure_cache(output_dir, split, epoch_idx):
+    """Return local path to cache file, downloading from HF if missing."""
+    fname = cache_filename(split, epoch_idx)
+    local = os.path.join(output_dir, fname)
+    if os.path.exists(local):
+        return local
+
+    from huggingface_hub import hf_hub_download
+    repo_path = f"{HF_CACHE_PREFIX}/{fname}"
+    print(f"  Downloading {repo_path} from HF ({HF_REPO_ID})...")
+    downloaded = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        repo_type=HF_REPO_TYPE,
+        filename=repo_path,
+    )
+    # Symlink into output_dir for quick subsequent lookups.
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        if os.path.islink(local) or os.path.exists(local):
+            os.remove(local)
+        os.symlink(downloaded, local)
+    except OSError:
+        pass
+    return downloaded if not os.path.exists(local) else local
+
+
+def load_cls_cache(output_dir, split, epoch_idx):
+    """Load a pre-computed CLS cache file. Returns dict[doc_idx -> Tensor(n, D)]."""
+    path = ensure_cache(output_dir, split, epoch_idx)
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+# ---------------------------------------------------------------------------
+# Align cache with growth rates
+# ---------------------------------------------------------------------------
+
+def build_idx_to_rate(split_docs, growth_rates):
+    """Map {doc_idx (pos in split) -> growth_rate} for matched, non-wiki docs."""
+    idx_to_rate = {}
+    for i, doc in enumerate(split_docs):
+        cid = extract_company_id(doc["source_file"])
+        if cid is None:
             continue
-
-        boundaries = get_boundaries(doc["input_ids"], nl_ids)
-        enc_target = rng.randint(CHUNK_MIN, CHUNK_MAX)  # ONE target per doc
-        spans = chunk_spans(content_len, boundaries, lambda: enc_target)
-
-        for ci, (s, e) in enumerate(spans):
-            chunk = extract_chunk(doc, s, e, cls_id, sep_id)
-            chunk["doc_idx"] = doc_idx
-            chunk["chunk_idx"] = ci
-            chunk["growth_rate"] = rate
-            all_chunks.append(chunk)
-
-    return all_chunks
+        rate = growth_rates.get(cid)
+        if rate is None:
+            continue
+        idx_to_rate[i] = rate
+    return idx_to_rate
 
 
-# ---------------------------------------------------------------------------
-# CLS computation
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def compute_all_cls(encoder_model, chunks, device, pad_id, token_budget):
-    """Compute CLS embeddings for all chunks using the frozen encoder.
-
-    Returns dict: doc_idx -> {chunk_idx: cls_vec (D,) on CPU}.
-    """
-    # Sort by length for efficient batching
-    sorted_chunks = sorted(chunks, key=lambda c: c["seq_length"])
-
-    # Form batches by token budget
-    batches = []
-    current = []
-    current_max = 0
-    for chunk in sorted_chunks:
-        l = chunk["seq_length"]
-        new_max = max(current_max, l)
-        if current and new_max * (len(current) + 1) > token_budget:
-            batches.append(current)
-            current = [chunk]
-            current_max = l
-        else:
-            current.append(chunk)
-            current_max = new_max
-    if current:
-        batches.append(current)
-
-    results = {}  # doc_idx -> {chunk_idx -> cls_vec}
-
-    pbar = tqdm(batches, desc="  CLS embeddings", unit="batch")
-    for batch in pbar:
-        ids, num_mask, num_vals, attn_mask = pad_and_collate(batch, pad_id)
-        ids = ids.to(device)
-        num_mask = num_mask.to(device)
-        num_vals = num_vals.to(device)
-        attn_mask = attn_mask.to(device)
-
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            embeds = encoder_model._build_embeds(
-                ids, num_vals, num_mask,
-                encoder_model._get_encoder_tok_embeddings(),
-                encoder_model.encoder.number_embedder,
-            )
-            out = encoder_model.encoder.modernbert(
-                inputs_embeds=embeds, attention_mask=attn_mask,
-            )
-        cls_vecs = out.last_hidden_state[:, 0, :].float().cpu()
-
-        for i, chunk in enumerate(batch):
-            doc_idx = chunk["doc_idx"]
-            chunk_idx = chunk["chunk_idx"]
-            if doc_idx not in results:
-                results[doc_idx] = {}
-            results[doc_idx][chunk_idx] = cls_vecs[i]
-
-    torch.cuda.empty_cache()
-    return results
-
-
-def gather_doc_embeddings(cls_dict, docs_with_rates):
-    """Assemble CLS dicts into per-document tensors and growth rate targets.
-
-    Returns:
-        doc_cls:    list of (N_i, D) tensors (one per document)
-        doc_rates:  list of float growth rates
-    """
-    doc_cls = []
-    doc_rates = []
-
-    for doc_idx in sorted(cls_dict.keys()):
-        chunk_dict = cls_dict[doc_idx]
-        # Stack in chunk order
-        n_chunks = max(chunk_dict.keys()) + 1
-        vecs = [chunk_dict[ci] for ci in range(n_chunks)]
-        doc_cls.append(torch.stack(vecs, dim=0))  # (N_i, D)
-        doc_rates.append(docs_with_rates[doc_idx][1])
-
-    return doc_cls, doc_rates
+def align_cache_with_rates(cls_cache, idx_to_rate):
+    """Intersect cache keys with rated docs; return ordered lists."""
+    keys = sorted(k for k in cls_cache if k in idx_to_rate)
+    doc_cls = [cls_cache[k] for k in keys]
+    doc_rates = [idx_to_rate[k] for k in keys]
+    return doc_cls, doc_rates, keys
 
 
 # ---------------------------------------------------------------------------
@@ -296,14 +187,7 @@ def gather_doc_embeddings(cls_dict, docs_with_rates):
 # ---------------------------------------------------------------------------
 
 def form_doc_batches(doc_cls, doc_rates, cls_budget, shuffle=True):
-    """Group documents into batches by greedily packing up to cls_budget total CLS tokens.
-
-    Documents are sorted by number of CLS embeddings to reduce padding waste,
-    then greedily packed. Resulting batches are shuffled for training.
-
-    Returns list of (cls_tokens, attention_mask, targets) tuples.
-    """
-    # Sort by n_chunks so similar-length docs are grouped (less padding)
+    """Greedily pack up to cls_budget total CLS tokens per batch."""
     indices = sorted(range(len(doc_cls)), key=lambda i: doc_cls[i].shape[0])
 
     batches_indices = []
@@ -330,7 +214,6 @@ def form_doc_batches(doc_cls, doc_rates, cls_budget, shuffle=True):
         batch_cls = [doc_cls[i] for i in batch_idx]
         batch_rates = [doc_rates[i] for i in batch_idx]
 
-        # Pad chunk dimension
         max_n = max(t.shape[0] for t in batch_cls)
         D = batch_cls[0].shape[1]
         B = len(batch_cls)
@@ -349,53 +232,16 @@ def form_doc_batches(doc_cls, doc_rates, cls_budget, shuffle=True):
     return batches
 
 
-def estimate_steps_per_epoch(docs_with_rates, tok_info, seed, cls_budget,
-                             grad_accum_steps):
-    """Dry-run chunking (CPU only) to count batches per epoch."""
-    chunks = chunk_documents(docs_with_rates, tok_info["newline_ids"],
-                             tok_info["cls_id"], tok_info["sep_id"], seed)
-
-    # Count chunks per document
-    doc_n_chunks = {}
-    for c in chunks:
-        d = c["doc_idx"]
-        doc_n_chunks[d] = doc_n_chunks.get(d, 0) + 1
-
-    # Simulate greedy batch packing (sorted by n_chunks)
-    sorted_counts = sorted(doc_n_chunks.values())
-    n_batches = 0
-    current_total = 0
-    started = False
-
-    for n in sorted_counts:
-        if started and current_total + n > cls_budget:
-            n_batches += 1
-            current_total = n
-        else:
-            current_total += n
-            started = True
-    if started:
-        n_batches += 1
-
-    steps = max(1, n_batches // grad_accum_steps)
-    n_docs = len(doc_n_chunks)
-    n_chunks = len(chunks)
-    avg_len = sum(c["seq_length"] for c in chunks) / max(n_chunks, 1)
-    print(f"  Dry-run chunking: {n_chunks} chunks from {n_docs} docs "
-          f"(avg {avg_len:.0f} tokens) -> {n_batches} batches, "
-          f"~{steps} optimizer steps/epoch")
-    return steps
-
-
 # ---------------------------------------------------------------------------
-# Regularization: pre-compute reference aggregator outputs
+# Regularization reference outputs
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def compute_reference_outputs(predictor, doc_cls, doc_rates, cls_budget, device):
-    """Pre-compute aggregator outputs before training as regularization targets.
+    """Pre-compute aggregator (mean-pooled) outputs as regularization targets.
 
-    Returns dict: doc_global_idx -> (D,) tensor on CPU.
+    Returns dict: global_idx -> (D,) tensor on CPU, indexed in the order
+    produced by form_doc_batches(..., shuffle=False).
     """
     batches = form_doc_batches(doc_cls, doc_rates, cls_budget, shuffle=False)
     references = {}
@@ -406,8 +252,8 @@ def compute_reference_outputs(predictor, doc_cls, doc_rates, cls_budget, device)
         attention_mask = attention_mask.to(device)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            doc_emb = predictor.aggregator(cls_tokens, attention_mask=attention_mask)
-        doc_emb = doc_emb.float().cpu()
+            out = predictor(cls_tokens, attention_mask=attention_mask)
+        doc_emb = out["doc_embedding"].float().cpu()
 
         for i in range(doc_emb.shape[0]):
             references[global_idx] = doc_emb[i]
@@ -417,7 +263,7 @@ def compute_reference_outputs(predictor, doc_cls, doc_rates, cls_budget, device)
 
 
 # ---------------------------------------------------------------------------
-# LR Schedule
+# LR schedule
 # ---------------------------------------------------------------------------
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
@@ -438,7 +284,6 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 
 def save_checkpoint(path, predictor, optimizer, scheduler, epoch, global_step,
                     ma=None, val_loss=None, args=None, weights_only=False):
-    """Save checkpoint."""
     os.makedirs(path, exist_ok=True)
 
     state = {
@@ -457,7 +302,6 @@ def save_checkpoint(path, predictor, optimizer, scheduler, epoch, global_step,
         state["args"] = vars(args)
     torch.save(state, os.path.join(path, "full_model.pt"))
 
-    # Save aggregator and head separately for downstream use
     unwrapped = predictor._orig_mod if hasattr(predictor, "_orig_mod") else predictor
     torch.save(unwrapped.aggregator.state_dict(), os.path.join(path, "aggregator.pt"))
     torch.save(unwrapped.head.state_dict(), os.path.join(path, "head.pt"))
@@ -465,60 +309,23 @@ def save_checkpoint(path, predictor, optimizer, scheduler, epoch, global_step,
 
 
 # ---------------------------------------------------------------------------
-# Training epoch
+# Epoch
 # ---------------------------------------------------------------------------
 
-def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
-              args, optimizer=None, scheduler=None, epoch=0, global_step=0,
+def run_epoch(predictor, idx_to_rate, device, args, split,
+              optimizer=None, scheduler=None, epoch=0, global_step=0,
               training=True, reference_outputs=None):
-    """Run one training or validation epoch.
-
-    Returns: (metrics_dict, global_step)
-    """
     prefix = "Train" if training else "Val"
+    cache_epoch = epoch % NUM_CACHED_EPOCHS
 
-    # 1. Check CLS cache (cycle through 10 cache files)
-    cache_epoch = epoch % 10
-    chunk_seed = args.seed + cache_epoch + (0 if training else 10000)
-    split_tag = "train" if training else "val"
-    cache_path = os.path.join(args.output_dir, f"cls_cache_epoch{cache_epoch}_{split_tag}.pt")
+    t_cache = time.time()
+    print(f"  {prefix}: Loading CLS cache (cache_epoch={cache_epoch})...")
+    cls_cache = load_cls_cache(args.output_dir, split, cache_epoch)
+    doc_cls, doc_rates, _ = align_cache_with_rates(cls_cache, idx_to_rate)
+    del cls_cache
+    print(f"  [TIMING] load+align CLS cache: {time.time() - t_cache:.1f}s")
+    print(f"  {len(doc_cls)} rated documents with CLS embeddings")
 
-    if os.path.exists(cache_path):
-        t_cache = time.time()
-        print(f"  {prefix}: Loading cached CLS embeddings from {cache_path}")
-        cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-        doc_cls = cached["doc_cls"]
-        doc_rates = cached["doc_rates"]
-        print(f"  [TIMING] load CLS cache: {time.time() - t_cache:.1f}s")
-    else:
-        # 1b. Chunk documents (fresh each epoch)
-        cls_id = tok_info["cls_id"]
-        sep_id = tok_info["sep_id"]
-        pad_id = tok_info["pad_id"]
-        nl_ids = tok_info["newline_ids"]
-        all_chunks = chunk_documents(docs_with_rates, nl_ids, cls_id, sep_id, chunk_seed)
-
-        n_chunks = len(all_chunks)
-        avg_len = sum(c["seq_length"] for c in all_chunks) / max(n_chunks, 1)
-        print(f"  {prefix}: {n_chunks} chunks from {len(docs_with_rates)} docs "
-              f"(avg {avg_len:.0f} tokens)")
-
-        # 2. Compute CLS embeddings (frozen encoder)
-        cls_dict = compute_all_cls(encoder_model, all_chunks, device, pad_id,
-                                   args.token_budget)
-        del all_chunks
-
-        # 3. Gather per-document
-        doc_cls, doc_rates = gather_doc_embeddings(cls_dict, docs_with_rates)
-        del cls_dict
-
-        # 3b. Cache to disk
-        torch.save({"doc_cls": doc_cls, "doc_rates": doc_rates}, cache_path)
-        print(f"  Cached CLS embeddings to {cache_path}")
-
-    print(f"  {len(doc_cls)} documents with CLS embeddings")
-
-    # 4. Form document batches
     t_batch = time.time()
     batches = form_doc_batches(doc_cls, doc_rates, args.cls_budget,
                                shuffle=training)
@@ -526,10 +333,8 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
     print(f"  {len(batches)} batches (cls_budget={args.cls_budget})")
     print(f"  [TIMING] form batches: {time.time() - t_batch:.1f}s")
 
-    # 5. Forward/backward
     if training:
         predictor.train()
-        # Keep aggregator in eval mode if frozen
         unwrapped = predictor._orig_mod if hasattr(predictor, "_orig_mod") else predictor
         if not args.train_aggregator:
             unwrapped.aggregator.eval()
@@ -542,12 +347,11 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
     n_batches = 0
     accum_count = 0
     last_ckpt_time = time.time()
-    doc_counter = 0  # global doc index for reference lookup
+    doc_counter = 0
 
     prev_grad = torch.is_grad_enabled()
     if not training:
         torch.set_grad_enabled(False)
-
     if training:
         optimizer.zero_grad()
 
@@ -562,10 +366,9 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
                 out = predictor(cls_tokens, attention_mask=attention_mask)
                 prediction = out["prediction"].float()
 
-            mse_loss = predictor.compute_loss(prediction, targets) if not hasattr(predictor, "_orig_mod") \
-                else predictor._orig_mod.compute_loss(prediction, targets)
+            unwrapped = predictor._orig_mod if hasattr(predictor, "_orig_mod") else predictor
+            mse_loss = unwrapped.compute_loss(prediction, targets)
 
-            # Optional aggregator regularization
             reg_loss = torch.tensor(0.0, device=device)
             if training and args.regularization and reference_outputs is not None:
                 doc_emb = out["doc_embedding"].float()
@@ -591,14 +394,11 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
                     optimizer.zero_grad()
                     global_step += 1
 
-
-            # Compute MAE for monitoring
             with torch.no_grad():
                 batch_mae = (prediction - targets).abs().mean().item()
 
             doc_counter += cls_tokens.shape[0]
 
-            # Track metrics
             ma["loss"].append(loss.item())
             ma["mse"].append(mse_loss.item())
             ma["reg"].append(reg_loss.item())
@@ -622,7 +422,6 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
                     postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
                 pbar.set_postfix(postfix)
 
-            # Periodic checkpoint
             if (training and not args.no_save and args.checkpoint_minutes > 0
                     and time.time() - last_ckpt_time >= args.checkpoint_minutes * 60):
                 ckpt_path = os.path.join(args.output_dir, "checkpoint_latest")
@@ -630,7 +429,6 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
                                 epoch, global_step, ma=ma)
                 last_ckpt_time = time.time()
 
-        # Flush remaining accumulated gradients
         if training and accum_count % args.grad_accum_steps != 0:
             nn.utils.clip_grad_norm_(
                 [p for p in predictor.parameters() if p.requires_grad],
@@ -650,35 +448,17 @@ def run_epoch(predictor, docs_with_rates, encoder_model, device, tok_info,
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Steps estimation from cache
 # ---------------------------------------------------------------------------
 
-def _check_all_caches_exist(output_dir, epochs, start_epoch=0):
-    """Check if CLS caches exist for all needed epochs (both train and val).
-
-    Cache files cycle every 10 epochs, so we only need caches for
-    the unique cache_epoch values (epoch % 10) that will be used.
-    """
-    needed = set(e % 10 for e in range(start_epoch, epochs))
-    for cache_epoch in sorted(needed):
-        for split in ("train", "val"):
-            path = os.path.join(output_dir, f"cls_cache_epoch{cache_epoch}_{split}.pt")
-            if not os.path.exists(path):
-                return False, path
-    return True, None
-
-
-def _estimate_steps_from_cache(cache_path, cls_budget, grad_accum_steps):
-    """Estimate steps/epoch from a cached CLS file (fast: just count doc sizes)."""
-    cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-    doc_cls = cached["doc_cls"]
-
-    # Simulate greedy batch packing (sorted by n_chunks)
-    sorted_counts = sorted(t.shape[0] for t in doc_cls)
+def estimate_steps_from_cache(cls_cache, idx_to_rate, cls_budget, grad_accum_steps):
+    sizes = sorted(
+        cls_cache[k].shape[0] for k in cls_cache if k in idx_to_rate
+    )
     n_batches = 0
     current_total = 0
     started = False
-    for n in sorted_counts:
+    for n in sizes:
         if started and current_total + n > cls_budget:
             n_batches += 1
             current_total = n
@@ -687,13 +467,15 @@ def _estimate_steps_from_cache(cache_path, cls_budget, grad_accum_steps):
             started = True
     if started:
         n_batches += 1
-
     steps = max(1, n_batches // grad_accum_steps)
-    print(f"  From cache: {len(doc_cls)} docs -> {n_batches} batches, "
+    print(f"  From cache: {len(sizes)} docs -> {n_batches} batches, "
           f"~{steps} optimizer steps/epoch")
-    del cached, doc_cls
     return steps
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -706,101 +488,63 @@ def train(args):
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Check if all CLS caches exist (skip heavy loading if so)
-    # ------------------------------------------------------------------
-    all_cached, missing = _check_all_caches_exist(
-        args.output_dir, args.epochs, start_epoch=0)
-    if all_cached:
-        print("\nAll CLS caches found — skipping document/encoder loading.")
+    # -----------------------------------------------------------
+    # Documents + growth rates -> per-split {doc_idx -> rate}
+    # -----------------------------------------------------------
+    t_section = time.time()
+    print(f"\nLoading documents from {args.data}...")
+    documents = torch.load(args.data, map_location="cpu", weights_only=False)
+    print(f"  [TIMING] torch.load documents: {time.time() - t_section:.1f}s")
 
-    # ------------------------------------------------------------------
-    # Data (skip if all cached and no regularization needed)
-    # ------------------------------------------------------------------
-    train_data = None
-    val_data = None
-    need_documents = not all_cached or (args.regularization and args.train_aggregator)
+    with open(args.growth_rates, "r") as f:
+        growth_rates = json.load(f)
+    print(f"  {len(growth_rates)} companies with growth rates")
 
-    if need_documents:
-        t_section = time.time()
-        print(f"\nLoading documents from {args.data}...")
-        documents = torch.load(args.data, map_location="cpu", weights_only=False)
-        print(f"  [TIMING] torch.load documents: {time.time() - t_section:.1f}s")
+    # Must reproduce the exact same split used by cls_aggregator_training_pipeline
+    train_docs, val_docs = split_documents(documents, args.val_ratio)
+    del documents
+    print(f"  Split: {len(train_docs)} train docs, {len(val_docs)} val docs")
 
-        t_section = time.time()
-        print(f"Loading growth rates from {args.growth_rates}...")
-        with open(args.growth_rates, "r") as f:
-            growth_rates = json.load(f)
-        print(f"  {len(growth_rates)} companies with growth rates")
+    train_idx_to_rate = build_idx_to_rate(train_docs, growth_rates)
+    val_idx_to_rate = build_idx_to_rate(val_docs, growth_rates)
+    del growth_rates, train_docs, val_docs
+    print(f"  Rated: {len(train_idx_to_rate)} train, {len(val_idx_to_rate)} val")
 
-        print("\nMatching documents to growth rates...")
-        matched = match_documents_to_growth_rates(documents, growth_rates)
-        del documents, growth_rates
+    if not train_idx_to_rate:
+        print("ERROR: No training documents matched to growth rates.")
+        return
 
-        if not matched:
-            print("ERROR: No documents matched to growth rates.")
-            return
-
-        matched_docs = [doc for doc, _ in matched]
-        train_docs_raw, val_docs_raw = split_documents(matched_docs, args.val_ratio)
-        del matched_docs
-
-        rate_lookup = {id(doc): rate for doc, rate in matched}
-        del matched
-        train_data = [(doc, rate_lookup[id(doc)]) for doc in train_docs_raw]
-        val_data = [(doc, rate_lookup[id(doc)]) for doc in val_docs_raw]
-        del rate_lookup, train_docs_raw, val_docs_raw
-        print(f"  {len(train_data)} train, {len(val_data)} val documents")
-
-    # ------------------------------------------------------------------
-    # Token info + Encoder (skip if all cached)
-    # ------------------------------------------------------------------
-    tok_info = None
-    encoder_model = None
-    hidden_size = 768  # ModernBERT-base default
-
-    if need_documents:
-        tok_info = get_token_info(PRETRAINED_ID)
-        t_section = time.time()
-        print("\nLoading encoder...")
-        encoder_model, config = load_encoder(args.encoder_checkpoint, device)
-        hidden_size = config.hidden_size
-        print(f"  [TIMING] load encoder: {time.time() - t_section:.1f}s")
-
-    # ------------------------------------------------------------------
-    # GrowthPredictor (aggregator + head)
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------
+    # Predictor
+    # -----------------------------------------------------------
     t_section = time.time()
     print("\nBuilding GrowthPredictor...")
     predictor = build_predictor(
         aggregator_checkpoint=args.aggregator_checkpoint,
-        hidden_size=hidden_size,
+        hidden_size=args.hidden_size,
         train_aggregator=args.train_aggregator,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        ffn_mult=args.ffn_mult,
     )
     predictor = predictor.to(device)
-
     if args.compile:
         print("Compiling predictor with torch.compile...")
         predictor = torch.compile(predictor, dynamic=True)
     print(f"  [TIMING] build predictor: {time.time() - t_section:.1f}s")
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------
     # Optimizer + schedule
-    # ------------------------------------------------------------------
-    param_groups = []
-
+    # -----------------------------------------------------------
     unwrapped = predictor._orig_mod if hasattr(predictor, "_orig_mod") else predictor
-    head_params = list(unwrapped.head.parameters())
-    param_groups.append({
-        "params": head_params,
+    param_groups = [{
+        "params": list(unwrapped.head.parameters()),
         "lr": args.lr,
         "name": "head",
-    })
-
+    }]
     if args.train_aggregator:
-        agg_params = list(unwrapped.aggregator.parameters())
         param_groups.append({
-            "params": agg_params,
+            "params": list(unwrapped.aggregator.parameters()),
             "lr": args.aggregator_lr,
             "name": "aggregator",
         })
@@ -812,35 +556,29 @@ def train(args):
         weight_decay=args.weight_decay,
     )
 
-    # Estimate steps: from cache if available, else dry-run chunking
-    t_section = time.time()
+    # Estimate steps/epoch from the first cached file
     print("\nEstimating steps per epoch...")
-    first_cache = os.path.join(args.output_dir, "cls_cache_epoch0_train.pt")
-    if os.path.exists(first_cache):
-        steps_per_epoch = _estimate_steps_from_cache(
-            first_cache, args.cls_budget, args.grad_accum_steps)
-    else:
-        steps_per_epoch = estimate_steps_per_epoch(
-            train_data, tok_info, args.seed, args.cls_budget, args.grad_accum_steps)
-    print(f"  [TIMING] estimate steps: {time.time() - t_section:.1f}s")
+    first_cache = load_cls_cache(args.output_dir, "train", 0)
+    steps_per_epoch = estimate_steps_from_cache(
+        first_cache, train_idx_to_rate, args.cls_budget, args.grad_accum_steps,
+    )
+    del first_cache
+
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
-
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    # ------------------------------------------------------------------
-    # Resume from checkpoint
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------
+    # Resume
+    # -----------------------------------------------------------
     start_epoch = 0
     global_step = 0
-
     if args.resume_from:
         ckpt_file = os.path.join(args.resume_from, "full_model.pt")
         print(f"\nResuming from {ckpt_file}...")
         ckpt = torch.load(ckpt_file, map_location=device, weights_only=False)
         state_dict = {k.removeprefix("_orig_mod."): v
                       for k, v in ckpt["model_state_dict"].items()}
-        unwrapped = predictor._orig_mod if hasattr(predictor, "_orig_mod") else predictor
         unwrapped.load_state_dict(state_dict)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
@@ -848,32 +586,25 @@ def train(args):
         global_step = ckpt["global_step"]
         print(f"  Resumed at epoch={start_epoch}, global_step={global_step}")
 
-    # ------------------------------------------------------------------
-    # Regularization: pre-compute reference aggregator outputs
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------
+    # Regularization reference (uses epoch 0 train cache)
+    # -----------------------------------------------------------
     reference_outputs = None
     if args.regularization and args.train_aggregator:
         print("\nPre-computing reference aggregator outputs for regularization...")
-        ref_chunks = chunk_documents(
-            train_data, tok_info["newline_ids"],
-            tok_info["cls_id"], tok_info["sep_id"], args.seed,
-        )
-        ref_cls = compute_all_cls(encoder_model, ref_chunks, device,
-                                  tok_info["pad_id"], args.token_budget)
-        del ref_chunks
-        ref_doc_cls, ref_doc_rates = gather_doc_embeddings(ref_cls, train_data)
-        del ref_cls
-
-        unwrapped = predictor._orig_mod if hasattr(predictor, "_orig_mod") else predictor
+        ref_cache = load_cls_cache(args.output_dir, "train", 0)
+        ref_doc_cls, ref_doc_rates, _ = align_cache_with_rates(
+            ref_cache, train_idx_to_rate)
+        del ref_cache
         reference_outputs = compute_reference_outputs(
             unwrapped, ref_doc_cls, ref_doc_rates, args.cls_budget, device,
         )
         del ref_doc_cls, ref_doc_rates
         print(f"  Computed {len(reference_outputs)} reference embeddings")
 
-    # ------------------------------------------------------------------
-    # Print config
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------
+    # Config print
+    # -----------------------------------------------------------
     print(f"\nTraining: {args.epochs} epochs, ~{steps_per_epoch} steps/epoch, "
           f"~{total_steps} total steps")
     print(f"cls_budget: {args.cls_budget}, grad_accum: {args.grad_accum_steps}")
@@ -884,9 +615,9 @@ def train(args):
         print(f"Regularization: lambda={args.reg_lambda}")
     print()
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------
     # Training loop
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------
     best_val_loss = float("inf")
     best_val_mae = float("inf")
 
@@ -897,25 +628,22 @@ def train(args):
 
         t0 = time.time()
         train_metrics, global_step = run_epoch(
-            predictor, train_data, encoder_model, device, tok_info, args,
+            predictor, train_idx_to_rate, device, args, split="train",
             optimizer=optimizer, scheduler=scheduler,
             epoch=epoch, global_step=global_step,
             training=True, reference_outputs=reference_outputs,
         )
         t_train = time.time() - t0
-
         print(f"\n  Train: loss={train_metrics['loss']:.4f} "
               f"(mse={train_metrics['mse']:.4f}, "
               f"reg={train_metrics['reg']:.4f}, "
               f"mae={train_metrics['mae']:.4f}) [{t_train:.0f}s]")
 
-        # Validation (run if we have val_data OR if val cache exists)
         val_loss = None
-        val_cache = os.path.join(args.output_dir, f"cls_cache_epoch{epoch % 10}_val.pt")
-        if val_data or os.path.exists(val_cache):
+        if val_idx_to_rate:
             t0 = time.time()
             val_metrics, _ = run_epoch(
-                predictor, val_data, encoder_model, device, tok_info, args,
+                predictor, val_idx_to_rate, device, args, split="val",
                 epoch=epoch, training=False,
             )
             t_val = time.time() - t0
@@ -928,13 +656,10 @@ def train(args):
                 best_val_mae = val_metrics["mae"]
 
         if not args.no_save:
-            # End-of-epoch checkpoint (weights only)
             ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch + 1}")
             save_checkpoint(ckpt_path, predictor, optimizer, scheduler,
                             epoch + 1, global_step,
                             val_loss=val_loss, args=args, weights_only=True)
-
-            # Latest checkpoint (with optimizer state for resuming)
             latest_path = os.path.join(args.output_dir, "checkpoint_latest")
             save_checkpoint(latest_path, predictor, optimizer, scheduler,
                             epoch + 1, global_step,
@@ -947,32 +672,29 @@ def train(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Growth rate prediction training")
+        description="Growth rate prediction training (uses pre-computed CLS cache)")
 
     # Data
     parser.add_argument("--data", required=True,
-                        help="Path to documents.pt")
+                        help="Path to documents.pt (used only to align cache doc_idx with growth rates)")
     parser.add_argument("--growth-rates", required=True,
                         help="Path to growth_rates.json ({company_id: rate})")
     parser.add_argument("--val_ratio", type=float, default=0.1,
-                        help="Fraction of documents for validation")
+                        help="Must match the val_ratio used by cls_aggregator_training_pipeline")
 
-    # Checkpoints (input)
-    parser.add_argument("--encoder-checkpoint", required=True,
-                        help="Path to T5 checkpoint (full_model.pt)")
+    # Aggregator
     parser.add_argument("--aggregator-checkpoint", type=str, default=None,
-                        help="Path to aggregator checkpoint")
+                        help="Path to aggregator checkpoint (JEPA-trained)")
+    parser.add_argument("--hidden-size", type=int, default=768)
+    parser.add_argument("--num-heads", type=int, default=16)
+    parser.add_argument("--num-layers", type=int, default=6)
+    parser.add_argument("--ffn-mult", type=int, default=4)
 
     # Training
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--cls-budget", type=int, default=256,
-                        help="Max total CLS tokens per document batch")
-    parser.add_argument("--token-budget", type=int, default=8192,
-                        help="Token budget for CLS embedding batches")
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Learning rate for head")
-    parser.add_argument("--aggregator-lr", type=float, default=1e-6,
-                        help="Learning rate for aggregator (with --train-aggregator)")
+    parser.add_argument("--cls-budget", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--aggregator-lr", type=float, default=1e-6)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.06)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -980,26 +702,19 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
 
     # Aggregator training
-    parser.add_argument("--train-aggregator", action="store_true",
-                        help="Also train the aggregator (with separate LR)")
-    parser.add_argument("--regularization", action="store_true",
-                        help="Add MSE regularization on aggregator outputs")
-    parser.add_argument("--reg-lambda", type=float, default=0.1,
-                        help="Weight for regularization loss")
+    parser.add_argument("--train-aggregator", action="store_true")
+    parser.add_argument("--regularization", action="store_true")
+    parser.add_argument("--reg-lambda", type=float, default=0.1)
 
     # Output / resuming
-    parser.add_argument("--output-dir", default="checkpoints/growth_predictor")
-    parser.add_argument("--compile", action="store_true",
-                        help="Use torch.compile")
-    parser.add_argument("--resume-from", type=str, default=None,
-                        help="Path to checkpoint directory to resume from")
-    parser.add_argument("--checkpoint-minutes", type=int, default=30,
-                        help="Save periodic checkpoint every N minutes (0=disable)")
-    parser.add_argument("--no-save", action="store_true",
-                        help="Disable all checkpoint saving")
+    parser.add_argument("--output-dir", default="checkpoints/growth_predictor",
+                        help="Directory for checkpoints and local cache mirror")
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--resume-from", type=str, default=None)
+    parser.add_argument("--checkpoint-minutes", type=int, default=30)
+    parser.add_argument("--no-save", action="store_true")
 
     args = parser.parse_args()
-
     train(args)
 
 
