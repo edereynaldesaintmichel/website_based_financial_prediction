@@ -15,3 +15,9 @@ training_data
 t5_training_data
 checkpoints
 mlm_data
+
+doc_for_claude/deploy_aggregator_training.md
+cls_aggregator_training_pipeline/setup.sh
+final_training_pipeline/setup.sh
+t5_style_training_pipeline/setup.sh
+mlm_training_pipeline/setup.sh
