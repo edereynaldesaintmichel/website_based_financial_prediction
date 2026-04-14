@@ -665,16 +665,19 @@ def main():
                  f"{total_steps} total steps")
 
     start_epoch = 0
+    resume_best_val = float("inf")
     if args.resume:
-        latest = os.path.join(args.output_dir, "latest.pt")
-        if os.path.exists(latest):
-            ckpt = torch.load(latest, map_location="cpu", weights_only=False)
+        best = os.path.join(args.output_dir, "best.pt")
+        if os.path.exists(best):
+            ckpt = torch.load(best, map_location="cpu", weights_only=False)
             agg_unwrap = aggregator.module if isinstance(aggregator, DDP) else aggregator
             agg_unwrap.load_state_dict(ckpt["aggregator"])
             optimizer.load_state_dict(ckpt["optimizer"])
             scheduler.load_state_dict(ckpt["scheduler"])
             start_epoch = ckpt["epoch"] + 1
-            rprint(rank, f"Resumed from epoch {start_epoch}")
+            resume_best_val = ckpt.get("val_metrics", {}).get("loss", float("inf"))
+            rprint(rank, f"Resumed from epoch {start_epoch} "
+                         f"(best val loss so far: {resume_best_val:.4f})")
             del ckpt
 
     # ─── Precompute all CLS caches upfront (parallel across ranks) ─────
@@ -703,6 +706,7 @@ def main():
         torch.cuda.empty_cache()
         rprint(rank, "  T5 encoder freed; entering training loop.")
 
+    best_val_loss = resume_best_val
     try:
         for epoch in range(start_epoch, args.epochs):
             rprint(rank, f"\n{'='*70}\nEpoch {epoch + 1}/{args.epochs} "
@@ -738,10 +742,14 @@ def main():
                     "val_metrics": va,
                     "args": vars(args),
                 }
-                torch.save(ckpt, os.path.join(args.output_dir, "latest.pt"))
-                torch.save(ckpt, os.path.join(
-                    args.output_dir, f"epoch_{epoch + 1}.pt"))
-                rprint(rank, f"  Saved checkpoint: epoch_{epoch + 1}.pt")
+                if va["loss"] < best_val_loss:
+                    best_val_loss = va["loss"]
+                    torch.save(ckpt, os.path.join(args.output_dir, "best.pt"))
+                    rprint(rank, f"  New best (val loss={va['loss']:.4f}); "
+                                 f"saved best.pt")
+                else:
+                    rprint(rank, f"  Val loss {va['loss']:.4f} ≥ best "
+                                 f"{best_val_loss:.4f}; checkpoint not saved.")
 
             if world_size > 1:
                 dist.barrier()
