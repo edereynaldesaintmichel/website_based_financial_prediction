@@ -594,6 +594,9 @@ def main():
     parser.add_argument("--agg_heads", type=int, default=16)
     parser.add_argument("--agg_hidden", type=int, default=768)
     parser.add_argument("--agg_dropout", type=float, default=0.0)
+    parser.add_argument("--freeze_projection", action="store_true",
+                        help="Freeze the aggregator input projection W at identity "
+                             "(teacher = raw CLS). Useful as a λ=0 diagnostic.")
     parser.add_argument("--compile", action="store_true")
     args = parser.parse_args()
 
@@ -635,6 +638,9 @@ def main():
         num_layers=args.agg_layers,
         dropout=args.agg_dropout,
     ).to(device)
+    if args.freeze_projection:
+        aggregator.W.weight.requires_grad_(False)
+        rprint(rank, "  Projection W frozen at identity (teacher = raw CLS).")
     n_agg = sum(p.numel() for p in aggregator.parameters()) / 1e6
     rprint(rank, f"\nAggregator: {n_agg:.1f}M params")
 
