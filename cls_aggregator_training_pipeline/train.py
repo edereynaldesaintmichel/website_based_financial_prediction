@@ -386,51 +386,74 @@ def get_cosine_schedule(optimizer, warmup_steps, total_steps):
 
 # ─── Epoch ──────────────────────────────────────────────────────────────────
 
-def run_epoch(aggregator, model, documents, optimizer, scheduler,
-              device, epoch, args, tok_info, training=True,
+def cache_path_for(args, cache_idx, training):
+    tag = "train" if training else "val"
+    return os.path.join(
+        args.cls_cache_dir, f"cls_cache_{tag}_epoch{cache_idx}.pt")
+
+
+def ensure_cls_cache(cache_idx, training, model, documents, args, tok_info,
+                     device, rank, world_size):
+    """Compute (if missing) and persist the CLS cache for a given cache_idx.
+
+    Chunking is seeded by cache_idx (not epoch), so caches are deterministic
+    and can be reused when epochs cycle back to the same index.
+    """
+    cls_cache_path = cache_path_for(args, cache_idx, training)
+    if os.path.exists(cls_cache_path):
+        return cls_cache_path
+
+    rng_state = random.getstate()
+    random.seed(args.seed + cache_idx + (0 if training else 10000))
+    try:
+        all_enc_chunks, _ = chunk_documents(documents, tok_info, rank=rank)
+    finally:
+        random.setstate(rng_state)
+    all_enc_chunks.sort(key=lambda c: c["seq_length"])
+
+    assert model is not None, "encoder required to compute CLSs (no cache)"
+    doc_cls = compute_all_cls(
+        model, all_enc_chunks, device, args.encoder_token_budget,
+        tok_info["pad_id"], rank=rank, world_size=world_size,
+        cache_path=cls_cache_path)
+    del all_enc_chunks
+
+    if rank == 0:
+        torch.save(doc_cls, cls_cache_path)
+        rprint(rank, f"  Cached CLS embeddings to {cls_cache_path}")
+        upload_to_hf_async(
+            cls_cache_path,
+            f"aggregator/cls_cache/{os.path.basename(cls_cache_path)}",
+        )
+        for r in range(world_size):
+            shard = cls_cache_path + f".shard_{r}"
+            if os.path.exists(shard):
+                os.remove(shard)
+    if world_size > 1:
+        dist.barrier()
+    torch.cuda.empty_cache()
+    return cls_cache_path
+
+
+def run_epoch(aggregator, optimizer, scheduler,
+              device, epoch, args, training=True,
               rank=0, world_size=1):
     prefix = "Train" if training else "Val"
     aggregator.train() if training else aggregator.eval()
 
     rng_state = random.getstate()
-    random.seed(args.seed + epoch + (0 if training else 10000))
-    pad_id = tok_info["pad_id"]
+    random.seed(args.seed + epoch * 1337 + (0 if training else 10000))
 
-    # ─── Chunk ──────────────────────────────────────────────────────────
-    all_enc_chunks, doc_n_chunks = chunk_documents(documents, tok_info, rank=rank)
-
-    # ─── CLS embeddings (cached) ────────────────────────────────────────
-    cache_tag = "train" if training else "val"
-    cls_cache_path = os.path.join(
-        args.cls_cache_dir, f"cls_cache_{cache_tag}_epoch{epoch}.pt")
-    if os.path.exists(cls_cache_path):
-        rprint(rank, f"  Loading cached CLS embeddings: {cls_cache_path}")
-        doc_cls = torch.load(cls_cache_path, map_location="cpu", weights_only=False)
-        del all_enc_chunks
-    else:
-        assert model is not None, "encoder required to compute CLSs (no cache found)"
-        all_enc_chunks.sort(key=lambda c: c["seq_length"])
-        doc_cls = compute_all_cls(
-            model, all_enc_chunks, device, args.encoder_token_budget, pad_id,
-            rank=rank, world_size=world_size, cache_path=cls_cache_path)
-        del all_enc_chunks
-        if rank == 0:
-            torch.save(doc_cls, cls_cache_path)
-            rprint(rank, f"  Cached CLS embeddings to {cls_cache_path}")
-            upload_to_hf_async(
-                cls_cache_path,
-                f"aggregator/cls_cache/{os.path.basename(cls_cache_path)}",
-            )
-            for r in range(world_size):
-                shard = cls_cache_path + f".shard_{r}"
-                if os.path.exists(shard):
-                    os.remove(shard)
-        if world_size > 1:
-            dist.barrier()
-            if doc_cls is None:
-                doc_cls = torch.load(cls_cache_path, map_location="cpu",
-                                     weights_only=False)
-    torch.cuda.empty_cache()
+    # ─── Load CLS cache (cycles every num_cached_epochs) ────────────────
+    cache_idx = epoch % args.num_cached_epochs
+    cls_cache_path = cache_path_for(args, cache_idx, training)
+    assert os.path.exists(cls_cache_path), (
+        f"CLS cache missing: {cls_cache_path}. Precomputation should run "
+        "before training.")
+    rprint(rank, f"  Loading CLS cache (epoch {epoch} → idx {cache_idx}): "
+                 f"{cls_cache_path}")
+    doc_cls = torch.load(cls_cache_path, map_location="cpu", weights_only=False)
+    doc_n_chunks = {d: t.shape[0] for d, t in doc_cls.items()}
 
     # ─── Form doc batches, shard across ranks ───────────────────────────
     batches = form_doc_batches(doc_n_chunks, args.cls_token_budget)
@@ -539,6 +562,10 @@ def main():
                         help="Where to read/write CLS caches. "
                              "Defaults to {output_dir}/cls_cache.")
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--num_cached_epochs", type=int, default=5,
+                        help="Number of distinct CLS caches to precompute. "
+                             "Epoch e uses cache (e %% num_cached_epochs), so "
+                             "epochs cycle through the precomputed shards.")
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="AdamW LR for 1D params (norms, mask_token).")
     parser.add_argument("--muon_lr", type=float, default=0.02,
@@ -556,7 +583,7 @@ def main():
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--agg_layers", type=int, default=6)
+    parser.add_argument("--agg_layers", type=int, default=12)
     parser.add_argument("--agg_heads", type=int, default=16)
     parser.add_argument("--agg_hidden", type=int, default=768)
     parser.add_argument("--agg_dropout", type=float, default=0.0)
@@ -649,21 +676,40 @@ def main():
             rprint(rank, f"Resumed from epoch {start_epoch}")
             del ckpt
 
+    # ─── Precompute all CLS caches upfront (parallel across ranks) ─────
+    K = args.num_cached_epochs
+    rprint(rank, f"\nPrecomputing CLS caches (K={K}, train+val)...")
+    any_missing = False
+    for k in range(K):
+        for tr_flag in (True, False):
+            if not os.path.exists(cache_path_for(args, k, tr_flag)):
+                any_missing = True
+                break
+        if any_missing:
+            break
+    if any_missing:
+        ensure_encoder()
+    for k in range(K):
+        for tr_flag, docs in ((True, train_docs), (False, val_docs)):
+            tag = "train" if tr_flag else "val"
+            rprint(rank, f"  [cache {k+1}/{K}, {tag}]")
+            ensure_cls_cache(k, tr_flag, model, docs, args, tok_info,
+                             device, rank, world_size)
+    # Encoder no longer needed — free its memory for the rest of training.
+    if model is not None:
+        del model
+        model = None
+        torch.cuda.empty_cache()
+        rprint(rank, "  T5 encoder freed; entering training loop.")
+
     try:
         for epoch in range(start_epoch, args.epochs):
-            rprint(rank, f"\n{'='*70}\nEpoch {epoch + 1}/{args.epochs}\n{'='*70}")
-
-            # Load encoder lazily: only if the train cache is missing this epoch.
-            train_cache = os.path.join(
-                args.cls_cache_dir, f"cls_cache_train_epoch{epoch}.pt")
-            val_cache = os.path.join(
-                args.cls_cache_dir, f"cls_cache_val_epoch{epoch}.pt")
-            if not os.path.exists(train_cache) or not os.path.exists(val_cache):
-                ensure_encoder()
+            rprint(rank, f"\n{'='*70}\nEpoch {epoch + 1}/{args.epochs} "
+                         f"(cache idx {epoch % K})\n{'='*70}")
 
             t0 = time.time()
-            tr = run_epoch(aggregator, model, train_docs, optimizer, scheduler,
-                           device, epoch, args, tok_info, training=True,
+            tr = run_epoch(aggregator, optimizer, scheduler,
+                           device, epoch, args, training=True,
                            rank=rank, world_size=world_size)
             t_train = time.time() - t0
             rprint(rank, f"\n  Train: loss={tr['loss']:.4f} "
@@ -672,8 +718,8 @@ def main():
                          f"[{t_train:.0f}s]")
 
             t0 = time.time()
-            va = run_epoch(aggregator, model, val_docs, optimizer, scheduler,
-                           device, epoch, args, tok_info, training=False,
+            va = run_epoch(aggregator, optimizer, scheduler,
+                           device, epoch, args, training=False,
                            rank=rank, world_size=world_size)
             t_val = time.time() - t0
             rprint(rank, f"  Val:   loss={va['loss']:.4f} "
