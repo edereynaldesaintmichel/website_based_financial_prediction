@@ -577,6 +577,9 @@ def main():
                         help="AdamW LR for 1D params (norms, mask_token).")
     parser.add_argument("--muon_lr", type=float, default=0.02,
                         help="Muon LR for 2D hidden matrices.")
+    parser.add_argument("--proj_lr", type=float, default=None,
+                        help="Muon LR for the input projection W. Defaults to "
+                             "muon_lr / 100 to damp teacher drift.")
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -651,18 +654,30 @@ def main():
     if world_size > 1:
         aggregator = DDP(aggregator, device_ids=[rank])
 
-    # Muon for 2D hidden matrices (Wqkv, Wo, w_gate/up/down, W projection);
+    # Muon for 2D hidden matrices (Wqkv, Wo, w_gate/up/down). The input
+    # projection W gets its own Muon group at a much lower LR to damp
+    # teacher drift (W produces both target (sg) and input).
     # AdamW for the rest (LayerNorm params, mask_token).
+    agg_unwrap = aggregator.module if isinstance(aggregator, DDP) else aggregator
+    proj_param_ids = {id(agg_unwrap.W.weight)}
     muon_params = [p for p in aggregator.parameters()
-                   if p.requires_grad and p.ndim == 2]
+                   if p.requires_grad and p.ndim == 2
+                   and id(p) not in proj_param_ids]
+    proj_params = [p for p in aggregator.parameters()
+                   if p.requires_grad and id(p) in proj_param_ids]
     adamw_params = [p for p in aggregator.parameters()
                     if p.requires_grad and p.ndim != 2]
+    proj_lr = args.proj_lr if args.proj_lr is not None else args.muon_lr / 100
     rprint(rank,
            f"Optimizer: Muon ({sum(p.numel() for p in muon_params)/1e6:.1f}M params) "
+           f"+ Muon-proj ({sum(p.numel() for p in proj_params)/1e6:.2f}M params @ lr={proj_lr:.2e}) "
            f"+ AdamW ({sum(p.numel() for p in adamw_params)/1e6:.2f}M params)")
-    optimizer = CombinedOptimizer([
-        Muon(muon_params, lr=args.muon_lr, momentum=0.95,
-             weight_decay=args.weight_decay),
+    muon_optims = [Muon(muon_params, lr=args.muon_lr, momentum=0.95,
+                        weight_decay=args.weight_decay)]
+    if proj_params:
+        muon_optims.append(Muon(proj_params, lr=proj_lr, momentum=0.95,
+                                weight_decay=args.weight_decay))
+    optimizer = CombinedOptimizer(muon_optims + [
         torch.optim.AdamW(adamw_params, lr=args.lr,
                           weight_decay=args.weight_decay),
     ])
