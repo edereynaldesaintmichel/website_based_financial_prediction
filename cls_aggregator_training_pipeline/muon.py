@@ -72,19 +72,33 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-class CombinedOptimizer:
-    """Thin wrapper that multiplexes step/zero_grad/state_dict over several
-    optimizers, while exposing their concatenated param_groups so that a
-    single LambdaLR can schedule all of them uniformly.
+class CombinedOptimizer(torch.optim.Optimizer):
+    """Multiplexes step/zero_grad/state_dict over several optimizers.
+
+    Inherits from torch.optim.Optimizer purely to satisfy LambdaLR's isinstance
+    check; real state lives in the wrapped optimizers, so we bypass
+    Optimizer.__init__.
     """
 
     def __init__(self, optimizers):
         self.optimizers = list(optimizers)
+        self.defaults = {}
 
     @property
     def param_groups(self):
         # Property (not static list) so LambdaLR always sees live groups.
         return [g for o in self.optimizers for g in o.param_groups]
+
+    @param_groups.setter
+    def param_groups(self, _value):
+        pass
+
+    @property
+    def state(self):
+        merged = {}
+        for o in self.optimizers:
+            merged.update(o.state)
+        return merged
 
     def step(self, closure=None):
         loss = closure() if closure is not None else None
