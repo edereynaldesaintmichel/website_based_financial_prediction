@@ -465,11 +465,10 @@ def run_epoch(aggregator, optimizer, scheduler,
 
             mse = F.mse_loss(pool_a, pool_b)
 
-            pooled = torch.cat([pool_a, pool_b], dim=0)
-            if pooled.shape[0] >= MIN_SIGREG_SAMPLES:
-                reg = sigreg_loss(pooled)
+            if pool_a.shape[0] >= MIN_SIGREG_SAMPLES:
+                reg = 0.5 * (sigreg_loss(pool_a) + sigreg_loss(pool_b))
             else:
-                reg = pooled.new_zeros(())
+                reg = pool_a.new_zeros(())
             loss = mse + args.sigreg_lambda * reg
 
             if training:
