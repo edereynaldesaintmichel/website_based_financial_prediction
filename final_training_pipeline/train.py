@@ -769,7 +769,7 @@ def main():
                         help="Path to aggregator checkpoint (JEPA-trained)")
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--num-heads", type=int, default=16)
-    parser.add_argument("--num-layers", type=int, default=6)
+    parser.add_argument("--num-layers", type=int, default=12)
     parser.add_argument("--ffn-mult", type=int, default=4)
     parser.add_argument("--aggregator-dropout", type=float, default=0.3)
 
