@@ -1,19 +1,18 @@
 """
-Latent-MLM training for the CLS aggregator.
+Two-view consistency training for the CLS aggregator.
 
 Pipeline:
 1. Chunk every document with boundary-aware random chunk sizes.
 2. Encode every chunk with the frozen T5 encoder to get per-chunk CLS embeddings.
    Results are cached on disk per epoch (expensive, done once per seed/epoch).
-3. Per batch of documents:
-      target = sg(W(cls))                          # frozen teacher in latent
-      x_in   = target, with 20% of positions replaced by the learnable mask
-               token (per-doc, min 2 masked positions, at least 1 visible)
-      pred   = aggregator(x_in)                    # (B, N, D)
-      L_mse  = MSE(pred[masked], target[masked])
-      L_reg  = mean_k SIGReg({ pred[i, k-th masked pos of doc i] : i })
-      loss   = L_mse + λ · L_reg
-   W is trained only through the aggregator's input path (unmasked positions).
+3. Per batch of documents, draw two independent masks (view A and view B) and
+   run the aggregator twice (different mask positions and different dropout):
+      out_a = aggregator(cls, mask_a)              # (B, N, D)
+      out_b = aggregator(cls, mask_b)              # (B, N, D)
+      pool_a, pool_b = masked_mean(out_{a,b}, valid)       # (B, D)
+      L_mse = MSE(pool_a, pool_b)                          # view consistency
+      L_reg = SIGReg(concat[pool_a, pool_b])               # anti-collapse
+      loss  = L_mse + λ · L_reg
 
 Inference: mean-pool `aggregator(cls_tokens)` over valid positions.
 
@@ -58,7 +57,7 @@ HF_REPO_TYPE = "dataset"
 CHUNK_MIN = 128
 CHUNK_MAX = 1024
 MIN_DOC_CHUNKS = 3          # need at least one masked + one visible, with headroom
-MIN_VIEW_SIZE = 32          # SIGReg views with fewer samples are skipped
+MIN_SIGREG_SAMPLES = 32     # SIGReg skipped if pooled-embedding batch is tiny
 
 
 # ─── Distributed helpers ────────────────────────────────────────────────────
@@ -339,43 +338,10 @@ def sigreg_loss(x, sketch_dim=64):
     return loss.mean()
 
 
-def per_slot_view_sigreg(pred, is_masked):
-    """Average SIGReg across per-slot views of masked predictions.
-
-    For each doc, randomly permute its masked positions; the k-th view contains
-    the k-th masked position from every doc that has ≥ k+1 masked positions.
-    Views with < MIN_VIEW_SIZE samples are skipped.
-    """
-    B, N, D = pred.shape
-    device = pred.device
-
-    # For each row, sort indices by a random key so masked positions come first
-    # in a shuffled order. sort is stable but we use a random tiebreak.
-    rand_key = torch.rand(B, N, device=device)
-    # Masked positions get a large score so they sort to the front.
-    score = is_masked.float() + rand_key * 0.5                    # masked ∈ [1, 1.5], unmasked ∈ [0, 0.5]
-    order = score.argsort(dim=1, descending=True)                 # (B, N)
-    # Gather predictions in that order: (B, N, D).
-    ordered_pred = pred.gather(1, order.unsqueeze(-1).expand(-1, -1, D))
-    # Row k of ordered_pred[:, k, :] is the k-th masked pred (or junk if row has fewer masks).
-    n_mask_per_row = is_masked.sum(dim=1)                         # (B,)
-    max_m = int(n_mask_per_row.max().item()) if B > 0 else 0
-
-    total = pred.new_zeros(())
-    n_views = 0
-    total_points = 0
-    for k in range(max_m):
-        keep = n_mask_per_row > k                                 # (B,)
-        n_keep = int(keep.sum().item())
-        if n_keep < MIN_VIEW_SIZE:
-            continue
-        view = ordered_pred[keep, k, :]                           # (n, D)
-        total = total + sigreg_loss(view)
-        n_views += 1
-        total_points += n_keep
-    if n_views == 0:
-        return pred.new_zeros(()), 0, 0.0
-    return total / n_views, n_views, total_points / n_views
+def masked_mean(x, valid):
+    """Mean-pool (B, N, D) along N over valid positions → (B, D)."""
+    v = valid.unsqueeze(-1).to(x.dtype)
+    return (x * v).sum(dim=1) / v.sum(dim=1).clamp_min(1.0)
 
 
 # ─── LR schedule ────────────────────────────────────────────────────────────
@@ -467,7 +433,7 @@ def run_epoch(aggregator, optimizer, scheduler,
     batches = batches[rank::world_size]
 
     # ─── Iterate ────────────────────────────────────────────────────────
-    totals = dict(loss=0.0, mse=0.0, reg=0.0, n=0, n_views=0, avg_pts=0.0)
+    totals = dict(loss=0.0, mse=0.0, reg=0.0, n=0)
     recent_mse = deque(maxlen=100)
     recent_reg = deque(maxlen=100)
 
@@ -485,26 +451,25 @@ def run_epoch(aggregator, optimizer, scheduler,
             padded = padded.to(device, non_blocking=True)
             valid = valid.to(device, non_blocking=True)
 
-            is_masked = sample_mask(
+            mask_a = sample_mask(
+                valid, mask_prob=args.mask_prob, min_mask=args.min_mask)
+            mask_b = sample_mask(
                 valid, mask_prob=args.mask_prob, min_mask=args.min_mask)
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                pred, target = aggregator(padded, valid, is_masked)
+                out_a = aggregator(padded, valid, mask_a)
+                out_b = aggregator(padded, valid, mask_b)
 
-            pred_f = pred.float()
-            target_f = target.float()
+            pool_a = masked_mean(out_a.float(), valid)
+            pool_b = masked_mean(out_b.float(), valid)
 
-            # MSE on masked positions only.
-            masked_flat = is_masked.view(-1)
-            if masked_flat.any():
-                mse = F.mse_loss(
-                    pred_f.reshape(-1, pred_f.shape[-1])[masked_flat],
-                    target_f.reshape(-1, target_f.shape[-1])[masked_flat],
-                )
+            mse = F.mse_loss(pool_a, pool_b)
+
+            pooled = torch.cat([pool_a, pool_b], dim=0)
+            if pooled.shape[0] >= MIN_SIGREG_SAMPLES:
+                reg = sigreg_loss(pooled)
             else:
-                mse = pred_f.new_zeros(())
-
-            reg, n_views, avg_pts = per_slot_view_sigreg(pred_f, is_masked)
+                reg = pooled.new_zeros(())
             loss = mse + args.sigreg_lambda * reg
 
             if training:
@@ -521,8 +486,6 @@ def run_epoch(aggregator, optimizer, scheduler,
             totals["mse"] += mse.item()
             totals["reg"] += reg.item() if torch.is_tensor(reg) else float(reg)
             totals["n"] += 1
-            totals["n_views"] += n_views
-            totals["avg_pts"] += avg_pts
             recent_mse.append(mse.item())
             recent_reg.append(reg.item() if torch.is_tensor(reg) else float(reg))
 
@@ -551,8 +514,6 @@ def run_epoch(aggregator, optimizer, scheduler,
         "loss": totals["loss"] / n,
         "mse": totals["mse"] / n,
         "reg": totals["reg"] / n,
-        "avg_views_per_batch": totals["n_views"] / n,
-        "avg_points_per_view": totals["avg_pts"] / n,
         "n_batches": totals["n"],
     }
 
@@ -577,9 +538,6 @@ def main():
                         help="AdamW LR for 1D params (norms, mask_token).")
     parser.add_argument("--muon_lr", type=float, default=0.02,
                         help="Muon LR for 2D hidden matrices.")
-    parser.add_argument("--proj_lr", type=float, default=None,
-                        help="Muon LR for the input projection W. Defaults to "
-                             "muon_lr / 100 to damp teacher drift.")
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -596,10 +554,7 @@ def main():
     parser.add_argument("--agg_layers", type=int, default=12)
     parser.add_argument("--agg_heads", type=int, default=16)
     parser.add_argument("--agg_hidden", type=int, default=768)
-    parser.add_argument("--agg_dropout", type=float, default=0.0)
-    parser.add_argument("--freeze_projection", action="store_true",
-                        help="Freeze the aggregator input projection W at identity "
-                             "(teacher = raw CLS). Useful as a λ=0 diagnostic.")
+    parser.add_argument("--agg_dropout", type=float, default=0.2)
     parser.add_argument("--compile", action="store_true")
     args = parser.parse_args()
 
@@ -641,9 +596,6 @@ def main():
         num_layers=args.agg_layers,
         dropout=args.agg_dropout,
     ).to(device)
-    if args.freeze_projection:
-        aggregator.W.weight.requires_grad_(False)
-        rprint(rank, "  Projection W frozen at identity (teacher = raw CLS).")
     n_agg = sum(p.numel() for p in aggregator.parameters()) / 1e6
     rprint(rank, f"\nAggregator: {n_agg:.1f}M params")
 
@@ -654,30 +606,18 @@ def main():
     if world_size > 1:
         aggregator = DDP(aggregator, device_ids=[rank])
 
-    # Muon for 2D hidden matrices (Wqkv, Wo, w_gate/up/down). The input
-    # projection W gets its own Muon group at a much lower LR to damp
-    # teacher drift (W produces both target (sg) and input).
+    # Muon for 2D hidden matrices (Wqkv, Wo, w_gate/up/down).
     # AdamW for the rest (LayerNorm params, mask_token).
-    agg_unwrap = aggregator.module if isinstance(aggregator, DDP) else aggregator
-    proj_param_ids = {id(agg_unwrap.W.weight)}
     muon_params = [p for p in aggregator.parameters()
-                   if p.requires_grad and p.ndim == 2
-                   and id(p) not in proj_param_ids]
-    proj_params = [p for p in aggregator.parameters()
-                   if p.requires_grad and id(p) in proj_param_ids]
+                   if p.requires_grad and p.ndim == 2]
     adamw_params = [p for p in aggregator.parameters()
                     if p.requires_grad and p.ndim != 2]
-    proj_lr = args.proj_lr if args.proj_lr is not None else args.muon_lr / 100
     rprint(rank,
            f"Optimizer: Muon ({sum(p.numel() for p in muon_params)/1e6:.1f}M params) "
-           f"+ Muon-proj ({sum(p.numel() for p in proj_params)/1e6:.2f}M params @ lr={proj_lr:.2e}) "
            f"+ AdamW ({sum(p.numel() for p in adamw_params)/1e6:.2f}M params)")
-    muon_optims = [Muon(muon_params, lr=args.muon_lr, momentum=0.95,
-                        weight_decay=args.weight_decay)]
-    if proj_params:
-        muon_optims.append(Muon(proj_params, lr=proj_lr, momentum=0.95,
-                                weight_decay=args.weight_decay))
-    optimizer = CombinedOptimizer(muon_optims + [
+    optimizer = CombinedOptimizer([
+        Muon(muon_params, lr=args.muon_lr, momentum=0.95,
+             weight_decay=args.weight_decay),
         torch.optim.AdamW(adamw_params, lr=args.lr,
                           weight_decay=args.weight_decay),
     ])
@@ -746,8 +686,6 @@ def main():
             t_train = time.time() - t0
             rprint(rank, f"\n  Train: loss={tr['loss']:.4f} "
                          f"mse={tr['mse']:.4f} reg={tr['reg']:.4f} "
-                         f"views/batch={tr['avg_views_per_batch']:.1f} "
-                         f"pts/view={tr['avg_points_per_view']:.1f} "
                          f"[{t_train:.0f}s]")
 
             t0 = time.time()
@@ -757,7 +695,6 @@ def main():
             t_val = time.time() - t0
             rprint(rank, f"  Val:   loss={va['loss']:.4f} "
                          f"mse={va['mse']:.4f} reg={va['reg']:.4f} "
-                         f"pts/view={va['avg_points_per_view']:.1f} "
                          f"[{t_val:.0f}s]")
 
             if rank == 0:
