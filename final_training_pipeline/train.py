@@ -74,7 +74,7 @@ def extract_company_id(source_file):
 # ---------------------------------------------------------------------------
 
 def build_predictor(aggregator_checkpoint, hidden_size, train_aggregator,
-                    num_heads=16, num_layers=6, ffn_mult=4, dropout=0.2):
+                    num_heads=16, num_layers=6, ffn_mult=4, dropout=0.3):
     """Build GrowthPredictor and load aggregator weights."""
     aggregator = CLSAggregator(
         hidden_size=hidden_size,
@@ -607,6 +607,7 @@ def train(args):
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         ffn_mult=args.ffn_mult,
+        dropout=args.aggregator_dropout,
     )
     predictor = predictor.to(device)
     if args.compile:
@@ -770,6 +771,7 @@ def main():
     parser.add_argument("--num-heads", type=int, default=16)
     parser.add_argument("--num-layers", type=int, default=6)
     parser.add_argument("--ffn-mult", type=int, default=4)
+    parser.add_argument("--aggregator-dropout", type=float, default=0.3)
 
     # Training
     parser.add_argument("--epochs", type=int, default=10)
