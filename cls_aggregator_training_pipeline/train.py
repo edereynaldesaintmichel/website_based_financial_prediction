@@ -622,31 +622,6 @@ def main():
                           weight_decay=args.weight_decay),
     ])
 
-    # Rough step estimate for cosine schedule.
-    avg_chunks = max(sum((len(d["input_ids"]) - 2) / ((CHUNK_MIN + CHUNK_MAX) / 2)
-                         for d in train_docs), 1)
-    est_batches = max(avg_chunks / args.cls_token_budget * 1.5, 1)
-    total_steps = int(est_batches * args.epochs / args.grad_accum_steps) + args.warmup_steps
-    scheduler = get_cosine_schedule(optimizer, args.warmup_steps, total_steps)
-    rprint(rank, f"Estimated ~{est_batches:.0f} batches/epoch, "
-                 f"{total_steps} total steps")
-
-    start_epoch = 0
-    resume_best_val = float("inf")
-    if args.resume:
-        best = os.path.join(args.output_dir, "best.pt")
-        if os.path.exists(best):
-            ckpt = torch.load(best, map_location="cpu", weights_only=False)
-            agg_unwrap = aggregator.module if isinstance(aggregator, DDP) else aggregator
-            agg_unwrap.load_state_dict(ckpt["aggregator"])
-            optimizer.load_state_dict(ckpt["optimizer"])
-            scheduler.load_state_dict(ckpt["scheduler"])
-            start_epoch = ckpt["epoch"] + 1
-            resume_best_val = ckpt.get("val_metrics", {}).get("loss", float("inf"))
-            rprint(rank, f"Resumed from epoch {start_epoch} "
-                         f"(best val loss so far: {resume_best_val:.4f})")
-            del ckpt
-
     # ─── Precompute all CLS caches upfront (parallel across ranks) ─────
     K = args.num_cached_epochs
     rprint(rank, f"\nPrecomputing CLS caches (K={K}, train+val)...")
@@ -672,6 +647,43 @@ def main():
         model = None
         torch.cuda.empty_cache()
         rprint(rank, "  T5 encoder freed; entering training loop.")
+
+    # ─── Exact step count from precomputed caches ───────────────────────
+    # form_doc_batches is deterministic in length given doc_n_chunks and
+    # budget (only the post-sort shuffle is random), so we can count the
+    # true number of optimizer steps per epoch.
+    per_cache_batches = []
+    for k in range(K):
+        cache = torch.load(cache_path_for(args, k, True),
+                           map_location="cpu", weights_only=False)
+        dn = {d: t.shape[0] for d, t in cache.items()}
+        n_b = len(form_doc_batches(dn, args.cls_token_budget))
+        # DDP shards batches[rank::world_size]; rank 0 gets ceil.
+        n_b_local = (n_b + world_size - 1) // world_size
+        per_cache_batches.append(n_b_local)
+        del cache
+    total_batches = sum(per_cache_batches[e % K] for e in range(args.epochs))
+    total_steps = math.ceil(total_batches / args.grad_accum_steps)
+    warmup_steps = min(args.warmup_steps, max(1, total_steps // 10))
+    scheduler = get_cosine_schedule(optimizer, warmup_steps, total_steps)
+    rprint(rank, f"Batches/epoch (per cache): {per_cache_batches}, "
+                 f"{total_steps} total steps, {warmup_steps} warmup")
+
+    start_epoch = 0
+    resume_best_val = float("inf")
+    if args.resume:
+        best = os.path.join(args.output_dir, "best.pt")
+        if os.path.exists(best):
+            ckpt = torch.load(best, map_location="cpu", weights_only=False)
+            agg_unwrap = aggregator.module if isinstance(aggregator, DDP) else aggregator
+            agg_unwrap.load_state_dict(ckpt["aggregator"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            start_epoch = ckpt["epoch"] + 1
+            resume_best_val = ckpt.get("val_metrics", {}).get("loss", float("inf"))
+            rprint(rank, f"Resumed from epoch {start_epoch} "
+                         f"(best val loss so far: {resume_best_val:.4f})")
+            del ckpt
 
     best_val_loss = resume_best_val
     try:
