@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from config import (
     EDGAR_BASE, INDEX_DIR, RAW_HTML_DIR, YEAR,
+    index_csv_for_year, raw_html_dir_for_year,
     sec_headers, REQUEST_DELAY,
 )
 
@@ -80,6 +81,12 @@ def find_primary_html(filing_index_url: str, headers: dict) -> str | None:
             continue
 
         href = link.get("href", "")
+        # Since 2021, EDGAR wraps the primary doc in the iXBRL viewer:
+        #   href="/ix?doc=/Archives/edgar/data/.../filing.htm"
+        # Fetching that returns the 6356-byte viewer shell, not the filing.
+        # Strip the viewer prefix to get the real document path.
+        if href.startswith("/ix?doc="):
+            href = href[len("/ix?doc="):]
         if not re.search(r"\.html?$", href, re.I):
             continue
 
@@ -115,7 +122,11 @@ def download_html(url: str, dest_path: str, headers: dict) -> bool:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description=f"Download SEC 10-K HTML documents for {YEAR}"
+        description="Download SEC 10-K HTML documents for a given filing year."
+    )
+    parser.add_argument(
+        "--year", type=int, default=None,
+        help=f"Filing year to download (default: {YEAR})",
     )
     parser.add_argument(
         "--max", type=int, default=0,
@@ -132,7 +143,12 @@ def main():
     args = parse_args()
     headers = sec_headers()
 
-    index_path = INDEX_DIR / f"10k_filings_{YEAR}.csv"
+    if args.year:
+        index_path = index_csv_for_year(args.year)
+        raw_dir = raw_html_dir_for_year(args.year)
+    else:
+        index_path = INDEX_DIR / f"10k_filings_{YEAR}.csv"
+        raw_dir = RAW_HTML_DIR
     if not index_path.exists():
         print(f"Error: index file not found: {index_path}")
         print("Run fetch_10k_index.py first.")
@@ -141,7 +157,7 @@ def main():
     filings = load_index(str(index_path))
     print(f"Loaded {len(filings):,} 10-K filings from index")
 
-    os.makedirs(RAW_HTML_DIR, exist_ok=True)
+    os.makedirs(raw_dir, exist_ok=True)
 
     if args.max > 0:
         filings = filings[:args.max]
@@ -155,7 +171,7 @@ def main():
         cik = filing["cik"]
         date_filed = filing["date_filed"]
         safe_name = f"{cik}_{date_filed}.html"
-        dest_path = os.path.join(str(RAW_HTML_DIR), safe_name)
+        dest_path = os.path.join(str(raw_dir), safe_name)
 
         # Resume support
         if args.resume and os.path.exists(dest_path):
@@ -186,7 +202,7 @@ def main():
         print(f"Skipped (already exists): {skipped:,}")
     if errors:
         print(f"Errors: {errors:,}")
-    print(f"Output: {RAW_HTML_DIR}")
+    print(f"Output: {raw_dir}")
     print(f"{'=' * 60}")
 
 

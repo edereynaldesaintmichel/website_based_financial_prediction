@@ -46,20 +46,24 @@ except ImportError:
 # Configuration
 # ============================================================================
 
-ZIP_URLS = [
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-January2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-February2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-March2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-April2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-May2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-June2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-July2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-August2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-September2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-October2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-November2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-December2025.zip",
+DEFAULT_YEAR = 2025
+
+MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
 ]
+
+
+def zip_urls_for_year(year: int) -> list[str]:
+    """Companies House monthly iXBRL archive URLs for a given calendar year."""
+    return [
+        f"https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{month}{year}.zip"
+        for month in MONTHS
+    ]
+
+
+# Default URL list (2025) kept for backward compatibility.
+ZIP_URLS = zip_urls_for_year(DEFAULT_YEAR)
 
 DEFAULT_OUTPUT_DIR = "/Users/eloireynal/Documents/My projects/website_based_financial_prediction/companies_house_pipeline/xbrl_parsing_pipeline/output"
 DEFAULT_WORKERS = max(1, (os.cpu_count() or 4) - 1)
@@ -247,9 +251,12 @@ def process_single_file(
     reference_ids: set[str],
     employee_registry: dict,
     registry_lock: threading.Lock,
+    html_output_dir: str | None = None,
 ) -> tuple[int, int, int, int]:
     """
     Parse one file and save JSON if its company ID is in the reference set.
+    When html_output_dir is provided, also copy the matched raw HTML there
+    so it can later be OCR'd for training data.
 
     Returns:
         (processed, errors, matched, skipped_not_in_ref)
@@ -267,6 +274,11 @@ def process_single_file(
     json_dest = os.path.join(json_output_dir, json_filename)
     with open(json_dest, "w", encoding="utf-8") as fh:
         json.dump(parsed_data, fh, indent=2, default=str, ensure_ascii=False)
+
+    if html_output_dir is not None:
+        html_dest = os.path.join(html_output_dir, html_file.name)
+        if not os.path.exists(html_dest):
+            shutil.copy2(str(html_file), html_dest)
 
     if employee_count is not None:
         with registry_lock:
@@ -304,6 +316,7 @@ def process_zip(
     registry_lock: threading.Lock,
     stats: RunStats,
     logger: logging.Logger,
+    html_output_dir: str | None = None,
 ):
     zip_name = os.path.basename(zip_url)
     zip_path = os.path.join(work_dir, zip_name)
@@ -342,6 +355,7 @@ def process_zip(
                 reference_ids,
                 employee_registry,
                 registry_lock,
+                html_output_dir,
             ): html_file
             for html_file in html_files
         }
@@ -428,6 +442,19 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Skip the first N-1 months and start from month N (1=January)",
     )
+    parser.add_argument(
+        "--year",
+        type=int,
+        default=DEFAULT_YEAR,
+        help=f"Calendar year of monthly Companies House archives (default: {DEFAULT_YEAR})",
+    )
+    parser.add_argument(
+        "--keep-html-dir",
+        type=str,
+        default=None,
+        help="If set, copy matched raw HTML filings to this directory so they "
+             "can later be OCR'd. Disabled by default.",
+    )
     return parser.parse_args()
 
 
@@ -435,27 +462,46 @@ def main():
     args = parse_args()
 
     output_dir = os.path.abspath(args.output_dir)
-    json_output_dir = os.path.join(output_dir, "json_reference_companies")
+    json_subdir = (
+        "json_reference_companies"
+        if args.year == DEFAULT_YEAR
+        else f"json_reference_companies_{args.year}"
+    )
+    json_output_dir = os.path.join(output_dir, json_subdir)
     work_dir = os.path.join(output_dir, "_work")
-    ranking_file = os.path.join(output_dir, "sorted_by_employees.json")
+    ranking_name = (
+        "sorted_by_employees.json"
+        if args.year == DEFAULT_YEAR
+        else f"sorted_by_employees_{args.year}.json"
+    )
+    ranking_file = os.path.join(output_dir, ranking_name)
 
     os.makedirs(json_output_dir, exist_ok=True)
     os.makedirs(work_dir, exist_ok=True)
+
+    html_output_dir = args.keep_html_dir
+    if html_output_dir:
+        html_output_dir = os.path.abspath(html_output_dir)
+        os.makedirs(html_output_dir, exist_ok=True)
 
     logger = setup_logging(output_dir)
 
     # Load reference company IDs
     reference_ids = load_reference_company_ids(args.reference_dir, logger)
 
+    zip_urls = zip_urls_for_year(args.year)
+
     # Banner
     logger.info("=" * 65)
-    logger.info("🏢  UK Companies House iXBRL Parser — No Survivorship Bias")
+    logger.info("🏢  UK Companies House iXBRL Parser — No Survivorship Bias (%d)", args.year)
     logger.info("📋  Reference companies : %d unique IDs", len(reference_ids))
     logger.info("⚙️   Worker threads      : %d", args.workers)
     logger.info("📂  Output directory    : %s", output_dir)
+    if html_output_dir:
+        logger.info("📄  Keep-HTML directory : %s", html_output_dir)
     logger.info("=" * 65)
 
-    urls_to_process = ZIP_URLS[args.start_from - 1:]
+    urls_to_process = zip_urls[args.start_from - 1:]
     if args.start_from > 1:
         logger.info("⏩  Skipping first %d month(s), starting from month %d", args.start_from - 1, args.start_from)
 
@@ -467,7 +513,7 @@ def main():
 
     for i, zip_url in enumerate(urls_to_process, start=args.start_from):
         logger.info("")
-        logger.info("── Archive %d / %d ─────────────────────────────────────────", i, len(ZIP_URLS))
+        logger.info("── Archive %d / %d ─────────────────────────────────────────", i, len(zip_urls))
         try:
             process_zip(
                 zip_url=zip_url,
@@ -479,6 +525,7 @@ def main():
                 registry_lock=registry_lock,
                 stats=stats,
                 logger=logger,
+                html_output_dir=html_output_dir,
             )
         except Exception as exc:
             logger.exception("❌ Unexpected error processing %s: %s", zip_url, exc)
@@ -514,7 +561,12 @@ def main():
     logger.info("❌  Reference companies NOT found           : %d", len(missing_ids))
 
     # Save missing companies list
-    missing_file = os.path.join(output_dir, "missing_companies.json")
+    missing_name = (
+        "missing_companies.json"
+        if args.year == DEFAULT_YEAR
+        else f"missing_companies_{args.year}.json"
+    )
+    missing_file = os.path.join(output_dir, missing_name)
     with open(missing_file, "w", encoding="utf-8") as fh:
         json.dump(sorted(missing_ids), fh, indent=2)
     logger.info("📝  Missing company IDs saved to: %s", missing_file)

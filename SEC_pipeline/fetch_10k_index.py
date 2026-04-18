@@ -12,6 +12,7 @@ Usage:
     python fetch_10k_index.py
 """
 
+import argparse
 import csv
 import os
 import re
@@ -21,16 +22,31 @@ import requests
 from tqdm import tqdm
 
 from config import (
-    FULL_INDEX_URLS, INDEX_DIR, YEAR, sec_headers, REQUEST_DELAY,
+    EDGAR_FULL_INDEX, FULL_INDEX_URLS, INDEX_DIR, QUARTERS, YEAR,
+    index_csv_for_year, sec_headers, REQUEST_DELAY,
+)
+
+
+#   company name  form_type  cik         date         filename
+# e.g. "10x Genomics, Inc.   10-K   1770787   2021-02-26   edgar/data/..."
+# Anchored on: filename always starts with "edgar/", date is YYYY-MM-DD,
+# CIK is a run of digits, form_type is whatever is between company name and CIK.
+ROW_RE = re.compile(
+    r"^(?P<company>.+?)\s{2,}"         # company name, greedy-lazy, followed by 2+ spaces
+    r"(?P<form>\S+(?:\s\S+)*?)\s{2,}"  # form type (may contain single spaces, e.g. "NT 10-K")
+    r"(?P<cik>\d+)\s+"                   # CIK
+    r"(?P<date>\d{4}-\d{2}-\d{2})\s+"  # filing date
+    r"(?P<filename>edgar/\S+)\s*$"     # EDGAR path
 )
 
 
 def fetch_company_idx(url: str, headers: dict) -> list[dict]:
     """Download and parse a single company.idx file from EDGAR.
 
-    The format is fixed-width with a header section (lines starting with
-    dashes or field names) followed by data rows:
-        Company Name | Form Type | CIK | Date Filed | Filename
+    EDGAR's full-index is nominally fixed-width but column positions drift
+    across quarters when any field exceeds its default width. We parse each
+    data row with a regex anchored on the date and ``edgar/...`` filename,
+    which are the only two fields with known shapes.
     """
     resp = requests.get(url, headers=headers, timeout=60)
     resp.raise_for_status()
@@ -48,20 +64,15 @@ def fetch_company_idx(url: str, headers: dict) -> list[dict]:
     for line in lines[data_start:]:
         if not line.strip():
             continue
-        # Fixed-width columns: Company Name (62), Form Type (12), CIK (12),
-        # Date Filed (12), Filename (rest)
-        company_name = line[:62].strip()
-        form_type = line[62:74].strip()
-        cik = line[74:86].strip()
-        date_filed = line[86:98].strip()
-        filename = line[98:].strip()
-
+        m = ROW_RE.match(line)
+        if not m:
+            continue
         entries.append({
-            "cik": cik,
-            "company_name": company_name,
-            "form_type": form_type,
-            "date_filed": date_filed,
-            "filename": filename,
+            "cik": m.group("cik"),
+            "company_name": m.group("company").strip(),
+            "form_type": m.group("form").strip(),
+            "date_filed": m.group("date"),
+            "filename": m.group("filename").strip(),
         })
 
     return entries
@@ -72,14 +83,38 @@ def filter_10k(entries: list[dict]) -> list[dict]:
     return [e for e in entries if e["form_type"] == "10-K"]
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Fetch SEC EDGAR 10-K filing index (optionally for a single year)."
+    )
+    parser.add_argument(
+        "--year", type=int, default=None,
+        help="Restrict to filings filed in this year. Default: use config range.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     headers = sec_headers()
     os.makedirs(INDEX_DIR, exist_ok=True)
 
+    if args.year:
+        urls = [
+            f"{EDGAR_FULL_INDEX}/{args.year}/QTR{q}/company.idx"
+            for q in QUARTERS
+        ]
+        output_path = index_csv_for_year(args.year)
+        year_label = str(args.year)
+    else:
+        urls = FULL_INDEX_URLS
+        output_path = INDEX_DIR / f"10k_filings_{YEAR}.csv"
+        year_label = str(YEAR)
+
     all_filings = []
 
-    print(f"Fetching EDGAR full index for {YEAR} ...")
-    for url in tqdm(FULL_INDEX_URLS, desc="Quarters"):
+    print(f"Fetching EDGAR full index for {year_label} ...")
+    for url in tqdm(urls, desc="Quarters"):
         qtr = re.search(r"QTR(\d)", url).group(1)
         print(f"\n  Quarter {qtr}: {url}")
 
@@ -99,7 +134,6 @@ def main():
             seen.add(key)
             unique.append(f)
 
-    output_path = INDEX_DIR / f"10k_filings_{YEAR}.csv"
     with open(output_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=["cik", "company_name", "form_type", "date_filed", "filename"])
         writer.writeheader()

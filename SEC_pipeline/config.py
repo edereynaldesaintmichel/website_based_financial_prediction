@@ -32,6 +32,26 @@ LLM_SANITIZED_DIR = OUTPUT_DIR / "10k_markdown"
 TAGGED_DIR = OUTPUT_DIR / "10k_markdown_tagged"
 WORK_DIR = OUTPUT_DIR / "_work"
 
+
+def financials_dir_for_year(year: int) -> Path:
+    """Directory for per-company financials JSON files for a given base year."""
+    return OUTPUT_DIR / f"financials_json_{year}"
+
+
+def raw_html_dir_for_year(year: int) -> Path:
+    """Directory for raw 10-K HTML filings filed during a given year."""
+    return OUTPUT_DIR / f"10k_html_raw_{year}"
+
+
+def markdown_dir_for_year(year: int) -> Path:
+    """Directory for sanitized 10-K markdown for a given filing year."""
+    return OUTPUT_DIR / f"10k_markdown_{year}"
+
+
+def index_csv_for_year(year: int) -> Path:
+    """Path to the 10-K filing index CSV for a given year."""
+    return INDEX_DIR / f"10k_filings_{year}.csv"
+
 # ──────────────────────────────────────────────────────────────
 # SEC EDGAR URLs
 # ──────────────────────────────────────────────────────────────

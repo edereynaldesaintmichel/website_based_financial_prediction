@@ -107,7 +107,7 @@ pipeline:
   # Maximum parallel workers for region recognition (layout mode)
   # High value keeps vLLM request queue full → better GPU batching
   # Too high causes connection resets (vLLM drops excess connections)
-  max_workers: 32
+  max_workers: 128
   # Queue sizes — large enough to not starve workers
   page_maxsize: 200
   region_maxsize: 2000

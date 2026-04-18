@@ -4,10 +4,12 @@
 # and starts the vLLM server once deps are ready.
 set -e
 
-INPUT_ZIP="/workspace/companies_house_html.zip"
-OUTPUT_JSONL="/workspace/companies_house_html_cleaned_up.jsonl"
-GDRIVE_FILE_ID="10oUo0a0HTg0PlU5OIKIUGBS5qUPPkRnn"
-GDRIVE_JSONL_FILE_ID="1q_48xszklw1OtURn7DnyBFm7Tq0zmzhp"
+INPUT_ZIP="${INPUT_ZIP:-/workspace/companies_house_html.zip}"
+OUTPUT_JSONL="${OUTPUT_JSONL:-/workspace/companies_house_html_cleaned_up.jsonl}"
+# GDrive IDs default to the 2018 fold. Set to empty to skip the download
+# (e.g. when the zip is SCP'd up manually, or there is no WIP checkpoint).
+GDRIVE_FILE_ID="${GDRIVE_FILE_ID-10oUo0a0HTg0PlU5OIKIUGBS5qUPPkRnn}"
+GDRIVE_JSONL_FILE_ID="${GDRIVE_JSONL_FILE_ID-1q_48xszklw1OtURn7DnyBFm7Tq0zmzhp}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Disable tmux on reconnect (fixes broken scroll)
@@ -27,11 +29,14 @@ fi
 echo "=== [1/3] Installing dependencies ==="
 pip install --quiet --upgrade \
     "mistral_common>=1.6.0" \
+    "huggingface_hub>=1.0" \
     aiohttp aiofiles tqdm \
     playwright \
     gdown \
     glmocr
-# Force-reinstall transformers from git — pip skips it otherwise if already installed
+# GLM-OCR arch is only in transformers git HEAD. Force-reinstall --no-deps
+# so vLLM's transformers<5 pin is ignored; at runtime the dev build works
+# with huggingface_hub>=1.0 (which we pulled above).
 pip install --quiet --force-reinstall --no-deps \
     git+https://github.com/huggingface/transformers.git
 echo "  Packages installed."
@@ -48,6 +53,10 @@ echo "=== [2/3] Downloading input data ==="
 if [ -f "$INPUT_ZIP" ]; then
     echo "  $INPUT_ZIP already exists, skipping download."
     DL_PID=""
+elif [ -z "$GDRIVE_FILE_ID" ]; then
+    echo "  ERROR: $INPUT_ZIP missing and GDRIVE_FILE_ID is empty."
+    echo "  SCP the zip to $INPUT_ZIP or set GDRIVE_FILE_ID before running."
+    exit 1
 else
     echo "  Downloading $INPUT_ZIP ..."
     gdown "$GDRIVE_FILE_ID" -O "$INPUT_ZIP" &
@@ -56,6 +65,9 @@ fi
 
 if [ -f "$OUTPUT_JSONL" ]; then
     echo "  $OUTPUT_JSONL already exists, skipping download."
+    DL_JSONL_PID=""
+elif [ -z "$GDRIVE_JSONL_FILE_ID" ]; then
+    echo "  No WIP checkpoint (GDRIVE_JSONL_FILE_ID empty); starting fresh."
     DL_JSONL_PID=""
 else
     echo "  Downloading $OUTPUT_JSONL (WIP checkpoint) ..."
@@ -77,7 +89,6 @@ nohup vllm serve zai-org/GLM-OCR \
     --enable-chunked-prefill \
     --dtype bfloat16 \
     --speculative_config '{"method":"mtp","num_speculative_tokens":3}' \
-    --disable-log-requests \
     > vllm.log 2>&1 &
 VLLM_PID=$!
 echo "  vLLM started (PID $VLLM_PID), logging to vllm.log"

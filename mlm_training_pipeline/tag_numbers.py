@@ -1,13 +1,3 @@
-"""
-Tag numbers in Wikipedia text for MLM training.
-
-Tags every number (integers, decimals, comma-formatted).
-Does not capture signs (leading minus/plus).
-
-Usage (standalone):
-    python -m wikipedia_pipeline.tag_numbers < input.txt
-"""
-
 import re
 
 NUMBER_RE = re.compile(
@@ -49,19 +39,51 @@ def tag_numbers_in_text(text: str) -> str:
 
 if __name__ == "__main__":
     import argparse, sys
+    from pathlib import Path
 
     parser = argparse.ArgumentParser(description="Tag numbers in text.")
-    parser.add_argument("input", nargs="?", help="Input file (default: stdin)")
-    parser.add_argument("-o", "--output", help="Output file (default: stdout)")
+    parser.add_argument("input", nargs="?",
+                        help="Input file or directory (default: stdin)")
+    parser.add_argument("-o", "--output",
+                        help="Output file or directory (default: stdout). "
+                             "If input is a directory, output must also be a directory.")
+    parser.add_argument("--glob", default="*.md",
+                        help="Glob applied when input is a directory (default: *.md)")
     args = parser.parse_args()
 
-    text = open(args.input).read() if args.input else sys.stdin.read()
-    tagged = tag_numbers_in_text(text)
+    in_path = Path(args.input) if args.input else None
 
-    if args.output:
-        with open(args.output, "w") as f:
-            f.write(tagged)
+    if in_path and in_path.is_dir():
+        if not args.output:
+            parser.error("--output is required when input is a directory")
+        out_dir = Path(args.output)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        files = sorted(in_path.glob(args.glob))
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(files, desc="Tag", unit="file")
+        except ImportError:
+            iterator = files
+        total_tags = 0
+        n_written = 0
+        for f in iterator:
+            out_path = out_dir / f.name
+            if out_path.exists():
+                continue
+            tagged = tag_numbers_in_text(f.read_text(encoding="utf-8"))
+            out_path.write_text(tagged, encoding="utf-8")
+            total_tags += tagged.count("<number>")
+            n_written += 1
+        print(f"--- {n_written}/{len(files)} files written, {total_tags} numbers tagged "
+              f"-> {out_dir} ---", file=sys.stderr)
     else:
-        print(tagged)
+        text = open(args.input).read() if args.input else sys.stdin.read()
+        tagged = tag_numbers_in_text(text)
 
-    print(f"--- {tagged.count('<number>')} numbers tagged ---", file=sys.stderr)
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(tagged)
+        else:
+            print(tagged)
+
+        print(f"--- {tagged.count('<number>')} numbers tagged ---", file=sys.stderr)

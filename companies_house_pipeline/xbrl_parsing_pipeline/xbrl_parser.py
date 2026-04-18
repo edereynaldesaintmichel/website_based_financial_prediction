@@ -39,20 +39,25 @@ except ImportError:
 # Configuration
 # ============================================================================
 
-ZIP_URLS = [
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-January2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-February2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-March2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-April2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-May2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-June2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-July2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-August2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-September2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-October2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-November2025.zip",
-    "https://download.companieshouse.gov.uk/Accounts_Monthly_Data-December2025.zip",
+DEFAULT_YEAR = 2025
+
+MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
 ]
+
+
+def zip_urls_for_year(year: int) -> list[str]:
+    """Companies House monthly iXBRL archive URLs for a given calendar year."""
+    return [
+        f"https://download.companieshouse.gov.uk/Accounts_Monthly_Data-{month}{year}.zip"
+        for month in MONTHS
+    ]
+
+
+# Default URL list (2025) kept for backward compatibility with callers that
+# import ZIP_URLS directly.
+ZIP_URLS = zip_urls_for_year(DEFAULT_YEAR)
 
 DEFAULT_EMPLOYEE_THRESHOLD = 50
 DEFAULT_OUTPUT_DIR = "./output"
@@ -409,32 +414,50 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Skip the first N-1 months and start from month N (1=January, useful for resuming)",
     )
+    parser.add_argument(
+        "--year",
+        type=int,
+        default=DEFAULT_YEAR,
+        help=f"Calendar year of monthly Companies House archives (default: {DEFAULT_YEAR})",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # Resolve paths
+    # Resolve paths (suffix per-year output subdir so different years coexist)
     output_dir = os.path.abspath(args.output_dir)
-    json_output_dir = os.path.join(output_dir, "json_50plus_employees")
+    json_subdir = (
+        "json_50plus_employees"
+        if args.year == DEFAULT_YEAR
+        else f"json_50plus_employees_{args.year}"
+    )
+    json_output_dir = os.path.join(output_dir, json_subdir)
     work_dir = os.path.join(output_dir, "_work")          # temp downloads + extracts
-    ranking_file = os.path.join(output_dir, "sorted_by_employees.json")
+    ranking_name = (
+        "sorted_by_employees.json"
+        if args.year == DEFAULT_YEAR
+        else f"sorted_by_employees_{args.year}.json"
+    )
+    ranking_file = os.path.join(output_dir, ranking_name)
 
     os.makedirs(json_output_dir, exist_ok=True)
     os.makedirs(work_dir, exist_ok=True)
 
     logger = setup_logging(output_dir)
 
+    zip_urls = zip_urls_for_year(args.year)
+
     # ── Banner ────────────────────────────────────────────────────────────────
     logger.info("=" * 65)
-    logger.info("🏢  UK Companies House iXBRL Parser  —  2025 Data")
+    logger.info("🏢  UK Companies House iXBRL Parser  —  %d Data", args.year)
     logger.info("👥  Employee threshold : ≥ %d", args.threshold)
     logger.info("⚙️   Worker threads     : %d", args.workers)
     logger.info("📂  Output directory   : %s", output_dir)
     logger.info("=" * 65)
 
-    urls_to_process = ZIP_URLS[args.start_from - 1:]
+    urls_to_process = zip_urls[args.start_from - 1:]
     if args.start_from > 1:
         logger.info("⏩  Skipping first %d month(s), starting from month %d", args.start_from - 1, args.start_from)
 
@@ -449,7 +472,7 @@ def main():
     # parallelism is applied *within* each zip across individual files.
     for i, zip_url in enumerate(urls_to_process, start=args.start_from):
         logger.info("")
-        logger.info("── Archive %d / %d ─────────────────────────────────────────", i, len(ZIP_URLS))
+        logger.info("── Archive %d / %d ─────────────────────────────────────────", i, len(zip_urls))
         try:
             process_zip(
                 zip_url=zip_url,
