@@ -91,7 +91,7 @@ pipeline:
 
     # Timeouts (seconds)
     connect_timeout: 30
-    request_timeout: 60
+    request_timeout: 120
 
     # Retry settings (helps with transient 429/5xx and overloaded OCR servers)
     retry_max_attempts: 2
@@ -115,10 +115,10 @@ pipeline:
   # Page loader: handles image/PDF loading and API request building
   page_loader:
     # Generation parameters
-    max_tokens: 16384
-    temperature: 0.8
-    top_p: 0.9
-    top_k: 50
+    max_tokens: 8192
+    temperature: 0.0
+    top_p: 0.00001
+    top_k: 1
     repetition_penalty: 1.1
 
     # Image processing

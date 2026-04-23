@@ -83,11 +83,12 @@ nohup vllm serve zai-org/GLM-OCR \
     --served-model-name glm-ocr \
     --port 8001 \
     --allowed-local-media-path / \
-    --gpu-memory-utilization 0.85 \
+    --gpu-memory-utilization 0.80 \
     --max-num-seqs 512 \
     --enable-prefix-caching \
     --enable-chunked-prefill \
     --dtype bfloat16 \
+    --api-server-count 4 \
     --speculative_config '{"method":"mtp","num_speculative_tokens":3}' \
     > vllm.log 2>&1 &
 VLLM_PID=$!

@@ -6,14 +6,15 @@ Converts HTML financial filings to clean markdown by rendering them
 to PDF (Playwright/Chromium), then using the GLM-OCR SDK for
 layout-aware OCR (PP-DocLayoutV3 → region-specific recognition).
 
-The SDK handles: PDF → page images → layout detection → parallel
-region OCR with task-specific prompts (Text/Table/Formula Recognition)
-→ structured Markdown + JSON output.
+Two-phase-per-batch design to maximise GPU utilisation:
+  Phase A: Load PDFs + run layout detection on all pages (GPU: layout model only)
+  Phase B: Blast all cropped regions to vLLM at once   (GPU: vLLM only)
+No GPU contention — each phase owns the GPU exclusively.
 
 Output is a single .jsonl file where each line is:
     {"stem": "<filename_without_ext>", "markdown": "<content>"}
 
-Lines are written progressively as files complete, so the output is
+Lines are written progressively as batches complete, so the output is
 safe to inspect mid-run and the pipeline can resume from where it left off.
 
 Usage:
@@ -28,23 +29,26 @@ Usage:
 Options:
     --output FILE       Output .jsonl path (default: {input}_cleaned_up.jsonl)
     --limit N           Process only first N files
-    --port N            vLLM server port (default: 8000)
+    --port N            vLLM server port (default: 8001)
     --no-layout         Disable layout detection (faster but no table/formula handling)
 """
 
 import argparse
 import asyncio
 import json
+import os
 import shutil
 import socket
 import sys
+import tempfile
 import time
-import zipfile  # used for input .zip extraction
+import zipfile
 from pathlib import Path
+
+import aiohttp
 
 from tqdm import tqdm
 
-# Allow running as `python convert.py` from any directory
 sys.path.insert(0, str(Path(__file__).parent))
 
 
@@ -78,11 +82,13 @@ async def html_to_pdf_batch(html_paths: list[Path], pdf_dir: Path,
                         wait_until="load",
                         timeout=120_000,
                     )
+                    tmp_path = pdf_path.with_suffix(f".pdf.tmp.{os.getpid()}.{id(html_path)}")
                     await page.pdf(
-                        path=str(pdf_path),
+                        path=str(tmp_path),
                         format="Letter",
                         print_background=True,
                     )
+                    os.replace(tmp_path, pdf_path)
                     await page.close()
                     pbar.update(1)
                     return (html_path.name, "ok")
@@ -103,6 +109,276 @@ def is_server_running(port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+# ──────────────────────────────────────────────────────────────
+# Phase 2: Two-phase OCR (layout then vLLM, sequential per batch)
+# ──────────────────────────────────────────────────────────────
+
+async def run_ocr_two_phase(
+    pdf_files: list[Path],
+    jsonl_path: Path,
+    config_path: str,
+    port: int,
+    enable_layout: bool,
+    batch_size: int = 200,
+):
+    """Process PDFs in batches. Each batch: layout-detect all pages, then OCR all regions."""
+    from glmocr.config import load_config
+    from glmocr.dataloader import PageLoader
+    from glmocr.ocr_client import OCRClient
+    from glmocr.postprocess import ResultFormatter
+    from glmocr.utils.image_utils import crop_image_region
+
+    cfg = load_config(config_path)
+    pcfg = cfg.pipeline
+
+    page_loader = PageLoader(pcfg.page_loader)
+    ocr_client = OCRClient(pcfg.ocr_api)
+    ocr_client._pool_maxsize = pcfg.max_workers
+    ocr_client.start()
+
+    result_formatter = ResultFormatter(pcfg.result_formatter)
+
+    layout_detector = None
+    if enable_layout:
+        from glmocr.layout import PPDocLayoutDetector
+        layout_detector = PPDocLayoutDetector(pcfg.layout)
+        layout_detector.start()
+
+    use_polygon = pcfg.layout.use_polygon if enable_layout else False
+
+    n_done = 0
+    n_errors = 0
+
+    pbar = tqdm(total=len(pdf_files), desc="OCR", unit="file")
+
+    try:
+        with jsonl_path.open("a", encoding="utf-8") as jsonl_fh:
+            for batch_start in range(0, len(pdf_files), batch_size):
+                batch = pdf_files[batch_start:batch_start + batch_size]
+
+                # ── Phase A: Load pages + layout detection ──────────────
+                unit_pages: dict[int, list] = {}
+                batch_sources = [f"file://{p.resolve()}" for p in batch]
+
+                all_pages = []
+                for page_img, unit_idx in page_loader.iter_pages_with_unit_indices(batch_sources):
+                    all_pages.append((unit_idx, page_img))
+
+                if enable_layout and layout_detector is not None:
+                    layout_batch_size = layout_detector.batch_size
+                    all_layouts = []
+
+                    for lb_start in range(0, len(all_pages), layout_batch_size):
+                        lb_end = lb_start + layout_batch_size
+                        lb_images = [img for _, img in all_pages[lb_start:lb_end]]
+                        layouts, _ = layout_detector.process(
+                            lb_images,
+                            save_visualization=False,
+                            global_start_idx=lb_start,
+                            use_polygon=use_polygon,
+                        )
+                        all_layouts.extend(layouts)
+
+                    for i, (unit_idx, page_img) in enumerate(all_pages):
+                        unit_pages.setdefault(unit_idx, []).append(
+                            (page_img, all_layouts[i])
+                        )
+                else:
+                    for unit_idx, page_img in all_pages:
+                        w, h = page_img.size
+                        fake_region = [{
+                            "bbox_2d": [0, 0, w, h],
+                            "task_type": "text",
+                            "label": "text",
+                            "index": 0,
+                        }]
+                        unit_pages.setdefault(unit_idx, []).append(
+                            (page_img, fake_region)
+                        )
+
+                # ── Crop all regions ───────────────────────────────────
+                ocr_tasks = []
+                skip_results = []
+
+                for unit_idx, pages in unit_pages.items():
+                    for page_local_idx, (page_img, layout_regions) in enumerate(pages):
+                        for region in layout_regions:
+                            task_type = region.get("task_type", "text")
+                            if task_type == "abandon":
+                                continue
+
+                            bbox = region.get("bbox_2d")
+                            polygon = region.get("polygon") if use_polygon else None
+                            try:
+                                cropped = crop_image_region(page_img, bbox, polygon)
+                            except Exception as e:
+                                tqdm.write(f"  Crop failed unit={unit_idx} bbox={bbox}: {e}")
+                                region["content"] = ""
+                                skip_results.append((unit_idx, page_local_idx, region, None))
+                                continue
+
+                            if task_type == "skip":
+                                region["content"] = None
+                                skip_results.append((unit_idx, page_local_idx, region, cropped))
+                                continue
+
+                            ocr_tasks.append((unit_idx, page_local_idx, region, cropped))
+
+                del all_pages
+                for unit_idx in unit_pages:
+                    unit_pages[unit_idx] = [(None, layout) for _, layout in unit_pages[unit_idx]]
+
+                # ── Phase B: Save images to disk, then blast vLLM ──────
+                tqdm.write(f"  Batch {batch_start//batch_size + 1}: "
+                           f"{len(ocr_tasks)} regions to OCR across "
+                           f"{len(unit_pages)} files")
+
+                results_by_unit: dict[int, dict[int, list]] = {}
+                for unit_idx, page_local_idx, region, cropped in skip_results:
+                    results_by_unit.setdefault(unit_idx, {}).setdefault(
+                        page_local_idx, []
+                    ).append(region)
+
+                region_dir = Path(tempfile.mkdtemp(prefix="ocr_regions_"))
+                prebuilt = []
+                encode_pbar = tqdm(
+                    total=len(ocr_tasks), desc="  Save", unit="region", leave=False
+                )
+                img_format = page_loader.image_format
+                for i, (unit_idx, page_local_idx, region, cropped) in enumerate(ocr_tasks):
+                    task_type = region.get("task_type", "text")
+                    prompt_text = ""
+                    if page_loader.task_prompt_mapping:
+                        prompt_text = page_loader.task_prompt_mapping.get(task_type, "")
+
+                    img_path = region_dir / f"r{i}.jpg"
+                    cropped.save(str(img_path), format=img_format)
+
+                    content = [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"file://{img_path}"},
+                        },
+                    ]
+                    if prompt_text:
+                        content.append({"type": "text", "text": prompt_text})
+
+                    req = {
+                        "model": ocr_client.model or "glm-ocr",
+                        "messages": [{"role": "user", "content": content}],
+                        "max_tokens": page_loader.max_tokens,
+                        "temperature": page_loader.temperature,
+                        "top_p": page_loader.top_p,
+                        "top_k": page_loader.top_k,
+                        "repetition_penalty": page_loader.repetition_penalty,
+                    }
+                    serialized = json.dumps(req).encode("utf-8")
+                    prebuilt.append((unit_idx, page_local_idx, region, serialized))
+                    encode_pbar.update(1)
+                encode_pbar.close()
+
+                del ocr_tasks
+
+                # Blast all requests via aiohttp
+                api_url = ocr_client.api_url
+                api_headers = {"Content-Type": "application/json"}
+                if ocr_client.api_key:
+                    api_headers["Authorization"] = f"Bearer {ocr_client.api_key}"
+                api_headers.update(ocr_client.extra_headers)
+                api_timeout_s = ocr_client.request_timeout
+
+                async def _blast_vllm(tasks):
+                    connector = aiohttp.TCPConnector(limit=0, ssl=False)
+                    timeout = aiohttp.ClientTimeout(total=api_timeout_s)
+                    ocr_pbar = tqdm(
+                        total=len(tasks), desc="  vLLM", unit="region", leave=False
+                    )
+
+                    async with aiohttp.ClientSession(
+                        connector=connector, timeout=timeout
+                    ) as session:
+                        sem = asyncio.Semaphore(512)
+
+                        async def _do_one(unit_idx, page_local_idx, region, data_bytes):
+                            async with sem:
+                                try:
+                                    async with session.post(
+                                        api_url,
+                                        headers=api_headers,
+                                        data=data_bytes,
+                                    ) as resp:
+                                        if resp.status == 200:
+                                            result = await resp.json()
+                                            content = result["choices"][0]["message"]["content"]
+                                            region["content"] = content.strip() if content else ""
+                                        else:
+                                            region["content"] = None
+                                except Exception:
+                                    region["content"] = None
+                                ocr_pbar.update(1)
+                                return unit_idx, page_local_idx, region
+
+                        results = await asyncio.gather(
+                            *[_do_one(u, p, r, d) for u, p, r, d in tasks]
+                        )
+
+                    ocr_pbar.close()
+                    return results
+
+                try:
+                    ocr_results = await _blast_vllm(prebuilt)
+                finally:
+                    shutil.rmtree(region_dir, ignore_errors=True)
+
+                for unit_idx, page_local_idx, region in ocr_results:
+                    results_by_unit.setdefault(unit_idx, {}).setdefault(
+                        page_local_idx, []
+                    ).append(region)
+
+                # ── Phase C: Format results and write JSONL ─────────────
+                for unit_idx, pdf_path in enumerate(batch):
+                    stem = pdf_path.stem
+                    page_results = results_by_unit.get(unit_idx, {})
+
+                    if not page_results:
+                        n_errors += 1
+                        tqdm.write(f"  No results for {stem}")
+                        pbar.update(1)
+                        continue
+
+                    n_pages = len(unit_pages.get(unit_idx, []))
+                    grouped = []
+                    for page_local_idx in range(n_pages):
+                        regions = page_results.get(page_local_idx, [])
+                        grouped.append(regions)
+
+                    try:
+                        _, md_result, _ = result_formatter.process(
+                            grouped, cropped_images=None
+                        )
+                        jsonl_fh.write(
+                            json.dumps(
+                                {"stem": stem, "markdown": md_result},
+                                ensure_ascii=False,
+                            ) + "\n"
+                        )
+                        jsonl_fh.flush()
+                        n_done += 1
+                    except Exception as e:
+                        n_errors += 1
+                        tqdm.write(f"  FAILED {stem}: {e}")
+
+                    pbar.update(1)
+
+    finally:
+        pbar.close()
+        ocr_client.stop()
+        if layout_detector is not None:
+            layout_detector.stop()
+
+    return n_done, n_errors
 
 
 # ──────────────────────────────────────────────────────────────
@@ -141,7 +417,7 @@ async def main():
     # ── Discover HTML files ──────────────────────────────────
     html_files = sorted(
         f for f in input_dir.rglob("*.html")
-        if not f.name.startswith("._")  # skip macOS resource fork files
+        if not f.name.startswith("._")
     )
     if args.limit > 0:
         html_files = html_files[:args.limit]
@@ -158,7 +434,7 @@ async def main():
         jsonl_path = input_dir.parent / f"{name}_cleaned_up.jsonl"
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Skip already-processed files (scan existing JSONL if present)
+    # Skip already-processed files
     existing: set[str] = set()
     if jsonl_path.exists():
         with jsonl_path.open(encoding="utf-8") as fh:
@@ -181,9 +457,8 @@ async def main():
 
     print(f"To process: {len(todo)} files\n")
 
-    # ── Temp directories ─────────────────────────────────────
-    tmp_dir = Path("_glm_ocr_tmp")
-    pdf_dir = tmp_dir / "pdfs"
+    # ── PDF cache ────────────────────────────────────────────
+    pdf_dir = Path(os.environ.get("GLM_OCR_PDF_CACHE", "/workspace/pdf_cache"))
     pdf_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
@@ -198,7 +473,6 @@ async def main():
     for name, err in errors[:10]:
         print(f"    {name}: {err}")
 
-    # Collect successfully converted PDFs
     successful_stems = {
         Path(n).stem for n, s in results if s in ("ok", "skipped")
     }
@@ -210,81 +484,27 @@ async def main():
         print("No PDFs to process!")
         return
 
-    # ── Phase 2: vLLM server + GLM-OCR SDK ───────────────────
+    # ── Phase 2: Two-phase OCR ───────────────────────────────
     enable_layout = not args.no_layout
     mode = "layout-aware" if enable_layout else "OCR-only"
-    print(f"\n=== Phase 2: GLM-OCR SDK ({mode}, {len(pdf_files)} files) ===")
+    print(f"\n=== Phase 2: Two-phase OCR ({mode}, {len(pdf_files)} files) ===")
 
     if not is_server_running(args.port):
         print(f"  ERROR: No vLLM server on port {args.port}. Run setup_companies_house_ocr.sh first.")
         sys.exit(1)
     print(f"  Using vLLM server on port {args.port}")
 
-    # Initialize GLM-OCR SDK in self-hosted mode
-    from glmocr import GlmOcr
-
     config_path = str(Path(__file__).parent / "config.yaml")
-    parser_ocr = GlmOcr(
+
+    n_done, n_errors = await run_ocr_two_phase(
+        pdf_files=pdf_files,
+        jsonl_path=jsonl_path,
         config_path=config_path,
-        mode="selfhosted",
-        ocr_api_host="127.0.0.1",
-        ocr_api_port=args.port,
+        port=args.port,
         enable_layout=enable_layout,
     )
 
-    n_done = 0
-    n_errors = 0
-
-    # Batch size trades RAM for GPU saturation.
-    # The SDK accumulates all page images in memory (images_dict) for the
-    # duration of each parse() call — memory grows linearly with batch size.
-    # At ~400 KB/page × ~5 pages/file: 500 files ≈ 1 GB peak per batch.
-    # Larger batches keep the region queue fuller → better GPU utilisation.
-    BATCH_SIZE = 20
-    # The SDK resolves paths to absolute, so key by resolved absolute path
-    path_to_stem = {str(p.resolve()): p.stem for p in pdf_files}
-
-    try:
-        pbar = tqdm(total=len(pdf_files), desc="OCR", unit="file")
-        with jsonl_path.open("a", encoding="utf-8") as jsonl_fh:
-            for batch_start in range(0, len(pdf_files), BATCH_SIZE):
-                batch = pdf_files[batch_start:batch_start + BATCH_SIZE]
-                batch_strs = [str(p) for p in batch]
-
-                for result in parser_ocr.parse(batch_strs, stream=True, save_layout_visualization=False):
-                    source = result.original_images[0] if result.original_images else None
-                    stem = path_to_stem.get(source)
-
-                    if stem is None:
-                        n_errors += 1
-                        tqdm.write(f"  Could not map result back to source file")
-                        pbar.update(1)
-                        continue
-
-                    try:
-                        full_md = result.markdown_result
-                        if hasattr(result, '_error') and result._error:
-                            raise RuntimeError(result._error)
-
-                        jsonl_fh.write(json.dumps({"stem": stem, "markdown": full_md}, ensure_ascii=False) + "\n")
-                        jsonl_fh.flush()
-                        n_done += 1
-                    except Exception as e:
-                        n_errors += 1
-                        tqdm.write(f"  FAILED {stem}: {e}")
-
-                    pbar.update(1)
-        pbar.close()
-
-    finally:
-        parser_ocr.close()
-
     elapsed = time.time() - t0
-
-    # ── Cleanup tmp ──────────────────────────────────────────
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    # ── Summary ──────────────────────────────────────────────
     size_mb = jsonl_path.stat().st_size / 1024 / 1024
     print(f"\nDone! {n_done} files in {elapsed:.0f}s → {jsonl_path} ({size_mb:.1f} MB)")
     if n_errors:
